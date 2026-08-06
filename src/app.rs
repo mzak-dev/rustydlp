@@ -14,8 +14,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::model::{File as MFile, FileKind, Item, Job, JobState, Preset, new_id};
-use crate::runner::{self, Probe};
+use crate::model::{File as MFile, FileKind, Item, Job, JobKind, JobState, Preset, new_id};
+use crate::player;
+use crate::runner::{self, ConvertEvent, ConvertFormat, Probe};
 use crate::store::Store;
 use crate::ytdlp::{Event, FormatMode, YtdlpOptions};
 
@@ -25,31 +26,41 @@ pub enum Route {
     Settings,
 }
 
-/// Which set of jobs the sidebar list shows.
+/// Which top-navbar mode is active, and therefore which jobs the sidebar
+/// list shows.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SidebarTab {
-    /// Everything, newest first.
-    Home,
-    /// Only jobs that are still working.
+    /// Download jobs, newest first.
+    Download,
+    /// Convert jobs, newest first.
+    Convert,
+    /// Jobs of either kind that are still working. Shown in the main pane,
+    /// not the sidebar — see `main_pane`.
     InProgress,
 }
 
 impl SidebarTab {
     fn index(self) -> usize {
         match self {
-            Self::Home => 0,
-            Self::InProgress => 1,
+            Self::Download => 0,
+            Self::Convert => 1,
+            Self::InProgress => 2,
         }
     }
 
     fn from_index(ix: usize) -> Self {
-        if ix == 1 { Self::InProgress } else { Self::Home }
+        match ix {
+            1 => Self::Convert,
+            2 => Self::InProgress,
+            _ => Self::Download,
+        }
     }
 
     fn empty_message(self) -> &'static str {
         match self {
-            Self::Home => "No recent downloads",
-            Self::InProgress => "No downloads in progress",
+            Self::Download => "No recent downloads",
+            Self::Convert => "No recent conversions",
+            Self::InProgress => "Nothing in progress",
         }
     }
 }
@@ -107,7 +118,34 @@ pub struct RustyDlp {
     /// Preset currently open in the Settings editor.
     editing: Option<Preset>,
     form: PresetForm,
+    /// Manually toggled. Also forced true whenever `tab == InProgress`, since
+    /// that list moves into the main pane and the sidebar has nothing to show.
+    sidebar_collapsed: bool,
+    player: Option<PlayerState>,
+    /// Path currently being probed/spawned, if a load is in flight — set the
+    /// instant `ensure_player` decides a (re)load is needed, cleared once
+    /// `player` is populated (or the load fails). Prevents re-triggering a
+    /// second load on every render while the first is still starting up.
+    player_pending: Option<String>,
+    /// Bumped on every load/seek so a stray event from a just-replaced
+    /// playback run can't clobber the state of the run that replaced it.
+    player_gen: u64,
+    /// Source file path awaiting a target-format choice, if the format
+    /// picker is open. Set by both the per-item Convert button and the
+    /// Convert tab's "Convert File" picker.
+    convert_picker: Option<String>,
     _subs: Vec<Subscription>,
+}
+
+/// Live native-playback state for whichever item is currently open in
+/// `detail()`. Torn down (killing the ffmpeg children) whenever the open
+/// item changes or the player is closed.
+struct PlayerState {
+    control: player::PlayerControl,
+    path: String,
+    frame: Option<Arc<gpui::RenderImage>>,
+    position_secs: f64,
+    playing: bool,
 }
 
 fn db_path() -> PathBuf {
@@ -232,7 +270,7 @@ impl RustyDlp {
             selected: None,
             open_item: None,
             route: Route::Library,
-            tab: SidebarTab::Home,
+            tab: SidebarTab::Download,
             modal: false,
             url_input,
             override_input,
@@ -247,6 +285,11 @@ impl RustyDlp {
             chosen_preset: None,
             editing: None,
             form: PresetForm::new(window, cx),
+            sidebar_collapsed: false,
+            player: None,
+            player_pending: None,
+            player_gen: 0,
+            convert_picker: None,
             _subs,
         };
         this.refresh_ytdlp();
@@ -913,25 +956,31 @@ impl RustyDlp {
         filter_jobs(&self.jobs, self.tab)
     }
 
+    /// Whether the sidebar shows a job list right now, or just the icon
+    /// rail. In progress has nothing for the sidebar to show (its list lives
+    /// in the main pane, see `main_pane`), so it always collapses.
+    fn sidebar_is_collapsed(&self) -> bool {
+        self.sidebar_collapsed || self.tab == SidebarTab::InProgress
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.sidebar_is_collapsed() {
+            return v_flex()
+                .w(px(56.))
+                .h_full()
+                .flex_shrink_0()
+                .items_center()
+                .bg(cx.theme().sidebar)
+                .border_r_1()
+                .border_color(cx.theme().sidebar_border)
+                .child(v_flex().flex_1())
+                .child(self.sidebar_actions(true, cx))
+                .into_any_element();
+        }
+
         let visible = self.visible_jobs();
         let rows: Vec<AnyElement> = visible.iter().map(|job| self.job_row(job, cx)).collect();
         let is_empty = rows.is_empty();
-
-        // TabBar::on_click hands back &mut App rather than &mut Context<Self>,
-        // so cx.listener is unusable here; go through the entity handle instead.
-        let entity = cx.entity();
-        let tabs = TabBar::new("sidebar-tabs")
-            .segmented()
-            .selected_index(self.tab.index())
-            .children([Tab::new().label("Home"), Tab::new().label("In progress")])
-            .on_click(move |ix, _window, cx| {
-                let tab = SidebarTab::from_index(*ix);
-                entity.update(cx, |this, cx| {
-                    this.tab = tab;
-                    cx.notify();
-                });
-            });
 
         v_flex()
             .w(px(260.))
@@ -940,10 +989,6 @@ impl RustyDlp {
             .bg(cx.theme().sidebar)
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
-            // TabBar's inner track is flex_1, so it expands to fill its parent —
-            // justify_center alone would do nothing. Bounding the width first is
-            // what actually lets it centre.
-            .child(h_flex().p_3().justify_center().child(tabs.w(px(200.))))
             .child(
                 v_flex()
                     // .id() is required before .overflow_y_scroll(): the scroll
@@ -951,7 +996,7 @@ impl RustyDlp {
                     .id("job-list")
                     .flex_1()
                     .min_h_0()
-                    .px_3()
+                    .p_3()
                     .gap_1()
                     .overflow_y_scroll()
                     .when(is_empty, |this| {
@@ -965,48 +1010,128 @@ impl RustyDlp {
                     })
                     .children(rows),
             )
+            .child(self.sidebar_actions(false, cx))
+            .into_any_element()
+    }
+
+    /// The bottom action row, shared between the full sidebar and its
+    /// collapsed icon rail — `icon_only` drops the labels and shrinks the
+    /// buttons to fit the narrow rail.
+    fn sidebar_actions(&self, icon_only: bool, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .p_3()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().sidebar_border)
             .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(cx.theme().sidebar_border)
-                    .child(
-                        Button::new("new-download")
-                            .primary()
-                            .w_full()
-                            .icon(IconName::Plus)
-                            .label("New download")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.modal = true;
-                                this.probe = ProbeState::Idle;
-                                // Re-probe here so installing yt-dlp while the
-                                // app is open takes effect without a restart.
-                                this.refresh_ytdlp();
-                                // Overrides are per-download; never carry one
-                                // silently into the next job.
-                                this.override_input
-                                    .update(cx, |s, cx| s.set_value("", window, cx));
-                                this.url_input.update(cx, |s, cx| s.focus(window, cx));
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("settings")
-                            .ghost()
-                            .w_full()
-                            .icon(IconName::Settings)
-                            .label("Settings")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.route = if this.route == Route::Settings {
-                                    Route::Library
-                                } else {
-                                    Route::Settings
-                                };
-                                cx.notify();
-                            })),
-                    ),
+                Button::new("new-download")
+                    .primary()
+                    .when(!icon_only, |b| b.w_full())
+                    .icon(IconName::Plus)
+                    .when(!icon_only, |b| b.label("New download"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.modal = true;
+                        this.probe = ProbeState::Idle;
+                        // Re-probe here so installing yt-dlp while the app is
+                        // open takes effect without a restart.
+                        this.refresh_ytdlp();
+                        // Overrides are per-download; never carry one
+                        // silently into the next job.
+                        this.override_input
+                            .update(cx, |s, cx| s.set_value("", window, cx));
+                        this.url_input.update(cx, |s, cx| s.focus(window, cx));
+                        cx.notify();
+                    })),
             )
+            .child(
+                Button::new("settings")
+                    .ghost()
+                    .when(!icon_only, |b| b.w_full())
+                    .icon(IconName::Settings)
+                    .when(!icon_only, |b| b.label("Settings"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.route = if this.route == Route::Settings {
+                            Route::Library
+                        } else {
+                            Route::Settings
+                        };
+                        cx.notify();
+                    })),
+            )
+            .when(self.tab != SidebarTab::InProgress, |this| {
+                this.child(
+                    Button::new("collapse-sidebar")
+                        .ghost()
+                        .when(!icon_only, |b| b.w_full())
+                        .icon(if icon_only {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronLeft
+                        })
+                        .when(!icon_only, |b| b.label("Collapse"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_collapsed = !this.sidebar_collapsed;
+                            cx.notify();
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Full-width row above the sidebar+main split: wordmark pinned left,
+    /// Download/Convert/In progress tabs true-centered regardless of the
+    /// wordmark's width.
+    fn navbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let tabs = TabBar::new("navbar-tabs")
+            .segmented()
+            .selected_index(self.tab.index())
+            .children([
+                Tab::new().label("Download"),
+                Tab::new().label("Convert"),
+                Tab::new().label("In Progress"),
+            ])
+            // TabBar::on_click hands back &mut App rather than &mut
+            // Context<Self>, so cx.listener is unusable here; go through the
+            // entity handle instead.
+            .on_click(move |ix, _window, cx| {
+                let tab = SidebarTab::from_index(*ix);
+                entity.update(cx, |this, cx| {
+                    // In progress has nothing to show in the (now narrow)
+                    // sidebar — collapse it automatically so the main pane's
+                    // in-progress list gets the room instead. Manually
+                    // re-expanding is still available on the other tabs.
+                    if tab == SidebarTab::InProgress {
+                        this.sidebar_collapsed = true;
+                    }
+                    this.tab = tab;
+                    this.selected = None;
+                    this.open_item = None;
+                    cx.notify();
+                });
+            });
+
+        h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .h(px(48.))
+            .px_4()
+            .items_center()
+            .bg(cx.theme().sidebar)
+            .border_b_1()
+            .border_color(cx.theme().sidebar_border)
+            // Three equal-width columns: wordmark left, tabs centered
+            // independent of the wordmark's own width, empty spacer right to
+            // balance the layout.
+            .child(
+                div()
+                    .flex_1()
+                    .font_bold()
+                    .text_color(cx.theme().sidebar_foreground)
+                    .child("rustyDLP"),
+            )
+            .child(div().flex_shrink_0().child(tabs.w(px(340.))))
+            .child(div().flex_1())
             .into_any_element()
     }
 
@@ -1081,30 +1206,125 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn main_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn main_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.route == Route::Settings {
+            self.ensure_player(None, cx);
             return self.settings(cx);
         }
+        // A selected job always wins over the tab's own landing view — this
+        // is how clicking a row in the in-progress list (which lives here in
+        // the main pane, not the sidebar) drills into that job's detail/
+        // player view.
+        //
+        // Cloned rather than borrowed: `detail` needs `&mut self` (to manage
+        // the player), which would conflict with holding a `&Job` borrowed
+        // out of `self.jobs` for the same call.
         let Some(job) = self
             .selected
             .as_ref()
             .and_then(|id| self.jobs.iter().find(|j| &j.id == id))
+            .cloned()
         else {
-            return self.empty_state(cx);
+            self.ensure_player(None, cx);
+            return match self.tab {
+                SidebarTab::InProgress => self.in_progress_pane(cx),
+                SidebarTab::Convert => self.convert_page(cx),
+                SidebarTab::Download => self.empty_state(cx),
+            };
         };
 
         // Job -> Item -> File: one item goes straight to detail, many show a grid.
         match job.items.len() {
-            0 => self.detail(job, None, cx),
-            1 => self.detail(job, job.items.first(), cx),
-            _ => match &self.open_item {
+            0 => self.detail(&job, None, cx),
+            1 => {
+                let item = job.items.first().cloned();
+                self.detail(&job, item.as_ref(), cx)
+            }
+            _ => match self.open_item.clone() {
                 Some(item_id) => {
-                    let item = job.items.iter().find(|i| &i.id == item_id);
-                    self.detail(job, item, cx)
+                    let item = job.items.iter().find(|i| i.id == item_id).cloned();
+                    self.detail(&job, item.as_ref(), cx)
                 }
-                None => self.grid(job, cx),
+                None => {
+                    self.ensure_player(None, cx);
+                    self.grid(&job, cx)
+                }
             },
         }
+    }
+
+    /// In progress moved out of the sidebar and into here because it mixes
+    /// download and convert jobs and needs room for a progress bar per row —
+    /// the 260px sidebar column was too cramped for that.
+    fn in_progress_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        let jobs = filter_jobs(&self.jobs, SidebarTab::InProgress);
+        let is_empty = jobs.is_empty();
+        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job, cx)).collect();
+
+        v_flex()
+            .id("in-progress-scroll")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .p_5()
+            .gap_2()
+            .overflow_y_scroll()
+            .child(div().font_bold().child("In Progress"))
+            .when(is_empty, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(SidebarTab::InProgress.empty_message()),
+                )
+            })
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// The Convert tab's landing view when nothing is selected: recent
+    /// conversions plus the "Convert File" action that makes conversion work
+    /// on any local file, not just something this app downloaded.
+    fn convert_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let jobs = filter_jobs(&self.jobs, SidebarTab::Convert);
+        let is_empty = jobs.is_empty();
+        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job, cx)).collect();
+
+        v_flex()
+            .id("convert-scroll")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .p_5()
+            .gap_3()
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .child(div().font_bold().child("Convert"))
+                    .child(
+                        Button::new("convert-file")
+                            .primary()
+                            .icon(IconName::Plus)
+                            .label("Convert File")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_file_to_convert(cx);
+                            })),
+                    ),
+            )
+            .child(div().font_bold().text_sm().mt_2().child("Recent conversions"))
+            .when(is_empty, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(SidebarTab::Convert.empty_message()),
+                )
+            })
+            .children(rows)
+            .into_any_element()
     }
 
     fn empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1501,8 +1721,198 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn detail(&self, job: &Job, item: Option<&Item>, cx: &mut Context<Self>) -> AnyElement {
-        let live = self.live.get(&job.id);
+    // -- player --------------------------------------------------------------
+
+    /// Starts/stops native playback so it always matches whatever file
+    /// `detail()` is currently showing. `target` is the playable file path
+    /// for the item on screen, or `None` when nothing playable is showing
+    /// (multi-item grid, empty state, Settings, ...).
+    fn ensure_player(&mut self, target: Option<&str>, cx: &mut Context<Self>) {
+        match target {
+            None => self.stop_player(),
+            Some(path) => {
+                let already_loaded = self.player.as_ref().map(|p| p.path.as_str()) == Some(path);
+                let already_loading = self.player_pending.as_deref() == Some(path);
+                if already_loaded || already_loading {
+                    return;
+                }
+                self.stop_player();
+                self.player_pending = Some(path.to_string());
+                self.load_player(path.to_string(), 0.0, cx);
+            }
+        }
+    }
+
+    fn stop_player(&mut self) {
+        if let Some(p) = self.player.take() {
+            p.control.stop();
+        }
+        self.player_pending = None;
+        // Any in-flight load's result will still arrive, but its generation
+        // will no longer match — see `load_player`.
+        self.player_gen += 1;
+    }
+
+    /// Resolves ffmpeg/ffprobe, probes, and starts playback entirely off the
+    /// UI thread (both are blocking calls) — see `player::load`.
+    fn load_player(&mut self, path: String, start_at_secs: f64, cx: &mut Context<Self>) {
+        self.player_gen += 1;
+        let generation = self.player_gen;
+        let rx = player::load(PathBuf::from(&path), start_at_secs);
+
+        cx.spawn(async move |this, cx| {
+            let loaded = rx.await;
+            let (control, mut events) = match loaded {
+                Ok(Ok((_, control, events))) => (control, events),
+                _ => {
+                    // ponytail: silent fallback to the static poster +
+                    // Open Externally, which always works regardless of why
+                    // native playback couldn't start (missing ffmpeg, no
+                    // video stream, unsupported codec, ...).
+                    let _ = this.update(cx, |this, cx| {
+                        if this.player_pending.as_deref() == Some(path.as_str()) {
+                            this.player_pending = None;
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+            };
+
+            let installed = this
+                .update(cx, |this, cx| {
+                    // Superseded by a newer load (navigated away, sought
+                    // again) before this one finished starting up — tear it
+                    // down rather than let it leak an ffmpeg process nobody
+                    // is watching.
+                    if this.player_gen != generation {
+                        control.stop();
+                        return false;
+                    }
+                    this.player_pending = None;
+                    this.player = Some(PlayerState {
+                        control,
+                        path: path.clone(),
+                        frame: None,
+                        position_secs: start_at_secs,
+                        playing: true,
+                    });
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+
+            if !installed {
+                return;
+            }
+
+            while let Some(event) = events.next().await {
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.player_gen != generation {
+                            return false;
+                        }
+                        match event {
+                            player::PlayerEvent::Frame(frame, pts) => {
+                                if let Some(p) = this.player.as_mut() {
+                                    p.frame = Some(frame);
+                                    p.position_secs = pts;
+                                }
+                            }
+                            player::PlayerEvent::Ended => {
+                                if let Some(p) = this.player.as_mut() {
+                                    p.playing = false;
+                                }
+                            }
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.player.as_mut() {
+            p.playing = !p.playing;
+            p.control.set_paused(!p.playing);
+            cx.notify();
+        }
+    }
+
+    /// The poster/player element that replaces the old static thumbnail:
+    /// shows the live decoded frame once playback has started, otherwise
+    /// falls back to the plain cover art.
+    fn player_view(&self, item: Option<&Item>, cx: &mut Context<Self>) -> AnyElement {
+        let thumb = item.and_then(|i| i.thumb_path.as_deref());
+
+        let Some(player) = &self.player else {
+            return cover(thumb, px(300.), px(96.), cx);
+        };
+        let Some(frame) = player.frame.clone() else {
+            return cover(thumb, px(300.), px(96.), cx);
+        };
+
+        v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(300.))
+                    .rounded(cx.theme().radius)
+                    .overflow_hidden()
+                    .bg(gpui::black())
+                    .child(
+                        img(frame)
+                            .w_full()
+                            .h_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("player-toggle")
+                            .small()
+                            .icon(if player.playing {
+                                IconName::Pause
+                            } else {
+                                IconName::Play
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(human_duration(player.position_secs)),
+                    )
+                    .child(
+                        // ponytail: display-only — shows progress but isn't
+                        // click-to-seek yet. Add position math against this
+                        // bar's own prepainted bounds (same technique
+                        // TabBar's indicator uses) if click-to-seek is
+                        // needed.
+                        div()
+                            .flex_1()
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(cx.theme().muted)
+                            .child(div().h_full().rounded_full().bg(cx.theme().progress_bar)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn detail(&mut self, job: &Job, item: Option<&Item>, cx: &mut Context<Self>) -> AnyElement {
         let title = item
             .map(|i| i.title.clone())
             .filter(|t| !t.is_empty())
@@ -1570,6 +1980,12 @@ impl RustyDlp {
         let running = is_active(job.state);
         let retryable = is_retryable(job.state);
 
+        self.ensure_player(playable.as_deref(), cx);
+        let player_view = self.player_view(item, cx);
+        // Borrowed only after the `&mut self` calls above — holding this
+        // across them would conflict with the mutable borrow they need.
+        let live = self.live.get(&job.id);
+
         h_flex()
             .flex_1()
             .min_w_0()
@@ -1593,16 +2009,7 @@ impl RustyDlp {
                                 })),
                         )
                     })
-                    .child(
-                        // ponytail: static preview. The Preview trait swap for a
-                        // real player is an M5+ concern, per the plan.
-                        cover(
-                            item.and_then(|i| i.thumb_path.as_deref()),
-                            px(300.),
-                            px(96.),
-                            cx,
-                        ),
-                    )
+                    .child(player_view)
                     .child(div().font_bold().child(title))
                     .child(
                         h_flex()
@@ -1610,12 +2017,23 @@ impl RustyDlp {
                             .flex_wrap()
                             .when_some(playable.clone(), |this, path| {
                                 let open = path.clone();
+                                let convert_source = path.clone();
                                 this.child(
-                                    Button::new("play")
+                                    Button::new("open-externally")
                                         .small()
                                         .icon(IconName::Play)
-                                        .label("Play")
+                                        .label("Open Externally")
                                         .on_click(move |_, _, _| open_path(&open)),
+                                )
+                                .child(
+                                    Button::new("convert")
+                                        .small()
+                                        .icon(IconName::Replace)
+                                        .label("Convert")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.convert_picker = Some(convert_source.clone());
+                                            cx.notify();
+                                        })),
                                 )
                                 .child(
                                     Button::new("reveal")
@@ -1867,6 +2285,219 @@ impl RustyDlp {
             )
             .into_any_element()
     }
+
+    // -- convert -------------------------------------------------------------
+
+    /// Opens the native file picker so conversion works on any local video,
+    /// not just something this app downloaded.
+    fn pick_file_to_convert(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select a video to convert".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.pop() else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.convert_picker = Some(path.to_string_lossy().to_string());
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn convert_format_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(source) = self.convert_picker.clone() else {
+            return div().into_any_element();
+        };
+
+        // ponytail: hand-rolled overlay, same as the New download modal —
+        // one absolutely-positioned div, no modal-manager lifecycle to learn.
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.5))
+            .child(
+                v_flex()
+                    .w(px(420.))
+                    .p_5()
+                    .gap_3()
+                    .rounded(cx.theme().radius)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(div().font_bold().child("Convert to…"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .truncate()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(file_name(&source)),
+                    )
+                    .child(v_flex().gap_2().children(ConvertFormat::ALL.into_iter().map(|format| {
+                        let source = source.clone();
+                        Button::new(SharedString::from(format!("convert-as-{}", format.as_str())))
+                            .w_full()
+                            .label(format.label())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_convert(source.clone(), format, cx);
+                            }))
+                    })))
+                    .child(
+                        h_flex().justify_end().child(
+                            Button::new("cancel-convert")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.convert_picker = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Creates and immediately launches a Convert job. No staggering queue
+    /// like downloads get — conversions are expected to run one at a time in
+    /// practice, and ffmpeg re-encodes are CPU-bound rather than
+    /// network-rate-limited, so there is no equivalent reason to space them
+    /// out. ponytail: if concurrent converts become common, give this the
+    /// same PendingLaunch/backoff treatment as downloads.
+    fn start_convert(&mut self, source: String, format: ConvertFormat, cx: &mut Context<Self>) {
+        self.convert_picker = None;
+
+        let mut job = Job::new_convert(source.clone(), format.as_str());
+        job.title = format!("{} → {}", file_name(&source), format.label());
+        job.state = JobState::Queued;
+        let job_id = job.id.clone();
+        self.jobs.insert(0, job.clone());
+        self.live.insert(job_id.clone(), Live::default());
+        self.selected = Some(job_id.clone());
+        self.open_item = None;
+        self.persist(job, cx);
+        cx.notify();
+
+        let ffmpeg = match runner::ffmpeg_path(None) {
+            Ok(p) => p,
+            Err(e) => {
+                self.fail_job(&job_id, format!("ffmpeg not available: {e}"), cx);
+                return;
+            }
+        };
+        let convert = match runner::spawn_convert(&ffmpeg, std::path::Path::new(&source), format) {
+            Ok(c) => c,
+            Err(e) => {
+                self.fail_job(&job_id, format!("could not start ffmpeg: {e}"), cx);
+                return;
+            }
+        };
+
+        self.cancels.insert(job_id.clone(), convert.cancel_handle());
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
+            job.state = JobState::Running;
+            let snapshot = job.clone();
+            self.persist(snapshot, cx);
+        }
+
+        // Duration is only known once ffmpeg reports it isn't — fall back to
+        // an indeterminate progress bar (no fraction) if the source has none
+        // recorded (e.g. a file picked outside any downloaded item).
+        let duration = self
+            .jobs
+            .iter()
+            .flat_map(|j| j.items.iter())
+            .find(|i| i.files.iter().any(|f| f.path == source))
+            .and_then(|i| i.duration);
+        let output_path = convert.output_path.to_string_lossy().to_string();
+
+        cx.spawn(async move |this, cx| {
+            let mut events = convert.events;
+            while let Some(event) = events.next().await {
+                let ended = this
+                    .update(cx, |this, cx| {
+                        this.apply_convert_event(&job_id, duration, event, cx)
+                    })
+                    .unwrap_or(true);
+                if ended {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.finish_convert(&job_id, &output_path, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn apply_convert_event(
+        &mut self,
+        job_id: &str,
+        duration: Option<f64>,
+        event: ConvertEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut ended = false;
+        match event {
+            ConvertEvent::Progress(p) => {
+                let live = self.live.entry(job_id.to_string()).or_default();
+                live.fraction = match (p.out_time_secs, duration) {
+                    (Some(t), Some(d)) if d > 0.0 => Some((t / d).clamp(0.0, 1.0) as f32),
+                    _ => None,
+                };
+                live.speed = p.speed;
+            }
+            ConvertEvent::Log(line) => {
+                if line == crate::runner::EXIT_OK {
+                    ended = true;
+                } else if let Some(code) = line.strip_prefix(crate::runner::EXIT_FAIL_PREFIX) {
+                    self.fail_job(job_id, format!("ffmpeg exited {code}"), cx);
+                    ended = true;
+                }
+            }
+        }
+        cx.notify();
+        ended
+    }
+
+    /// Attaches the converted file as a single-item Job (mirroring what a
+    /// download job looks like) so it shows up in the Convert tab's list and
+    /// can be played/opened the same way.
+    fn finish_convert(&mut self, job_id: &str, output_path: &str, cx: &mut Context<Self>) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
+            if job.state == JobState::Running {
+                job.state = JobState::Done;
+                let bytes = std::fs::metadata(output_path).ok().map(|m| m.len() as i64);
+                job.items = vec![Item {
+                    id: new_id("itm"),
+                    index: 0,
+                    title: job.title.clone(),
+                    duration: None,
+                    thumb_path: None,
+                    webpage_url: String::new(),
+                    files: vec![MFile {
+                        id: new_id("fil"),
+                        path: output_path.to_string(),
+                        kind: classify(output_path),
+                        format_id: None,
+                        bytes,
+                    }],
+                }];
+            }
+            let snapshot = job.clone();
+            self.persist(snapshot, cx);
+        }
+        self.live.remove(job_id);
+        self.cancels.remove(job_id);
+        cx.notify();
+    }
 }
 
 /// Opens the app-data folder yt-dlp is expected in.
@@ -2002,12 +2633,16 @@ fn state_after_failure(current: JobState) -> JobState {
     }
 }
 
-/// Home lists everything; In progress lists only jobs still doing work.
-/// Free function so it is testable without constructing a Window.
+/// Download/Convert list jobs of their own kind, newest first. In progress
+/// lists jobs of either kind that are still doing work — it's the only tab
+/// that mixes kinds, which is why it renders in the main pane instead of a
+/// per-kind sidebar list. Free function so it is testable without
+/// constructing a Window.
 fn filter_jobs(jobs: &[Job], tab: SidebarTab) -> Vec<&Job> {
     jobs.iter()
         .filter(|j| match tab {
-            SidebarTab::Home => true,
+            SidebarTab::Download => j.kind == JobKind::Download,
+            SidebarTab::Convert => j.kind == JobKind::Convert,
             SidebarTab::InProgress => is_active(j.state),
         })
         .collect()
@@ -2035,8 +2670,8 @@ mod tests {
     // the built-in one, and #[test] then expands into itself until the
     // recursion limit. Import explicitly.
     use super::{
-        Job, JobState, SidebarTab, filter_jobs, is_active, is_retryable, sibling_thumbnail,
-        state_after_failure,
+        Job, JobKind, JobState, SidebarTab, filter_jobs, is_active, is_retryable,
+        sibling_thumbnail, state_after_failure,
     };
 
     fn job_in(state: JobState) -> Job {
@@ -2045,8 +2680,32 @@ mod tests {
         j
     }
 
+    fn convert_job_in(state: JobState) -> Job {
+        let mut j = Job::new_convert("C:/dl/a.mkv", "mp4");
+        j.state = state;
+        j
+    }
+
     #[test]
-    fn home_lists_everything_in_progress_lists_only_active() {
+    fn download_and_convert_tabs_list_only_their_own_kind() {
+        let jobs = vec![
+            job_in(JobState::Done),
+            job_in(JobState::Running),
+            convert_job_in(JobState::Done),
+            convert_job_in(JobState::Running),
+        ];
+
+        let downloads = filter_jobs(&jobs, SidebarTab::Download);
+        assert_eq!(downloads.len(), 2);
+        assert!(downloads.iter().all(|j| j.kind == JobKind::Download));
+
+        let converts = filter_jobs(&jobs, SidebarTab::Convert);
+        assert_eq!(converts.len(), 2);
+        assert!(converts.iter().all(|j| j.kind == JobKind::Convert));
+    }
+
+    #[test]
+    fn in_progress_mixes_kinds_but_only_active_ones() {
         let jobs = vec![
             job_in(JobState::Running),
             job_in(JobState::Done),
@@ -2054,12 +2713,12 @@ mod tests {
             job_in(JobState::Failed),
             job_in(JobState::Probing),
             job_in(JobState::Cancelled),
+            convert_job_in(JobState::Running),
+            convert_job_in(JobState::Done),
         ];
 
-        assert_eq!(filter_jobs(&jobs, SidebarTab::Home).len(), 6);
-
         let active = filter_jobs(&jobs, SidebarTab::InProgress);
-        assert_eq!(active.len(), 3, "queued/probing/running are in progress");
+        assert_eq!(active.len(), 4, "queued/probing/running of either kind are in progress");
         for j in active {
             assert!(
                 !matches!(
@@ -2072,11 +2731,12 @@ mod tests {
     }
 
     #[test]
-    fn tab_index_round_trips_and_defaults_to_home() {
-        assert_eq!(SidebarTab::from_index(0), SidebarTab::Home);
-        assert_eq!(SidebarTab::from_index(1), SidebarTab::InProgress);
+    fn tab_index_round_trips_and_defaults_to_download() {
+        assert_eq!(SidebarTab::from_index(0), SidebarTab::Download);
+        assert_eq!(SidebarTab::from_index(1), SidebarTab::Convert);
+        assert_eq!(SidebarTab::from_index(2), SidebarTab::InProgress);
         // TabBar could in principle hand back an out-of-range index.
-        assert_eq!(SidebarTab::from_index(99), SidebarTab::Home);
+        assert_eq!(SidebarTab::from_index(99), SidebarTab::Download);
         assert_eq!(SidebarTab::from_index(SidebarTab::InProgress.index()), SidebarTab::InProgress);
     }
 
@@ -2170,19 +2830,22 @@ mod tests {
 
     #[test]
     fn empty_message_differs_per_tab() {
-        assert_eq!(SidebarTab::Home.empty_message(), "No recent downloads");
-        assert_eq!(
-            SidebarTab::InProgress.empty_message(),
-            "No downloads in progress"
-        );
+        assert_eq!(SidebarTab::Download.empty_message(), "No recent downloads");
+        assert_eq!(SidebarTab::Convert.empty_message(), "No recent conversions");
+        assert_eq!(SidebarTab::InProgress.empty_message(), "Nothing in progress");
     }
 }
 
 impl Render for RustyDlp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let navbar = self.navbar(cx);
         let sidebar = self.sidebar(cx);
         let main = self.main_pane(cx);
         let modal = if self.modal { Some(self.modal(cx)) } else { None };
+        let convert_modal = self
+            .convert_picker
+            .is_some()
+            .then(|| self.convert_format_picker(cx));
         let banner = self.startup_error.clone();
 
         div()
@@ -2230,8 +2893,10 @@ impl Render for RustyDlp {
                                 ),
                         )
                     })
+                    .child(navbar)
                     .child(h_flex().flex_1().min_h_0().child(sidebar).child(main)),
             )
             .children(modal)
+            .children(convert_modal)
     }
 }

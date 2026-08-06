@@ -171,11 +171,41 @@ pub struct Item {
     pub files: Vec<File>,
 }
 
+/// What kind of work a job represents. Download jobs probe/fetch a URL;
+/// convert jobs re-encode an existing local file. Both share the same
+/// state machine and progress plumbing, so they live in one table
+/// distinguished only by this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Download,
+    Convert,
+}
+
+impl JobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Convert => "convert",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "convert" => Self::Convert,
+            _ => Self::Download,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     pub id: String,
+    pub kind: JobKind,
+    /// Download: the source URL. Convert: the source file path.
     pub url: String,
     pub title: String,
+    /// Download: the preset name. Convert: the target format key
+    /// (see `ConvertFormat::as_str`).
     pub preset: String,
     pub state: JobState,
     pub error: Option<String>,
@@ -187,6 +217,7 @@ impl Job {
     pub fn new(url: impl Into<String>, preset: impl Into<String>) -> Self {
         Self {
             id: new_id("job"),
+            kind: JobKind::Download,
             url: url.into(),
             title: String::new(),
             preset: preset.into(),
@@ -194,6 +225,13 @@ impl Job {
             error: None,
             created_at: now_secs(),
             items: Vec::new(),
+        }
+    }
+
+    pub fn new_convert(source_path: impl Into<String>, format: impl Into<String>) -> Self {
+        Self {
+            kind: JobKind::Convert,
+            ..Self::new(source_path, format)
         }
     }
 }

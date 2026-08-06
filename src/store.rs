@@ -1,4 +1,4 @@
-use crate::model::{File, FileKind, Item, Job, JobState, Preset};
+use crate::model::{File, FileKind, Item, Job, JobKind, JobState, Preset};
 use anyhow::Result;
 use turso::{Builder, Connection, Value, params::params_from_iter};
 
@@ -8,6 +8,7 @@ use turso::{Builder, Connection, Value, params::params_from_iter};
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS job (
     id         TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL DEFAULT 'download',
     url        TEXT NOT NULL,
     title      TEXT NOT NULL,
     preset     TEXT NOT NULL,
@@ -105,6 +106,12 @@ impl Store {
         let db = Builder::new_local(path).build().await?;
         let conn = db.connect()?;
         conn.execute_batch(SCHEMA).await?;
+        // ponytail: no migration framework — a DB from before `kind` existed
+        // just gets the column bolted on. Errors here mean the column already
+        // exists (fresh DB, or already migrated), so they're ignored.
+        let _ = conn
+            .execute("ALTER TABLE job ADD COLUMN kind TEXT NOT NULL DEFAULT 'download'", ())
+            .await;
         Ok(Self { conn })
     }
 
@@ -116,12 +123,13 @@ impl Store {
     pub async fn save_job(&self, job: &Job) -> Result<()> {
         self.conn
             .execute(
-                "INSERT INTO job (id, url, title, preset, state, error, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO job (id, kind, url, title, preset, state, error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
-                   url=?2, title=?3, preset=?4, state=?5, error=?6, created_at=?7",
+                   kind=?2, url=?3, title=?4, preset=?5, state=?6, error=?7, created_at=?8",
                 params_from_iter(vec![
                     text(&job.id),
+                    text(job.kind.as_str()),
                     text(&job.url),
                     text(&job.title),
                     text(&job.preset),
@@ -217,7 +225,7 @@ impl Store {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, url, title, preset, state, error, created_at
+                "SELECT id, kind, url, title, preset, state, error, created_at
                  FROM job ORDER BY created_at DESC, id DESC",
                 (),
             )
@@ -226,12 +234,13 @@ impl Store {
         while let Some(row) = rows.next().await? {
             jobs.push(Job {
                 id: get_text(&row, 0)?,
-                url: get_text(&row, 1)?,
-                title: get_text(&row, 2)?,
-                preset: get_text(&row, 3)?,
-                state: JobState::parse(&get_text(&row, 4)?),
-                error: get_opt_text(&row, 5)?,
-                created_at: get_opt_int(&row, 6)?.unwrap_or(0),
+                kind: JobKind::parse(&get_text(&row, 1)?),
+                url: get_text(&row, 2)?,
+                title: get_text(&row, 3)?,
+                preset: get_text(&row, 4)?,
+                state: JobState::parse(&get_text(&row, 5)?),
+                error: get_opt_text(&row, 6)?,
+                created_at: get_opt_int(&row, 7)?.unwrap_or(0),
                 items: Vec::new(),
             });
         }
