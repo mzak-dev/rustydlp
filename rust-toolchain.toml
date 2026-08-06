@@ -1,0 +1,7 @@
+# Must match the toolchain zed pins for the gpui rev in Cargo.lock.
+# gpui_util uses `slice_as_array`, stabilised after 1.89 -> older stables fail
+# with E0658. When bumping the gpui rev, re-check zed's own rust-toolchain.toml.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

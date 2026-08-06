@@ -1,0 +1,44 @@
+[package]
+name = "rustydlp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pinned to an exact rev on purpose: gpui-component floats on zed's main branch,
+# so an unpinned build is not reproducible.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e" }
+
+# Deliberately NOT pinned with `rev`, even though that looks wrong.
+# gpui-component references zed unpinned; cargo keys git deps by source spec, so
+# adding `rev = ...` here creates a SECOND source id for the same commit and
+# compiles gpui twice -> "expected Window, found Window" type errors.
+# The actual pin lives in Cargo.lock (commit it). Verify with `cargo tree -d`.
+gpui = { git = "https://github.com/zed-industries/zed" }
+# gpui_platform provides `application()` — the actual entry point. gpui-component
+# does not depend on it, so it must be declared here or bootstrapping is impossible.
+gpui_platform = { git = "https://github.com/zed-industries/zed" }
+# Ships the built-in Lucide icon set as an AssetSource.
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e" }
+
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# default-features off keeps the `sync` feature (and with it tokio + hyper + rustls)
+# out of the build. Local embedded use only.
+turso = { version = "0.8.0-pre.3", default-features = false }
+anyhow = "1"
+# Only for its channels: a reader thread hands events to a gpui background task.
+futures = "0.3"
+# Resolves the real Videos/Downloads folders via the Windows known-folder API
+# rather than assuming %USERPROFILE%\... — correct when they've been relocated.
+dirs = "6"
+
+[dev-dependencies]
+# Deliberately NOT tokio: if turso's futures complete under pollster's bare
+# block_on, they are runtime-agnostic and will run on gpui's BackgroundExecutor.
+pollster = "0.4"
+
+# ponytail: gpui's dependency tree is huge. opt-level 2 on deps only — our own
+# crate stays at 0 so incremental rebuilds during UI work stay fast.
+[profile.dev.package."*"]
+opt-level = 2

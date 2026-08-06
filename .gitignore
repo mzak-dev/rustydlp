@@ -1,0 +1,7 @@
+/target
+
+# Session/tooling state, not project config
+.claude/scheduled_tasks.lock
+
+# Bundled yt-dlp/ffmpeg live next to the built exe; they are fetched, not tracked
+/bin
