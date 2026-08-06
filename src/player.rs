@@ -372,8 +372,12 @@ fn run_audio_output(
                 Ok(g) => g,
                 Err(_) => return,
             };
+            // ponytail: fixed starting volume, no UI control yet — add a
+            // slider wired to this scale factor if adjustable volume is needed.
+            const START_VOLUME: f32 = 0.45;
             for sample in data.iter_mut() {
-                *sample = guard.pop_front().unwrap_or(0);
+                let raw = guard.pop_front().unwrap_or(0);
+                *sample = (raw as f32 * START_VOLUME) as i16;
             }
         },
         |err| eprintln!("player: audio stream error: {err}"),
