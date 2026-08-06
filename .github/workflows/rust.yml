@@ -10,20 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.resolve.outputs.version }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0 # the tags ARE the version state — see .github/version.sh
-      - run: bash .github/version.sh --test
-      - id: resolve
-        run: bash .github/version.sh >> "$GITHUB_OUTPUT"
-
   test:
-    needs: prepare
     runs-on: windows-latest # the crate is cfg(windows) top to bottom; nothing else can build it
     steps:
       - uses: actions/checkout@v5
@@ -34,36 +21,35 @@ jobs:
       - run: cargo test --workspace -- --skip builds_a_skia_context_on_a_real_d3d12_device
 
   build:
-    needs: [prepare, test]
+    needs: test
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
-      # Cargo.toml holds the manual floor, not the resolved version, so stamp it in —
-      # otherwise the exe's own CARGO_PKG_VERSION would disagree with its release tag.
-      - name: Stamp version
+      # Cargo.toml is the single source of truth for the version, so read it back.
+      - id: version
         shell: bash
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: bash .github/version.sh --stamp "$VERSION"
-      - run: cargo build --release -p dock
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)" >> "$GITHUB_OUTPUT"
+      - run: cargo build --release -p rustydlp
       - uses: actions/upload-artifact@v4
         with:
-          name: dock-${{ needs.prepare.outputs.version }}
-          path: target/release/dock.exe
+          name: rustydlp-${{ steps.version.outputs.version }}
+          path: target/release/rustydlp.exe
 
   release:
     if: github.event_name == 'push'
-    needs: [prepare, build]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write # creates the tag and the release
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dock-${{ needs.prepare.outputs.version }}
+          name: rustydlp-${{ needs.build.outputs.version }}
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --generate-notes dock.exe
+          VERSION: ${{ needs.build.outputs.version }}
+        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --generate-notes rustydlp.exe
