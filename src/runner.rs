@@ -117,7 +117,20 @@ pub fn ytdlp_path(override_path: Option<&Path>) -> Result<PathBuf> {
     ))
 }
 
-fn base_command(exe: &Path) -> Command {
+/// ffmpeg is expected bundled alongside yt-dlp (yt-dlp already shells out to
+/// it by name for muxing), so it resolves through the same search order.
+pub fn ffmpeg_path(override_path: Option<&Path>) -> Result<PathBuf> {
+    resolve("ffmpeg", override_path)
+        .ok_or_else(|| anyhow!("ffmpeg not found in bin dir, next to the exe, or on PATH"))
+}
+
+/// ffprobe ships in the same archive as ffmpeg in every common distribution.
+pub fn ffprobe_path(override_path: Option<&Path>) -> Result<PathBuf> {
+    resolve("ffprobe", override_path)
+        .ok_or_else(|| anyhow!("ffprobe not found in bin dir, next to the exe, or on PATH"))
+}
+
+pub(crate) fn base_command(exe: &Path) -> Command {
     let mut c = Command::new(exe);
     // Without this a console window flashes on every spawn — including the
     // debounced probe that fires while the user is still typing a URL.
@@ -339,6 +352,194 @@ pub fn spawn_download(exe: &Path, url: &str, opts: &YtdlpOptions) -> Result<Down
     }
 
     Ok(Download { events: rx, child })
+}
+
+// ---------------------------------------------------------------------------
+// Convert
+// ---------------------------------------------------------------------------
+
+/// A fixed target format for the Convert feature. No codec picker — each
+/// variant bakes in a codec pair that actually works together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertFormat {
+    Mp4H264Aac,
+    MkvH264Aac,
+    WebmVp9Opus,
+    Mp3Audio,
+}
+
+impl ConvertFormat {
+    pub const ALL: [ConvertFormat; 4] = [
+        Self::Mp4H264Aac,
+        Self::MkvH264Aac,
+        Self::WebmVp9Opus,
+        Self::Mp3Audio,
+    ];
+
+    /// Stored in `Job.preset` for a convert job, and used to round-trip from
+    /// the DB.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mp4H264Aac => "mp4",
+            Self::MkvH264Aac => "mkv",
+            Self::WebmVp9Opus => "webm",
+            Self::Mp3Audio => "mp3",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "mkv" => Self::MkvH264Aac,
+            "webm" => Self::WebmVp9Opus,
+            "mp3" => Self::Mp3Audio,
+            _ => Self::Mp4H264Aac,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mp4H264Aac => "MP4 (H.264/AAC)",
+            Self::MkvH264Aac => "MKV (H.264/AAC)",
+            Self::WebmVp9Opus => "WebM (VP9/Opus)",
+            Self::Mp3Audio => "MP3 (audio only)",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// Always a full re-encode — no remux-first branching — so it works
+    /// regardless of the source's own codec.
+    fn ffmpeg_codec_args(self) -> Vec<&'static str> {
+        match self {
+            Self::Mp4H264Aac | Self::MkvH264Aac => {
+                vec!["-c:v", "libx264", "-c:a", "aac"]
+            }
+            Self::WebmVp9Opus => vec!["-c:v", "libvpx-vp9", "-c:a", "libopus"],
+            Self::Mp3Audio => vec!["-vn", "-c:a", "libmp3lame"],
+        }
+    }
+}
+
+/// Same directory as the source, named so a same-extension conversion (e.g.
+/// mp4 -> mp4) can never collide with the file it was made from.
+pub fn convert_output_path(source: &Path, format: ConvertFormat) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "converted".to_string());
+    source.with_file_name(format!("{stem} [{}].{}", format.as_str(), format.extension()))
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConvertProgress {
+    pub out_time_secs: Option<f64>,
+    pub speed: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConvertEvent {
+    Progress(ConvertProgress),
+    Log(String),
+}
+
+/// A running conversion. Mirrors `Download`'s shape exactly — same
+/// child-tracking, same cancel handle — just driven by ffmpeg's own
+/// `-progress` key=value stream instead of yt-dlp's JSON.
+pub struct Convert {
+    pub events: mpsc::UnboundedReceiver<ConvertEvent>,
+    pub output_path: PathBuf,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl Convert {
+    pub fn cancel_handle(&self) -> CancelHandle {
+        CancelHandle(Arc::clone(&self.child))
+    }
+}
+
+pub fn spawn_convert(ffmpeg: &Path, source: &Path, format: ConvertFormat) -> Result<Convert> {
+    let output_path = convert_output_path(source, format);
+
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-y".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-i".into(),
+        source.into(),
+    ];
+    args.extend(format.ffmpeg_codec_args().into_iter().map(Into::into));
+    args.extend(
+        ["-progress", "pipe:1", "-nostats"]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+    );
+    args.push(output_path.clone().into_os_string());
+
+    let mut child = base_command(ffmpeg)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn ffmpeg")?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("child stdout was not captured"))?;
+    let stderr = child.stderr.take();
+
+    let (tx, rx) = mpsc::unbounded();
+    let child = Arc::new(Mutex::new(Some(child)));
+
+    if let Some(stderr) = stderr {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.unbounded_send(ConvertEvent::Log(line));
+            }
+        });
+    }
+
+    {
+        let child = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let mut acc = ConvertProgress::default();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "out_time_ms" => {
+                        acc.out_time_secs = value.trim().parse::<f64>().ok().map(|us| us / 1_000_000.0);
+                    }
+                    "speed" => {
+                        acc.speed = value.trim().trim_end_matches('x').parse().ok();
+                    }
+                    "progress" => {
+                        // One "frame" of key=value pairs ends with
+                        // progress=continue|end — that's the signal to emit.
+                        let _ = tx.unbounded_send(ConvertEvent::Progress(acc.clone()));
+                        if value.trim() == "end" {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let status = child.lock().ok().and_then(|mut g| g.as_mut().map(|c| c.wait()));
+            let msg = match status {
+                Some(Ok(s)) if s.success() => EXIT_OK.to_string(),
+                Some(Ok(s)) => format!("{EXIT_FAIL_PREFIX}{}", s.code().unwrap_or(-1)),
+                _ => format!("{EXIT_FAIL_PREFIX}unknown"),
+            };
+            let _ = tx.unbounded_send(ConvertEvent::Log(msg));
+        });
+    }
+
+    Ok(Convert { events: rx, output_path, child })
 }
 
 #[cfg(test)]

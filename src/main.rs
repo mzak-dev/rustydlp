@@ -5,6 +5,7 @@
 mod app;
 mod assets;
 mod model;
+mod player;
 mod runner;
 mod store;
 mod ytdlp;

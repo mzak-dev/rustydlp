@@ -32,6 +32,16 @@ futures = "0.3"
 # Resolves the real Videos/Downloads folders via the Windows known-folder API
 # rather than assuming %USERPROFILE%\... — correct when they've been relocated.
 dirs = "6"
+# Pinned to the exact version gpui already pulls in (see Cargo.lock): the
+# player builds gpui::RenderImage frames directly, which requires the same
+# image::Frame type gpui itself compiles against.
+image = { version = "=0.25.10", default-features = false }
+# Same reason as `image` above: RenderImage::new takes a SmallVec of the
+# exact smallvec crate instance gpui itself compiles against.
+smallvec = "=1.15.2"
+# Raw PCM audio output for the native player. No decoder features needed —
+# ffmpeg already decodes to raw samples before they reach cpal.
+cpal = "0.15"
 
 [dev-dependencies]
 # Deliberately NOT tokio: if turso's futures complete under pollster's bare
