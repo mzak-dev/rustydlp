@@ -184,6 +184,29 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes a job and its item/file subtree.
+    pub async fn delete_job(&self, job_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM file WHERE item_id IN (SELECT id FROM item WHERE job_id = ?1)",
+                params_from_iter(vec![text(job_id)]),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM item WHERE job_id = ?1",
+                params_from_iter(vec![text(job_id)]),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM job WHERE id = ?1",
+                params_from_iter(vec![text(job_id)]),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Loads every job, newest first, with items and files attached.
     ///
     /// ponytail: N+1 queries (one per job for items, one per item for files).
