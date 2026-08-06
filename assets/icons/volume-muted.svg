@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
+     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Same speaker as volume.svg with the waves replaced by a cross, so the
+       two icons swap in place without the button changing width. -->
+  <path d="M11 4.7 6.6 8.4H3v7.2h3.6L11 19.3z"/>
+  <path d="M16 9.5l5 5"/>
+  <path d="M21 9.5l-5 5"/>
+</svg>

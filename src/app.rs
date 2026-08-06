@@ -2,9 +2,10 @@ use futures::StreamExt as _;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, IconName,
+    ActiveTheme, Icon, IconName,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
+    slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
     tab::{Tab, TabBar},
     *,
@@ -130,6 +131,22 @@ pub struct RustyDlp {
     /// Bumped on every load/seek so a stray event from a just-replaced
     /// playback run can't clobber the state of the run that replaced it.
     player_gen: u64,
+    /// Path whose last load attempt failed. Needed because a failed load
+    /// notifies, which re-renders, which calls `ensure_player` again — an
+    /// unguarded retry spins a fresh ffprobe every frame for as long as the
+    /// item stays open. Cleared on navigating away, so re-opening the item
+    /// tries again.
+    player_failed: Option<String>,
+    /// Seek bar position as a fraction of the source's duration, not as
+    /// seconds: a `SliderState`'s range is fixed when it is built, and the
+    /// duration only becomes known once a file is loaded.
+    seek_slider: Entity<SliderState>,
+    /// Output gain, `0.0..=1.0`.
+    volume_slider: Entity<SliderState>,
+    /// Kept here rather than on `PlayerState` so it survives seeks (which
+    /// re-spawn ffmpeg) and carries over to the next item played.
+    volume: f32,
+    muted: bool,
     /// Source file path awaiting a target-format choice, if the format
     /// picker is open. Set by both the per-item Convert button and the
     /// Convert tab's "Convert File" picker.
@@ -145,8 +162,21 @@ struct PlayerState {
     path: String,
     frame: Option<Arc<gpui::RenderImage>>,
     position_secs: f64,
+    /// Total length: ffprobe's, or the item's recorded one as a fallback.
+    /// Without it there is nothing to draw a seek bar against.
+    duration_secs: Option<f64>,
     playing: bool,
+    /// Playback reached the end of the file. Play then restarts from the top
+    /// rather than un-pausing pipes that have nothing left to give.
+    ended: bool,
+    /// True while the seek bar is being dragged, so arriving frame positions
+    /// don't fight the thumb for the slider's value.
+    scrubbing: bool,
 }
+
+/// Starting playback volume. Full scale is loud enough to be startling on a
+/// first play, and there is no per-file gain to compensate with.
+const DEFAULT_VOLUME: f32 = 0.45;
 
 fn db_path() -> PathBuf {
     let base = std::env::var_os("APPDATA")
@@ -252,15 +282,54 @@ impl RustyDlp {
             InputState::new(window, cx).placeholder("Extra args for this download only")
         });
 
-        let _subs = vec![cx.subscribe_in(&url_input, window, {
-            let input = url_input.clone();
-            move |this: &mut Self, _, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    let value = input.read(cx).value().to_string();
-                    this.schedule_probe(value, window, cx);
+        // Both player sliders work in normalised units: the seek bar as a
+        // fraction of the duration, the volume as a gain factor.
+        let seek_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(1.0)
+                .step(0.001)
+                .default_value(0.0)
+        });
+        let volume_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(1.0)
+                .step(0.01)
+                .default_value(DEFAULT_VOLUME)
+        });
+
+        let _subs = vec![
+            cx.subscribe_in(&url_input, window, {
+                let input = url_input.clone();
+                move |this: &mut Self, _, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        let value = input.read(cx).value().to_string();
+                        this.schedule_probe(value, window, cx);
+                    }
                 }
-            }
-        })];
+            }),
+            // Dragging only moves the readout; the seek itself waits for the
+            // release, because every seek re-spawns two ffmpeg processes and
+            // doing that per mouse-move would thrash.
+            cx.subscribe_in(
+                &seek_slider,
+                window,
+                |this: &mut Self, _, ev: &SliderEvent, _, cx| match ev {
+                    SliderEvent::Change(value) => this.scrub_to(value.end(), cx),
+                    SliderEvent::Release(value) => this.seek_to_fraction(value.end(), cx),
+                },
+            ),
+            cx.subscribe_in(
+                &volume_slider,
+                window,
+                |this: &mut Self, _, ev: &SliderEvent, _, cx| {
+                    if let SliderEvent::Change(value) = ev {
+                        this.set_volume(value.end(), cx);
+                    }
+                },
+            ),
+        ];
 
         let mut this = Self {
             ytdlp: None,
@@ -289,6 +358,11 @@ impl RustyDlp {
             player: None,
             player_pending: None,
             player_gen: 0,
+            player_failed: None,
+            seek_slider,
+            volume_slider,
+            volume: DEFAULT_VOLUME,
+            muted: false,
             convert_picker: None,
             _subs,
         };
@@ -1120,18 +1194,23 @@ impl RustyDlp {
             .bg(cx.theme().sidebar)
             .border_b_1()
             .border_color(cx.theme().sidebar_border)
-            // Three equal-width columns: wordmark left, tabs centered
-            // independent of the wordmark's own width, empty spacer right to
-            // balance the layout.
+            // Three columns: wordmark left, tabs centered independent of the
+            // wordmark's own width, empty spacer right to balance the layout.
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .font_bold()
                     .text_color(cx.theme().sidebar_foreground)
                     .child("rustyDLP"),
             )
-            .child(div().flex_shrink_0().child(tabs.w(px(340.))))
-            .child(div().flex_1())
+            // Deliberately no width: a fixed one was wider than the three
+            // labels, and TabBar lays its tabs out from the left, so the
+            // slack showed up as dead segmented background hanging off the
+            // right-hand end. Left to size itself, the bar shrink-wraps the
+            // tabs and the row stays centered.
+            .child(div().flex_shrink_0().child(tabs))
+            .child(div().flex_1().min_w_0())
             .into_any_element()
     }
 
@@ -1206,9 +1285,9 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn main_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn main_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.route == Route::Settings {
-            self.ensure_player(None, cx);
+            self.ensure_player(None, None, cx);
             return self.settings(cx);
         }
         // A selected job always wins over the tab's own landing view — this
@@ -1225,7 +1304,7 @@ impl RustyDlp {
             .and_then(|id| self.jobs.iter().find(|j| &j.id == id))
             .cloned()
         else {
-            self.ensure_player(None, cx);
+            self.ensure_player(None, None, cx);
             return match self.tab {
                 SidebarTab::InProgress => self.in_progress_pane(cx),
                 SidebarTab::Convert => self.convert_page(cx),
@@ -1235,18 +1314,18 @@ impl RustyDlp {
 
         // Job -> Item -> File: one item goes straight to detail, many show a grid.
         match job.items.len() {
-            0 => self.detail(&job, None, cx),
+            0 => self.detail(&job, None, window, cx),
             1 => {
                 let item = job.items.first().cloned();
-                self.detail(&job, item.as_ref(), cx)
+                self.detail(&job, item.as_ref(), window, cx)
             }
             _ => match self.open_item.clone() {
                 Some(item_id) => {
                     let item = job.items.iter().find(|i| i.id == item_id).cloned();
-                    self.detail(&job, item.as_ref(), cx)
+                    self.detail(&job, item.as_ref(), window, cx)
                 }
                 None => {
-                    self.ensure_player(None, cx);
+                    self.ensure_player(None, None, cx);
                     self.grid(&job, cx)
                 }
             },
@@ -1726,19 +1805,27 @@ impl RustyDlp {
     /// Starts/stops native playback so it always matches whatever file
     /// `detail()` is currently showing. `target` is the playable file path
     /// for the item on screen, or `None` when nothing playable is showing
-    /// (multi-item grid, empty state, Settings, ...).
-    fn ensure_player(&mut self, target: Option<&str>, cx: &mut Context<Self>) {
+    /// (multi-item grid, empty state, Settings, ...). `duration_hint` is the
+    /// length recorded at download time, used only when ffprobe can't report
+    /// one of its own.
+    fn ensure_player(
+        &mut self,
+        target: Option<&str>,
+        duration_hint: Option<f64>,
+        cx: &mut Context<Self>,
+    ) {
         match target {
             None => self.stop_player(),
             Some(path) => {
                 let already_loaded = self.player.as_ref().map(|p| p.path.as_str()) == Some(path);
                 let already_loading = self.player_pending.as_deref() == Some(path);
-                if already_loaded || already_loading {
+                let failed = self.player_failed.as_deref() == Some(path);
+                if already_loaded || already_loading || failed {
                     return;
                 }
                 self.stop_player();
                 self.player_pending = Some(path.to_string());
-                self.load_player(path.to_string(), 0.0, cx);
+                self.load_player(path.to_string(), 0.0, duration_hint, cx);
             }
         }
     }
@@ -1748,6 +1835,7 @@ impl RustyDlp {
             p.control.stop();
         }
         self.player_pending = None;
+        self.player_failed = None;
         // Any in-flight load's result will still arrive, but its generation
         // will no longer match — see `load_player`.
         self.player_gen += 1;
@@ -1755,15 +1843,25 @@ impl RustyDlp {
 
     /// Resolves ffmpeg/ffprobe, probes, and starts playback entirely off the
     /// UI thread (both are blocking calls) — see `player::load`.
-    fn load_player(&mut self, path: String, start_at_secs: f64, cx: &mut Context<Self>) {
+    fn load_player(
+        &mut self,
+        path: String,
+        start_at_secs: f64,
+        duration_hint: Option<f64>,
+        cx: &mut Context<Self>,
+    ) {
         self.player_gen += 1;
         let generation = self.player_gen;
-        let rx = player::load(PathBuf::from(&path), start_at_secs);
+        let rx = player::load(
+            PathBuf::from(&path),
+            start_at_secs,
+            self.effective_volume(),
+        );
 
         cx.spawn(async move |this, cx| {
             let loaded = rx.await;
-            let (control, mut events) = match loaded {
-                Ok(Ok((_, control, events))) => (control, events),
+            let (info, control, mut events) = match loaded {
+                Ok(Ok((info, control, events))) => (info, control, events),
                 _ => {
                     // ponytail: silent fallback to the static poster +
                     // Open Externally, which always works regardless of why
@@ -1772,6 +1870,14 @@ impl RustyDlp {
                     let _ = this.update(cx, |this, cx| {
                         if this.player_pending.as_deref() == Some(path.as_str()) {
                             this.player_pending = None;
+                            this.player_failed = Some(path.clone());
+                            // A seek that fails to restart leaves the old,
+                            // already-stopped run on screen; drop it so the
+                            // fallback poster takes over rather than a player
+                            // whose buttons do nothing.
+                            if this.player.as_ref().is_some_and(|p| p.path == path) {
+                                this.player = None;
+                            }
                             cx.notify();
                         }
                     });
@@ -1789,13 +1895,24 @@ impl RustyDlp {
                         control.stop();
                         return false;
                     }
+                    // A seek keeps the outgoing run's last frame on screen so
+                    // the view doesn't drop back to the poster (losing the
+                    // controls with it) while ffmpeg restarts.
+                    let carried_frame = this
+                        .player
+                        .as_ref()
+                        .filter(|p| p.path == path)
+                        .and_then(|p| p.frame.clone());
                     this.player_pending = None;
                     this.player = Some(PlayerState {
                         control,
                         path: path.clone(),
-                        frame: None,
+                        frame: carried_frame,
                         position_secs: start_at_secs,
+                        duration_secs: info.duration.or(duration_hint),
                         playing: true,
+                        ended: false,
+                        scrubbing: false,
                     });
                     cx.notify();
                     true
@@ -1816,12 +1933,18 @@ impl RustyDlp {
                             player::PlayerEvent::Frame(frame, pts) => {
                                 if let Some(p) = this.player.as_mut() {
                                     p.frame = Some(frame);
-                                    p.position_secs = pts;
+                                    // While the thumb is being dragged the
+                                    // readout belongs to it, not to the run
+                                    // still playing behind it.
+                                    if !p.scrubbing {
+                                        p.position_secs = pts;
+                                    }
                                 }
                             }
                             player::PlayerEvent::Ended => {
                                 if let Some(p) = this.player.as_mut() {
                                     p.playing = false;
+                                    p.ended = true;
                                 }
                             }
                         }
@@ -1838,6 +1961,12 @@ impl RustyDlp {
     }
 
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        // Once the pipes have run dry there is nothing to un-pause, so Play
+        // on a finished file means "play it again".
+        if self.player.as_ref().is_some_and(|p| p.ended) {
+            self.seek_to(0.0, cx);
+            return;
+        }
         if let Some(p) = self.player.as_mut() {
             p.playing = !p.playing;
             p.control.set_paused(!p.playing);
@@ -1845,10 +1974,88 @@ impl RustyDlp {
         }
     }
 
+    /// Drag feedback only: moves the readout without touching playback, so a
+    /// drag across the bar doesn't spawn an ffmpeg per pixel.
+    fn scrub_to(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let Some(p) = self.player.as_mut() else {
+            return;
+        };
+        let Some(duration) = p.duration_secs else {
+            return;
+        };
+        p.scrubbing = true;
+        p.position_secs = (fraction as f64 * duration).clamp(0.0, duration);
+        cx.notify();
+    }
+
+    fn seek_to_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let Some(duration) = self.player.as_ref().and_then(|p| p.duration_secs) else {
+            return;
+        };
+        self.seek_to((fraction as f64 * duration).clamp(0.0, duration), cx);
+    }
+
+    /// ffmpeg can't seek in place over a pipe, so a seek is a fresh pair of
+    /// processes started with a new `-ss`. The old run is stopped up front
+    /// (otherwise its audio keeps playing through the restart) but its state
+    /// — including the last frame — stays on screen until the new run
+    /// delivers.
+    fn seek_to(&mut self, secs: f64, cx: &mut Context<Self>) {
+        let Some(p) = self.player.as_mut() else {
+            return;
+        };
+        let path = p.path.clone();
+        let duration = p.duration_secs;
+        let secs = secs.max(0.0);
+
+        p.control.stop();
+        p.position_secs = secs;
+        p.scrubbing = false;
+        p.ended = false;
+        // A seek always resumes: leaving a frozen frame from the old position
+        // on screen while the new one decodes reads as a hang.
+        p.playing = true;
+
+        // Without this, the `ensure_player` call in the next render sees no
+        // load in flight and restarts the file from the beginning.
+        self.player_pending = Some(path.clone());
+        self.load_player(path, secs, duration, cx);
+    }
+
+    fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        self.volume = volume.clamp(0.0, 1.0);
+        // Reaching for the slider is also how you come back from mute.
+        self.muted = false;
+        self.apply_volume(cx);
+    }
+
+    fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        self.muted = !self.muted;
+        self.apply_volume(cx);
+    }
+
+    /// What actually reaches the audio callback. Mute is kept separate from
+    /// the slider's value so un-muting restores the level you had.
+    fn effective_volume(&self) -> f32 {
+        if self.muted { 0.0 } else { self.volume }
+    }
+
+    fn apply_volume(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.player.as_ref() {
+            p.control.set_volume(self.effective_volume());
+        }
+        cx.notify();
+    }
+
     /// The poster/player element that replaces the old static thumbnail:
     /// shows the live decoded frame once playback has started, otherwise
     /// falls back to the plain cover art.
-    fn player_view(&self, item: Option<&Item>, cx: &mut Context<Self>) -> AnyElement {
+    fn player_view(
+        &self,
+        item: Option<&Item>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let thumb = item.and_then(|i| i.thumb_path.as_deref());
 
         let Some(player) = &self.player else {
@@ -1857,6 +2064,10 @@ impl RustyDlp {
         let Some(frame) = player.frame.clone() else {
             return cover(thumb, px(300.), px(96.), cx);
         };
+
+        let position = player.position_secs;
+        let duration = player.duration_secs;
+        self.sync_seek_slider(position, duration, player.scrubbing, window, cx);
 
         v_flex()
             .gap_2()
@@ -1877,7 +2088,8 @@ impl RustyDlp {
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .w_full()
+                    .gap_3()
                     .items_center()
                     .child(
                         Button::new("player-toggle")
@@ -1891,28 +2103,83 @@ impl RustyDlp {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(human_duration(player.position_secs)),
+                            .child(match duration {
+                                Some(d) => {
+                                    format!("{} / {}", human_duration(position), human_duration(d))
+                                }
+                                None => human_duration(position),
+                            }),
                     )
                     .child(
-                        // ponytail: display-only — shows progress but isn't
-                        // click-to-seek yet. Add position math against this
-                        // bar's own prepainted bounds (same technique
-                        // TabBar's indicator uses) if click-to-seek is
-                        // needed.
                         div()
                             .flex_1()
-                            .h(px(4.))
-                            .rounded_full()
-                            .bg(cx.theme().muted)
-                            .child(div().h_full().rounded_full().bg(cx.theme().progress_bar)),
-                    ),
+                            .min_w_0()
+                            // Nothing to seek against without a duration: a
+                            // live stream, or a container ffprobe can't
+                            // measure.
+                            .child(Slider::new(&self.seek_slider).disabled(duration.is_none())),
+                    )
+                    .child(self.volume_controls(cx)),
             )
             .into_any_element()
     }
 
-    fn detail(&mut self, job: &Job, item: Option<&Item>, cx: &mut Context<Self>) -> AnyElement {
+    /// Keeps the seek thumb on the playhead. Deliberately conditional:
+    /// `set_value` notifies, and notifying every frame for a value that
+    /// hasn't moved is a render loop.
+    fn sync_seek_slider(
+        &self,
+        position: f64,
+        duration: Option<f64>,
+        scrubbing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // While the thumb is under the mouse it owns the value.
+        if scrubbing {
+            return;
+        }
+        let fraction = match duration {
+            Some(d) if d > 0.0 => (position / d).clamp(0.0, 1.0) as f32,
+            _ => 0.0,
+        };
+        if (self.seek_slider.read(cx).value().end() - fraction).abs() <= 0.0005 {
+            return;
+        }
+        self.seek_slider
+            .update(cx, |state, cx| state.set_value(fraction, window, cx));
+    }
+
+    fn volume_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .flex_shrink_0()
+            .gap_1()
+            .items_center()
+            .child(
+                Button::new("player-mute")
+                    .small()
+                    .ghost()
+                    .icon(Icon::empty().path(if self.muted || self.volume <= 0.0 {
+                        "icons/volume-muted.svg"
+                    } else {
+                        "icons/volume.svg"
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
+            )
+            .child(div().w(px(88.)).child(Slider::new(&self.volume_slider)))
+            .into_any_element()
+    }
+
+    fn detail(
+        &mut self,
+        job: &Job,
+        item: Option<&Item>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let title = item
             .map(|i| i.title.clone())
             .filter(|t| !t.is_empty())
@@ -1980,8 +2247,8 @@ impl RustyDlp {
         let running = is_active(job.state);
         let retryable = is_retryable(job.state);
 
-        self.ensure_player(playable.as_deref(), cx);
-        let player_view = self.player_view(item, cx);
+        self.ensure_player(playable.as_deref(), item.and_then(|i| i.duration), cx);
+        let player_view = self.player_view(item, window, cx);
         // Borrowed only after the `&mut self` calls above — holding this
         // across them would conflict with the mutable borrow they need.
         let live = self.live.get(&job.id);
@@ -2837,10 +3104,10 @@ mod tests {
 }
 
 impl Render for RustyDlp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let navbar = self.navbar(cx);
         let sidebar = self.sidebar(cx);
-        let main = self.main_pane(cx);
+        let main = self.main_pane(window, cx);
         let modal = if self.modal { Some(self.modal(cx)) } else { None };
         let convert_modal = self
             .convert_picker
