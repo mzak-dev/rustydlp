@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Only the release job writes anything; everything else is read-only.
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the tags ARE the version state — see .github/version.sh
+      - run: bash .github/version.sh --test
+      - id: resolve
+        run: bash .github/version.sh >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
+    runs-on: windows-latest # the crate is cfg(windows) top to bottom; nothing else can build it
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Skipping the one test whose own doc comment rules out CI: it needs a real D3D12
+      # adapter, and the adapter loop deliberately steps over WARP (render/d3d.rs).
+      - run: cargo test --workspace -- --skip builds_a_skia_context_on_a_real_d3d12_device
+
+  build:
+    needs: [prepare, test]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      # Cargo.toml holds the manual floor, not the resolved version, so stamp it in —
+      # otherwise the exe's own CARGO_PKG_VERSION would disagree with its release tag.
+      - name: Stamp version
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash .github/version.sh --stamp "$VERSION"
+      - run: cargo build --release -p dock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dock-${{ needs.prepare.outputs.version }}
+          path: target/release/dock.exe
+
+  release:
+    if: github.event_name == 'push'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # creates the tag and the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dock-${{ needs.prepare.outputs.version }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --generate-notes dock.exe
