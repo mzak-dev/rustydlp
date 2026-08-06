@@ -2059,10 +2059,10 @@ impl RustyDlp {
         let thumb = item.and_then(|i| i.thumb_path.as_deref());
 
         let Some(player) = &self.player else {
-            return cover(thumb, px(300.), px(96.), cx);
+            return self.stage(cover(thumb, relative(1.), px(96.), cx), cx);
         };
         let Some(frame) = player.frame.clone() else {
-            return cover(thumb, px(300.), px(96.), cx);
+            return self.stage(cover(thumb, relative(1.), px(96.), cx), cx);
         };
 
         let position = player.position_secs;
@@ -2070,25 +2070,31 @@ impl RustyDlp {
         self.sync_seek_slider(position, duration, player.scrubbing, window, cx);
 
         v_flex()
+            // Takes the detail pane's leftover height so the picture grows
+            // with the window; min_h_0 is what lets it shrink again, since a
+            // column flex item's automatic minimum is its content height.
+            .flex_1()
+            .min_h_0()
             .gap_2()
             .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .h(px(300.))
-                    .rounded(cx.theme().radius)
-                    .overflow_hidden()
-                    .bg(gpui::black())
-                    .child(
-                        img(frame)
-                            .w_full()
-                            .h_full()
-                            .object_fit(ObjectFit::Contain),
-                    ),
+                self.stage(
+                    // Positioned against the stage rather than sized in
+                    // percentages: an `img` left at Length::Auto gets the
+                    // frame's natural size (1920x1080) forced on it, which
+                    // would overflow and clip.
+                    img(frame)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Contain)
+                        .into_any_element(),
+                    cx,
+                ),
             )
             .child(
                 h_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .gap_3()
                     .items_center()
                     .child(
@@ -2124,6 +2130,29 @@ impl RustyDlp {
                     )
                     .child(self.volume_controls(cx)),
             )
+            .into_any_element()
+    }
+
+    /// The box the decoded frame — or the poster, before the first frame
+    /// arrives — is drawn into.
+    ///
+    /// Flexes with the window instead of sitting at a fixed height: pinned at
+    /// 300px, maximising the window only widened the black surround while a
+    /// 1080p frame stayed letterboxed into the same short strip. `Contain`
+    /// keeps the whole frame visible whatever shape the pane ends up, and
+    /// `relative` is what the frame positions itself against.
+    fn stage(&self, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .relative()
+            .w_full()
+            .flex_1()
+            // A floor, so a short window shrinks the picture rather than
+            // losing it entirely behind the controls.
+            .min_h(px(180.))
+            .rounded(cx.theme().radius)
+            .overflow_hidden()
+            .bg(gpui::black())
+            .child(content)
             .into_any_element()
     }
 
@@ -2825,13 +2854,20 @@ fn toggle(
 /// Cover art box: the real thumbnail when one exists on disk, otherwise the
 /// placeholder glyph. Checks `is_file` because the DB may name a cover the user
 /// has since deleted, and gpui would otherwise render a broken-image gap.
+///
+/// `height` is a `Length` rather than `Pixels` so the same box serves both the
+/// fixed-size grid cards and the player's stage, which fills whatever height
+/// the window gives it.
 fn cover(
     thumb: Option<&str>,
-    height: Pixels,
+    height: impl Into<Length>,
     glyph: Pixels,
     cx: &mut Context<RustyDlp>,
 ) -> AnyElement {
     let existing = thumb.filter(|p| std::path::Path::new(p).is_file());
+    // Converted up front: `Styled::h` takes its argument by value and both
+    // arms need it.
+    let height: Length = height.into();
 
     match existing {
         Some(path) => img(PathBuf::from(path))
