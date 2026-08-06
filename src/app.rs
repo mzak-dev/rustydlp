@@ -664,6 +664,27 @@ impl RustyDlp {
         cx.notify();
     }
 
+    /// Removes a job from the list and library. Only for jobs that aren't
+    /// actively downloading — cancel first.
+    fn delete_job(&mut self, job_id: &str, cx: &mut Context<Self>) {
+        self.jobs.retain(|j| j.id != job_id);
+        self.live.remove(job_id);
+        self.cancels.remove(job_id);
+        if self.selected.as_deref() == Some(job_id) {
+            self.selected = None;
+        }
+        if let Some(store) = self.store.clone() {
+            let job_id = job_id.to_string();
+            cx.background_spawn(async move {
+                if let Err(e) = store.delete_job(&job_id).await {
+                    eprintln!("rustydlp: failed to delete job {job_id}: {e}");
+                }
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
     /// Re-queues a failed or cancelled job. Partial `.part` files survive a
     /// kill, so yt-dlp resumes rather than starting the transfer again.
     fn retry_job(&mut self, job_id: &str, cx: &mut Context<Self>) {
@@ -1625,6 +1646,19 @@ impl RustyDlp {
                                         .label("Retry")
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.retry_job(&id, cx);
+                                        })),
+                                )
+                            })
+                            .when(!running, |this| {
+                                let id = job_id.clone();
+                                this.child(
+                                    Button::new("delete-job")
+                                        .small()
+                                        .ghost()
+                                        .danger()
+                                        .label("Delete")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.delete_job(&id, cx);
                                         })),
                                 )
                             }),
