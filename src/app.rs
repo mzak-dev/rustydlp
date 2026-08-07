@@ -3,7 +3,9 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
     ActiveTheme, Icon, IconName,
+    animation::{Lerp, cubic_bezier},
     button::{Button, ButtonVariants as _},
+    dialog::Dialog,
     input::{Input, InputEvent, InputState},
     slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
@@ -20,6 +22,26 @@ use crate::player;
 use crate::runner::{self, ConvertEvent, ConvertFormat, Probe};
 use crate::store::Store;
 use crate::ytdlp::{Event, FormatMode, YtdlpOptions};
+
+/// The app's default motion curve. Used everywhere animated except dialogs,
+/// whose entrance is fixed by `gpui_component::dialog` (see
+/// CONTEXT.md#motion-system).
+///
+/// ponytail: clamped to [0, 1] rather than a true overshooting back-ease —
+/// gpui's `AnimationElement` debug_asserts the eased delta stays in that
+/// range (crates/gpui/src/elements/animation.rs), so an unclamped
+/// cubic_bezier(0.34, 1.56, 0.64, 1.0) panics the instant it plays, and that
+/// panic unwinding through a native paint callback is what was crashing the
+/// app. A real overshoot needs a two-stage animation (grow past the target,
+/// then settle back) via `with_animations`, staying in-range each stage —
+/// worth doing once this is confirmed to be the actual fix.
+fn bounce_ease() -> impl Fn(f32) -> f32 {
+    let curve = cubic_bezier(0.34, 1.56, 0.64, 1.0);
+    move |t| curve(t).clamp(0.0, 1.0)
+}
+
+/// Shared duration for bounce-eased UI motion.
+const BOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Route {
@@ -96,7 +118,6 @@ pub struct RustyDlp {
     open_item: Option<String>,
     route: Route,
     tab: SidebarTab,
-    modal: bool,
     url_input: Entity<InputState>,
     /// Extra yt-dlp args applied to this download only, never saved back to the
     /// preset. Keeps the merge two layers deep: preset, then this run.
@@ -147,10 +168,6 @@ pub struct RustyDlp {
     /// re-spawn ffmpeg) and carries over to the next item played.
     volume: f32,
     muted: bool,
-    /// Source file path awaiting a target-format choice, if the format
-    /// picker is open. Set by both the per-item Convert button and the
-    /// Convert tab's "Convert File" picker.
-    convert_picker: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -340,7 +357,6 @@ impl RustyDlp {
             open_item: None,
             route: Route::Library,
             tab: SidebarTab::Download,
-            modal: false,
             url_input,
             override_input,
             probe: ProbeState::Idle,
@@ -363,7 +379,6 @@ impl RustyDlp {
             volume_slider,
             volume: DEFAULT_VOLUME,
             muted: false,
-            convert_picker: None,
             _subs,
         };
         this.refresh_ytdlp();
@@ -529,7 +544,6 @@ impl RustyDlp {
         self.live.insert(job_id.clone(), Live::default());
         self.selected = Some(job_id.clone());
         self.open_item = None;
-        self.modal = false;
         self.probe = ProbeState::Idle;
         // Deliberately does NOT switch to the In progress tab: Home already
         // lists the new job, so a jump would only move you off what you had.
@@ -1037,9 +1051,12 @@ impl RustyDlp {
         self.sidebar_collapsed || self.tab == SidebarTab::InProgress
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.sidebar_is_collapsed() {
-            return v_flex()
+    fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let collapsed = self.sidebar_is_collapsed();
+        let target = if collapsed { px(56.) } else { px(260.) };
+
+        let content: AnyElement = if collapsed {
+            v_flex()
                 .w(px(56.))
                 .h_full()
                 .flex_shrink_0()
@@ -1049,43 +1066,70 @@ impl RustyDlp {
                 .border_color(cx.theme().sidebar_border)
                 .child(v_flex().flex_1())
                 .child(self.sidebar_actions(true, cx))
-                .into_any_element();
+                .into_any_element()
+        } else {
+            let visible = self.visible_jobs();
+            let rows: Vec<AnyElement> = visible
+                .iter()
+                .map(|job| self.job_row(job, window, cx))
+                .collect();
+            let is_empty = rows.is_empty();
+
+            v_flex()
+                .w(px(260.))
+                .h_full()
+                .flex_shrink_0()
+                .bg(cx.theme().sidebar)
+                .border_r_1()
+                .border_color(cx.theme().sidebar_border)
+                .child(
+                    v_flex()
+                        // .id() is required before .overflow_y_scroll(): the scroll
+                        // offset is retained state and needs identity across frames.
+                        .id("job-list")
+                        .flex_1()
+                        .min_h_0()
+                        .p_3()
+                        .gap_1()
+                        .overflow_y_scroll()
+                        .when(is_empty, |this| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .text_sm()
+                                    .text_color(cx.theme().sidebar_foreground.opacity(0.55))
+                                    .child(self.tab.empty_message()),
+                            )
+                        })
+                        .children(rows),
+                )
+                .child(self.sidebar_actions(false, cx))
+                .into_any_element()
+        };
+
+        // Fixed-width content (its natural resting size either way) behind an
+        // animated-width peephole: the width tween never has to reflow the
+        // content itself, just reveal or hide more of its left edge.
+        let clip = div().h_full().flex_shrink_0().overflow_hidden().child(content);
+
+        let settled = window.use_keyed_state("sidebar-width", cx, |_, _| target);
+        let from = *settled.read(cx);
+        if from == target {
+            return clip.w(target).into_any_element();
         }
 
-        let visible = self.visible_jobs();
-        let rows: Vec<AnyElement> = visible.iter().map(|job| self.job_row(job, cx)).collect();
-        let is_empty = rows.is_empty();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(BOUNCE).await;
+            settled.update(cx, |v, _| *v = target);
+        })
+        .detach();
 
-        v_flex()
-            .w(px(260.))
-            .h_full()
-            .flex_shrink_0()
-            .bg(cx.theme().sidebar)
-            .border_r_1()
-            .border_color(cx.theme().sidebar_border)
-            .child(
-                v_flex()
-                    // .id() is required before .overflow_y_scroll(): the scroll
-                    // offset is retained state and needs identity across frames.
-                    .id("job-list")
-                    .flex_1()
-                    .min_h_0()
-                    .p_3()
-                    .gap_1()
-                    .overflow_y_scroll()
-                    .when(is_empty, |this| {
-                        this.child(
-                            div()
-                                .px_2()
-                                .text_sm()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.55))
-                                .child(self.tab.empty_message()),
-                        )
-                    })
-                    .children(rows),
-            )
-            .child(self.sidebar_actions(false, cx))
-            .into_any_element()
+        clip.with_animation(
+            ElementId::NamedInteger("sidebar-width".into(), collapsed as u64),
+            Animation::new(BOUNCE).with_easing(bounce_ease()),
+            move |el, delta| el.w(Lerp::lerp(&from, &target, delta)),
+        )
+        .into_any_element()
     }
 
     /// The bottom action row, shared between the full sidebar and its
@@ -1104,7 +1148,6 @@ impl RustyDlp {
                     .icon(IconName::Plus)
                     .when(!icon_only, |b| b.label("New download"))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.modal = true;
                         this.probe = ProbeState::Idle;
                         // Re-probe here so installing yt-dlp while the app is
                         // open takes effect without a restart.
@@ -1114,6 +1157,10 @@ impl RustyDlp {
                         this.override_input
                             .update(cx, |s, cx| s.set_value("", window, cx));
                         this.url_input.update(cx, |s, cx| s.focus(window, cx));
+                        let view = cx.entity();
+                        window.open_dialog(cx, move |dialog, window, cx| {
+                            Self::build_download_dialog(dialog, &view, window, cx)
+                        });
                         cx.notify();
                     })),
             )
@@ -1214,7 +1261,7 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn job_row(&self, job: &Job, cx: &mut Context<Self>) -> AnyElement {
+    fn job_row(&self, job: &Job, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let id = job.id.clone();
         let active = self.selected.as_deref() == Some(job.id.as_str())
             && self.route == Route::Library;
@@ -1232,16 +1279,79 @@ impl RustyDlp {
             },
         };
 
-        v_flex()
+        // Hover is tracked explicitly (rather than via the declarative
+        // `.hover()` style) because animating it needs a plain bool to read
+        // a delta against, the same way Switch tracks `checked`.
+        let hover_key = SharedString::from(format!("job-hover-{}", job.id));
+        let hover_state = window.use_keyed_state(hover_key, cx, |_, _| false);
+        let hovered = *hover_state.read(cx);
+
+        let (target_bg, bg_discriminant) = if active {
+            (cx.theme().sidebar_accent, 2u64)
+        } else if hovered {
+            (cx.theme().list_hover, 1u64)
+        } else {
+            // Same hue as the hover color at zero alpha, so animating in/out
+            // is a clean fade rather than a cross-hue blend.
+            (cx.theme().list_hover.opacity(0.0), 0u64)
+        };
+        let bg_key = SharedString::from(format!("job-bg-{}", job.id));
+        let bg_settled = window.use_keyed_state(bg_key.clone(), cx, |_, _| target_bg);
+        let bg_from = *bg_settled.read(cx);
+
+        let target_pct = live.and_then(|l| l.fraction).map(|p| p.clamp(0.0, 1.0));
+        let pct_key = SharedString::from(format!("job-pct-{}", job.id));
+        let pct_settled =
+            window.use_keyed_state(pct_key.clone(), cx, |_, _| target_pct.unwrap_or(0.0));
+        let pct_from = *pct_settled.read(cx);
+
+        // ponytail: settles a fixed BOUNCE after each change, same as every
+        // other animated surface here — not a continuous chase of a moving
+        // target. Progress ticks (~10x/sec) can arrive faster than that
+        // settles, so a tick mid-tween restarts from the last *settled*
+        // value rather than the current on-screen one; upgrade to tracking
+        // the live interpolated value if that stutter ever reads as wrong
+        // rather than lively.
+        let progress = target_pct.map(|pct_to| {
+            let fill = div().h_full().rounded_full().bg(cx.theme().progress_bar);
+            let fill: AnyElement = if pct_from == pct_to {
+                fill.w(relative(pct_to)).into_any_element()
+            } else {
+                cx.spawn(async move |_, cx| {
+                    cx.background_executor().timer(BOUNCE).await;
+                    pct_settled.update(cx, |v, _| *v = pct_to);
+                })
+                .detach();
+                fill.with_animation(
+                    ElementId::NamedInteger(pct_key, (pct_to * 100.0).round() as u64),
+                    Animation::new(BOUNCE).with_easing(bounce_ease()),
+                    move |el, delta| el.w(relative(Lerp::lerp(&pct_from, &pct_to, delta))),
+                )
+                .into_any_element()
+            };
+            div()
+                .mt_1()
+                .w_full()
+                .h(px(3.))
+                .rounded_full()
+                .bg(cx.theme().muted)
+                .child(fill)
+        });
+
+        let row = v_flex()
             .id(SharedString::from(job.id.clone()))
             .w_full()
             .px_2()
             .py_1p5()
             .gap_0p5()
             .rounded(cx.theme().radius)
-            .when(active, |this| this.bg(cx.theme().sidebar_accent))
-            .hover(|this| this.bg(cx.theme().list_hover))
             .cursor_pointer()
+            .on_hover({
+                let hover_state = hover_state.clone();
+                move |is_hovered, _, cx| {
+                    hover_state.update(cx, |v, _| *v = *is_hovered);
+                }
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.selected = Some(id.clone());
                 this.open_item = None;
@@ -1265,80 +1375,112 @@ impl RustyDlp {
                     })
                     .child(subtitle),
             )
-            .when_some(live.and_then(|l| l.fraction), |this, pct| {
-                this.child(
-                    div()
-                        .mt_1()
-                        .w_full()
-                        .h(px(3.))
-                        .rounded_full()
-                        .bg(cx.theme().muted)
-                        .child(
-                            div()
-                                .h_full()
-                                .rounded_full()
-                                .bg(cx.theme().progress_bar)
-                                .w(relative(pct.clamp(0.0, 1.0))),
-                        ),
-                )
+            .when_some(progress, |this, el| this.child(el));
+
+        if bg_from == target_bg {
+            row.bg(target_bg).into_any_element()
+        } else {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(BOUNCE).await;
+                bg_settled.update(cx, |v, _| *v = target_bg);
             })
+            .detach();
+            row.with_animation(
+                ElementId::NamedInteger(bg_key, bg_discriminant),
+                Animation::new(BOUNCE).with_easing(bounce_ease()),
+                move |el, delta| el.bg(Lerp::lerp(&bg_from, &target_bg, delta)),
+            )
             .into_any_element()
+        }
     }
 
     fn main_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.route == Route::Settings {
+        // `key` buckets *which screen* is showing, not which job: switching
+        // sidebar tabs or entering/leaving detail view replays the entrance
+        // below, but clicking between jobs while already in detail view
+        // doesn't re-trigger it on every row click.
+        let (key, content): (u64, AnyElement) = if self.route == Route::Settings {
             self.ensure_player(None, None, cx);
-            return self.settings(cx);
-        }
-        // A selected job always wins over the tab's own landing view — this
-        // is how clicking a row in the in-progress list (which lives here in
-        // the main pane, not the sidebar) drills into that job's detail/
-        // player view.
-        //
-        // Cloned rather than borrowed: `detail` needs `&mut self` (to manage
-        // the player), which would conflict with holding a `&Job` borrowed
-        // out of `self.jobs` for the same call.
-        let Some(job) = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.jobs.iter().find(|j| &j.id == id))
-            .cloned()
-        else {
-            self.ensure_player(None, None, cx);
-            return match self.tab {
-                SidebarTab::InProgress => self.in_progress_pane(cx),
-                SidebarTab::Convert => self.convert_page(cx),
-                SidebarTab::Download => self.empty_state(cx),
-            };
-        };
+            (0, self.settings(cx))
+        } else {
+            // Cloned rather than borrowed: `detail` needs `&mut self` (to
+            // manage the player), which would conflict with holding a `&Job`
+            // borrowed out of `self.jobs` for the same call.
+            let job = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.jobs.iter().find(|j| &j.id == id))
+                .cloned();
 
-        // Job -> Item -> File: one item goes straight to detail, many show a grid.
-        match job.items.len() {
-            0 => self.detail(&job, None, window, cx),
-            1 => {
-                let item = job.items.first().cloned();
-                self.detail(&job, item.as_ref(), window, cx)
-            }
-            _ => match self.open_item.clone() {
-                Some(item_id) => {
-                    let item = job.items.iter().find(|i| i.id == item_id).cloned();
-                    self.detail(&job, item.as_ref(), window, cx)
-                }
+            match job {
                 None => {
                     self.ensure_player(None, None, cx);
-                    self.grid(&job, cx)
+                    let content = match self.tab {
+                        SidebarTab::InProgress => self.in_progress_pane(window, cx),
+                        SidebarTab::Convert => self.convert_page(window, cx),
+                        SidebarTab::Download => self.empty_state(cx),
+                    };
+                    (1 + self.tab.index() as u64, content)
                 }
-            },
-        }
+                // A selected job always wins over the tab's own landing view
+                // — this is how clicking a row in the in-progress list
+                // (which lives here in the main pane, not the sidebar)
+                // drills into that job's detail/player view.
+                Some(job) => {
+                    // Job -> Item -> File: one item goes straight to detail, many show a grid.
+                    let content = match job.items.len() {
+                        0 => self.detail(&job, None, window, cx),
+                        1 => {
+                            let item = job.items.first().cloned();
+                            self.detail(&job, item.as_ref(), window, cx)
+                        }
+                        _ => match self.open_item.clone() {
+                            Some(item_id) => {
+                                let item = job.items.iter().find(|i| i.id == item_id).cloned();
+                                self.detail(&job, item.as_ref(), window, cx)
+                            }
+                            None => {
+                                self.ensure_player(None, None, cx);
+                                self.grid(&job, cx)
+                            }
+                        },
+                    };
+                    (10, content)
+                }
+            }
+        };
+
+        // One-shot fade + bounce-slide entrance, replayed whenever `key`
+        // changes (see CONTEXT.md#motion-system). `h_flex`, not `div`: this
+        // takes the place `main` used to occupy directly under render()'s
+        // outer flex row, and `detail`/`in_progress_pane`/etc. all size
+        // themselves assuming a flex parent.
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .child(content)
+            .with_animation(
+                ElementId::NamedInteger("main-pane".into(), key),
+                Animation::new(BOUNCE).with_easing(bounce_ease()),
+                move |el, delta| {
+                    el.opacity(delta.clamp(0.0, 1.0))
+                        .top(Lerp::lerp(&px(-8.), &px(0.), delta))
+                },
+            )
+            .into_any_element()
     }
 
     /// In progress moved out of the sidebar and into here because it mixes
     /// download and convert jobs and needs room for a progress bar per row —
     /// the 260px sidebar column was too cramped for that.
-    fn in_progress_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn in_progress_pane(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let jobs = filter_jobs(&self.jobs, SidebarTab::InProgress);
         let is_empty = jobs.is_empty();
-        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job, cx)).collect();
+        let rows: Vec<AnyElement> = jobs
+            .iter()
+            .map(|job| self.job_row(job, window, cx))
+            .collect();
 
         v_flex()
             .id("in-progress-scroll")
@@ -1364,10 +1506,13 @@ impl RustyDlp {
     /// The Convert tab's landing view when nothing is selected: recent
     /// conversions plus the "Convert File" action that makes conversion work
     /// on any local file, not just something this app downloaded.
-    fn convert_page(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn convert_page(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let jobs = filter_jobs(&self.jobs, SidebarTab::Convert);
         let is_empty = jobs.is_empty();
-        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job, cx)).collect();
+        let rows: Vec<AnyElement> = jobs
+            .iter()
+            .map(|job| self.job_row(job, window, cx))
+            .collect();
 
         v_flex()
             .id("convert-scroll")
@@ -1388,8 +1533,8 @@ impl RustyDlp {
                             .primary()
                             .icon(IconName::Plus)
                             .label("Convert File")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.pick_file_to_convert(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_file_to_convert(window, cx);
                             })),
                     ),
             )
@@ -2321,16 +2466,26 @@ impl RustyDlp {
                                         .label("Open Externally")
                                         .on_click(move |_, _, _| open_path(&open)),
                                 )
-                                .child(
+                                .child({
+                                    let view = cx.entity();
                                     Button::new("convert")
                                         .small()
                                         .icon(IconName::Replace)
                                         .label("Convert")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.convert_picker = Some(convert_source.clone());
-                                            cx.notify();
-                                        })),
-                                )
+                                        .on_click(move |_, window, cx| {
+                                            let view = view.clone();
+                                            let source = convert_source.clone();
+                                            window.open_dialog(cx, move |dialog, window, cx| {
+                                                Self::build_convert_dialog(
+                                                    dialog,
+                                                    view.clone(),
+                                                    source.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            });
+                                        })
+                                })
                                 .child(
                                     Button::new("reveal")
                                         .small()
@@ -2455,8 +2610,19 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn modal(&self, cx: &mut Context<Self>) -> AnyElement {
-        let preview: AnyElement = match &self.probe {
+    /// Builds the New-download dialog's content. A plain (non-method)
+    /// signature — the `Fn(Dialog, &mut Window, &mut App) -> Dialog` builder
+    /// `window.open_dialog` wants runs with `&mut App`, not
+    /// `&mut Context<Self>`, so live state comes from `view.read(cx)` and
+    /// mutations go through `view.clone()` + `.update()` (see ADR-0001).
+    fn build_download_dialog(
+        dialog: Dialog,
+        view: &Entity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Dialog {
+        let this = view.read(cx);
+        let preview: AnyElement = match &this.probe {
             ProbeState::Idle => div().into_any_element(),
             ProbeState::Running => div()
                 .text_xs()
@@ -2496,169 +2662,145 @@ impl RustyDlp {
             }
         };
 
-        // ponytail: hand-rolled overlay rather than gpui_component::dialog —
-        // one absolutely-positioned div, no modal-manager lifecycle to learn.
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.5))
+        let presets = h_flex().flex_wrap().gap_2().children(this.presets.iter().map(|p| {
+            let name = p.name.clone();
+            let active = this.chosen_preset.as_deref() == Some(p.name.as_str());
+            let view = view.clone();
+            let click_name = name.clone();
+            Button::new(SharedString::from(format!("pick-{}", p.name)))
+                .small()
+                .selected(active)
+                .label(p.name.clone())
+                .on_click(move |_, _, cx| {
+                    let click_name = click_name.clone();
+                    view.update(cx, |this, cx| {
+                        this.chosen_preset = Some(click_name);
+                        cx.notify();
+                    });
+                })
+        }));
+
+        let url_input = Input::new(&this.url_input);
+        let override_input = Input::new(&this.override_input);
+        let go_view = view.clone();
+
+        dialog
+            .title("New download")
+            .child(url_input)
+            .child(preview)
             .child(
                 v_flex()
-                    .w(px(520.))
-                    .p_5()
-                    .gap_4()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
-                    .child(div().font_bold().child("New download"))
-                    .child(Input::new(&self.url_input))
-                    .child(preview)
+                    .gap_1()
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Preset"),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .children(self.presets.iter().map(|p| {
-                                        let name = p.name.clone();
-                                        let active =
-                                            self.chosen_preset.as_deref() == Some(p.name.as_str());
-                                        Button::new(SharedString::from(format!("pick-{}", p.name)))
-                                            .small()
-                                            .selected(active)
-                                            .label(p.name.clone())
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.chosen_preset = Some(name.clone());
-                                                cx.notify();
-                                            }))
-                                    })),
-                            ),
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Preset"),
+                    )
+                    .child(presets),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Override for this download (optional)"),
+                    )
+                    .child(override_input),
+            )
+            .footer(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Override for this download (optional)"),
-                            )
-                            .child(Input::new(&self.override_input)),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("cancel")
-                                    .ghost()
-                                    .label("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.modal = false;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("go")
-                                    .primary()
-                                    .label("Download")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.start_download(cx);
-                                    })),
-                            ),
+                        Button::new("go")
+                            .primary()
+                            .label("Download")
+                            .on_click(move |_, window, cx| {
+                                go_view.update(cx, |this, cx| this.start_download(cx));
+                                window.close_dialog(cx);
+                            }),
                     ),
             )
-            .into_any_element()
     }
 
     // -- convert -------------------------------------------------------------
 
     /// Opens the native file picker so conversion works on any local video,
     /// not just something this app downloaded.
-    fn pick_file_to_convert(&mut self, cx: &mut Context<Self>) {
+    fn pick_file_to_convert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some("Select a video to convert".into()),
         });
-        cx.spawn(async move |this, cx| {
+        // spawn_in (not spawn): opening a dialog needs a live `&mut Window`,
+        // which only an AsyncWindowContext carries across the await.
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(mut paths))) = rx.await else {
                 return;
             };
             let Some(path) = paths.pop() else { return };
-            let _ = this.update(cx, |this, cx| {
-                this.convert_picker = Some(path.to_string_lossy().to_string());
-                cx.notify();
+            let source = path.to_string_lossy().to_string();
+            let _ = this.update_in(cx, |_, window, cx| {
+                let view = cx.entity();
+                window.open_dialog(cx, move |dialog, window, cx| {
+                    Self::build_convert_dialog(dialog, view.clone(), source.clone(), window, cx)
+                });
             });
         })
         .detach();
     }
 
-    fn convert_format_picker(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(source) = self.convert_picker.clone() else {
-            return div().into_any_element();
-        };
+    /// Builds the Convert-format dialog's content. See
+    /// `build_download_dialog` for why this takes `view`/`&mut App` rather
+    /// than `&self`/`&mut Context<Self>`.
+    fn build_convert_dialog(
+        dialog: Dialog,
+        view: Entity<Self>,
+        source: String,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Dialog {
+        let buttons = ConvertFormat::ALL.into_iter().map(|format| {
+            let view = view.clone();
+            let source = source.clone();
+            Button::new(SharedString::from(format!("convert-as-{}", format.as_str())))
+                .w_full()
+                .label(format.label())
+                .on_click(move |_, window, cx| {
+                    view.update(cx, |this, cx| this.start_convert(source.clone(), format, cx));
+                    window.close_dialog(cx);
+                })
+        });
 
-        // ponytail: hand-rolled overlay, same as the New download modal —
-        // one absolutely-positioned div, no modal-manager lifecycle to learn.
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.5))
+        dialog
+            .title("Convert to…")
             .child(
-                v_flex()
-                    .w(px(420.))
-                    .p_5()
-                    .gap_3()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
-                    .child(div().font_bold().child("Convert to…"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .truncate()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(file_name(&source)),
-                    )
-                    .child(v_flex().gap_2().children(ConvertFormat::ALL.into_iter().map(|format| {
-                        let source = source.clone();
-                        Button::new(SharedString::from(format!("convert-as-{}", format.as_str())))
-                            .w_full()
-                            .label(format.label())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.start_convert(source.clone(), format, cx);
-                            }))
-                    })))
-                    .child(
-                        h_flex().justify_end().child(
-                            Button::new("cancel-convert")
-                                .ghost()
-                                .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.convert_picker = None;
-                                    cx.notify();
-                                })),
-                        ),
-                    ),
+                div()
+                    .text_xs()
+                    .truncate()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(file_name(&source)),
             )
-            .into_any_element()
+            .child(v_flex().gap_2().children(buttons))
+            .footer(
+                h_flex().justify_end().child(
+                    Button::new("cancel-convert")
+                        .ghost()
+                        .label("Cancel")
+                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                ),
+            )
     }
 
     /// Creates and immediately launches a Convert job. No staggering queue
@@ -2668,8 +2810,6 @@ impl RustyDlp {
     /// out. ponytail: if concurrent converts become common, give this the
     /// same PendingLaunch/backoff treatment as downloads.
     fn start_convert(&mut self, source: String, format: ConvertFormat, cx: &mut Context<Self>) {
-        self.convert_picker = None;
-
         let mut job = Job::new_convert(source.clone(), format.as_str());
         job.title = format!("{} → {}", file_name(&source), format.label());
         job.state = JobState::Queued;
@@ -3142,13 +3282,8 @@ mod tests {
 impl Render for RustyDlp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let navbar = self.navbar(cx);
-        let sidebar = self.sidebar(cx);
+        let sidebar = self.sidebar(window, cx);
         let main = self.main_pane(window, cx);
-        let modal = if self.modal { Some(self.modal(cx)) } else { None };
-        let convert_modal = self
-            .convert_picker
-            .is_some()
-            .then(|| self.convert_format_picker(cx));
         let banner = self.startup_error.clone();
 
         div()
@@ -3199,7 +3334,5 @@ impl Render for RustyDlp {
                     .child(navbar)
                     .child(h_flex().flex_1().min_h_0().child(sidebar).child(main)),
             )
-            .children(modal)
-            .children(convert_modal)
     }
 }
