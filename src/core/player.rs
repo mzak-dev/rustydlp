@@ -286,10 +286,16 @@ fn spawn_player(
             "-an",
             "-loglevel",
             "error",
+            // Genuinely rgba, not bgra: this build's own image path
+            // (`ImageSource::Rgba` in ui/paint.rs) uploads these bytes as
+            // Skia's `ColorType::RGBA8888`, unlike the old gpui renderer
+            // this was ported from, whose `RenderImage` was documented as
+            // BGRA. Asking ffmpeg for bgra here (a leftover from that port)
+            // swapped red and blue in every frame.
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "bgra",
+            "rgba",
             "-vf",
             &format!("fps={}", info.fps),
             "pipe:1",

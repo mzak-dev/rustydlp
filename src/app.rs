@@ -212,6 +212,12 @@ pub struct RustyDlp {
     updates: Updates,
     /// Which field has the keyboard, if any.
     focus: Option<Focus>,
+    /// In-flight width/colour/entrance transitions, keyed by whatever each
+    /// call site uses to name "this same animated thing across renders".
+    /// `RefCell`-guarded so `sidebar()`/`job_row()` — ported from gpui
+    /// signatures that took `&self` — can consult and advance it without
+    /// becoming `&mut self`.
+    anim: crate::ui::Animator,
 }
 
 /// Live native-playback state for whichever item is currently open in
@@ -480,6 +486,7 @@ impl RustyDlp {
             fonts,
             updates,
             focus: None,
+            anim: crate::ui::Animator::default(),
         }
     }
 
@@ -618,6 +625,15 @@ impl RustyDlp {
 
     pub fn is_playing(&self) -> bool {
         self.player.as_ref().is_some_and(|p| p.playing)
+    }
+
+    /// Whether any width/colour/entrance transition `render()` just touched
+    /// is still short of settling. The event loop uses this exactly like
+    /// `is_playing()`: while either is true it keeps waking up on a timer
+    /// instead of sleeping until the next input event, since a tween has
+    /// nothing else to prod the loop into redrawing the next frame of it.
+    pub fn is_animating(&self) -> bool {
+        self.anim.is_animating()
     }
 
     /// Re-probes for the yt-dlp binary and clears/sets the banner accordingly.
@@ -1259,8 +1275,10 @@ impl RustyDlp {
     }
 
     fn sidebar(&self) -> AnyElement {
-        if self.sidebar_is_collapsed() {
-            return v_flex()
+        let collapsed = self.sidebar_is_collapsed();
+
+        let content: AnyElement = if collapsed {
+            v_flex()
                 .w(px(56.))
                 .h_full()
                 .flex_shrink_0()
@@ -1270,42 +1288,57 @@ impl RustyDlp {
                 .border_color(theme().sidebar_border)
                 .child(v_flex().flex_1())
                 .child(self.sidebar_actions(true))
-                .into_any_element();
-        }
+                .into_any_element()
+        } else {
+            let visible = self.visible_jobs();
+            let rows: Vec<AnyElement> = visible.iter().map(|job| self.job_row(job)).collect();
+            let is_empty = rows.is_empty();
 
-        let visible = self.visible_jobs();
-        let rows: Vec<AnyElement> = visible.iter().map(|job| self.job_row(job)).collect();
-        let is_empty = rows.is_empty();
+            v_flex()
+                .w(px(260.))
+                .h_full()
+                .flex_shrink_0()
+                .bg(theme().sidebar)
+                .border_r_1()
+                .border_color(theme().sidebar_border)
+                .child(
+                    v_flex()
+                        // .id() is required before .overflow_y_scroll(): the scroll
+                        // offset is retained state and needs identity across frames.
+                        .id("job-list")
+                        .flex_1()
+                        .min_h_0()
+                        .p_3()
+                        .gap_1()
+                        .overflow_y_scroll()
+                        .when(is_empty, |this| {
+                            this.child(
+                                div()
+                                    .px_2()
+                                    .text_sm()
+                                    .text_color(theme().sidebar_foreground.opacity(0.55))
+                                    .child(self.tab.empty_message()),
+                            )
+                        })
+                        .children(rows),
+                )
+                .child(self.sidebar_actions(false))
+                .into_any_element()
+        };
 
-        v_flex()
-            .w(px(260.))
+        // Content is always laid out at its natural resting width (56 or
+        // 260) either way; only the clipping box around it is tweened, so
+        // the width change reads as sliding a peephole over fixed content
+        // rather than reflowing the content itself mid-transition.
+        let target = if collapsed { 56.0 } else { 260.0 };
+        let width = self.anim.tween_f32("sidebar-width", target);
+
+        div()
             .h_full()
             .flex_shrink_0()
-            .bg(theme().sidebar)
-            .border_r_1()
-            .border_color(theme().sidebar_border)
-            .child(
-                v_flex()
-                    // .id() is required before .overflow_y_scroll(): the scroll
-                    // offset is retained state and needs identity across frames.
-                    .id("job-list")
-                    .flex_1()
-                    .min_h_0()
-                    .p_3()
-                    .gap_1()
-                    .overflow_y_scroll()
-                    .when(is_empty, |this| {
-                        this.child(
-                            div()
-                                .px_2()
-                                .text_sm()
-                                .text_color(theme().sidebar_foreground.opacity(0.55))
-                                .child(self.tab.empty_message()),
-                        )
-                    })
-                    .children(rows),
-            )
-            .child(self.sidebar_actions(false))
+            .overflow_hidden()
+            .w(px(width))
+            .child(content)
             .into_any_element()
     }
 
@@ -1446,6 +1479,19 @@ impl RustyDlp {
             },
         };
 
+        // Selection fades in/out rather than snapping, animated against the
+        // same hue at zero alpha rather than a plain transparent, so the
+        // transition reads as a clean fade instead of a cross-hue blend.
+        // Hover stays instant (`.hover()` below): the pointer's own position
+        // is resolved at paint time, after the element tree already exists,
+        // so there is no app-state moment to key a hover tween off.
+        let target_bg =
+            if active { theme().sidebar_accent } else { theme().sidebar_accent.opacity(0.0) };
+        let bg = self.anim.tween_color(format!("job-bg-{}", job.id), target_bg);
+
+        let target_pct = live.and_then(|l| l.fraction).map(|p| p.clamp(0.0, 1.0));
+        let pct = target_pct.map(|p| self.anim.tween_f32(format!("job-pct-{}", job.id), p));
+
         v_flex()
             .id(SharedString::from(job.id.clone()))
             .w_full()
@@ -1453,7 +1499,7 @@ impl RustyDlp {
             .py_1p5()
             .gap_0p5()
             .rounded(theme().radius)
-            .when(active, |this| this.bg(theme().sidebar_accent))
+            .bg(bg)
             .hover(|this| this.bg(theme().list_hover))
             .cursor_pointer()
             .on_click(move |this: &mut Self| {
@@ -1463,6 +1509,8 @@ impl RustyDlp {
             })
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .text_sm()
                     .truncate()
                     .text_color(theme().sidebar_foreground)
@@ -1478,20 +1526,27 @@ impl RustyDlp {
                     })
                     .child(subtitle),
             )
-            .when_some(live.and_then(|l| l.fraction), |this, pct| {
+            .when_some(pct, |this, pct| {
                 this.child(
                     div()
                         .mt_1()
                         .w_full()
                         .h(px(3.))
                         .rounded_full()
+                        .overflow_hidden()
                         .bg(theme().muted)
                         .child(
                             div()
                                 .h_full()
                                 .rounded_full()
                                 .bg(theme().progress_bar)
-                                .w(relative(pct.clamp(0.0, 1.0))),
+                                // Not reclamped to 0..=1: `pct` is already the
+                                // eased value, and letting a slight overshoot
+                                // past the target through (clipped by the
+                                // track's own `overflow_hidden` if it pokes
+                                // past 100%) is the bounce this app's other
+                                // animated surfaces share.
+                                .w(relative(pct)),
                         ),
                 )
             })
@@ -1499,50 +1554,74 @@ impl RustyDlp {
     }
 
     fn main_pane(&mut self) -> AnyElement {
-        if self.route == Route::Settings {
+        // `key` buckets *which screen* is showing, not which job: switching
+        // sidebar tabs or entering/leaving detail view replays the entrance
+        // below, but clicking between jobs while already in detail view
+        // doesn't re-trigger it on every row click.
+        let (key, content): (u64, AnyElement) = if self.route == Route::Settings {
             self.ensure_player(None, None);
-            return self.settings();
-        }
-        // A selected job always wins over the tab's own landing view — this
-        // is how clicking a row in the in-progress list (which lives here in
-        // the main pane, not the sidebar) drills into that job's detail/
-        // player view.
-        //
-        // Cloned rather than borrowed: `detail` needs `&mut self` (to manage
-        // the player), which would conflict with holding a `&Job` borrowed
-        // out of `self.jobs` for the same call.
-        let Some(job) = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.jobs.iter().find(|j| &j.id == id))
-            .cloned()
-        else {
-            self.ensure_player(None, None);
-            return match self.tab {
-                SidebarTab::InProgress => self.in_progress_pane(),
-                SidebarTab::Convert => self.convert_page(),
-                SidebarTab::Download => self.empty_state(),
-            };
-        };
+            (0, self.settings())
+        } else {
+            // Cloned rather than borrowed: `detail` needs `&mut self` (to
+            // manage the player), which would conflict with holding a `&Job`
+            // borrowed out of `self.jobs` for the same call.
+            let job = self.selected.as_ref().and_then(|id| self.jobs.iter().find(|j| &j.id == id)).cloned();
 
-        // Job -> Item -> File: one item goes straight to detail, many show a grid.
-        match job.items.len() {
-            0 => self.detail(&job, None),
-            1 => {
-                let item = job.items.first().cloned();
-                self.detail(&job, item.as_ref())
-            }
-            _ => match self.open_item.clone() {
-                Some(item_id) => {
-                    let item = job.items.iter().find(|i| i.id == item_id).cloned();
-                    self.detail(&job, item.as_ref())
-                }
+            match job {
                 None => {
                     self.ensure_player(None, None);
-                    self.grid(&job)
+                    let content = match self.tab {
+                        SidebarTab::InProgress => self.in_progress_pane(),
+                        SidebarTab::Convert => self.convert_page(),
+                        SidebarTab::Download => self.empty_state(),
+                    };
+                    (1 + self.tab.index() as u64, content)
                 }
-            },
-        }
+                // A selected job always wins over the tab's own landing view
+                // — this is how clicking a row in the in-progress list
+                // (which lives here in the main pane, not the sidebar)
+                // drills into that job's detail/player view.
+                Some(job) => {
+                    // Job -> Item -> File: one item goes straight to detail, many show a grid.
+                    let content = match job.items.len() {
+                        0 => self.detail(&job, None),
+                        1 => {
+                            let item = job.items.first().cloned();
+                            self.detail(&job, item.as_ref())
+                        }
+                        _ => match self.open_item.clone() {
+                            Some(item_id) => {
+                                let item = job.items.iter().find(|i| i.id == item_id).cloned();
+                                self.detail(&job, item.as_ref())
+                            }
+                            None => {
+                                self.ensure_player(None, None);
+                                self.grid(&job)
+                            }
+                        },
+                    };
+                    (10, content)
+                }
+            }
+        };
+
+        // One-shot fade + bounce-slide entrance, replayed whenever `key`
+        // changes. The inner box is absolutely positioned within the outer
+        // one (which stays normally flexed, unanimated, so it keeps its slot
+        // in the sidebar+main row) rather than sliding the pane itself,
+        // because this layout engine only resolves an inset offset for an
+        // absolutely positioned box — the same trick `stage()` uses to
+        // overlay the player frame without disturbing its container's size.
+        let progress = self.anim.entrance_progress("main-pane", key);
+        let opacity = progress.clamp(0.0, 1.0);
+        let eased = crate::ui::Animator::ease(progress);
+        let offset = -8.0 + 8.0 * eased;
+
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .child(div().absolute().inset_0().opacity(opacity).top(px(offset)).child(content))
+            .into_any_element()
     }
 
     /// In progress moved out of the sidebar and into here because it mixes
@@ -1676,7 +1755,7 @@ impl RustyDlp {
                     .on_click(move |this: &mut Self| {
                         this.edit_preset(preset.clone());
                     })
-                    .child(div().text_sm().truncate().child(p.name.clone()))
+                    .child(div().flex_1().min_w_0().text_sm().truncate().child(p.name.clone()))
                     .when(p.is_default, |t| {
                         t.child(
                             div()
@@ -1957,7 +2036,7 @@ impl RustyDlp {
                         this.open_item = Some(item_id.clone());
                     })
                     .child(cover(item.thumb_path.as_deref(), px(112.), px(48.)))
-                    .child(div().text_sm().truncate().child(item.title.clone()))
+                    .child(div().w_full().min_w_0().text_sm().truncate().child(item.title.clone()))
                     .child(
                         div()
                             .text_xs()
@@ -2113,7 +2192,24 @@ impl RustyDlp {
                 return;
             }
 
-            while let Some(event) = pollster::block_on(events.next()) {
+            while let Some(mut event) = pollster::block_on(events.next()) {
+                // Coalesce a frame backlog: the decode thread paces itself to
+                // real time regardless of how fast this loop's round trip to
+                // the UI thread runs, so if that round trip is ever slow
+                // (a busy repaint, GC-style pauses), frames queue up here —
+                // 8MB apiece at 1080p, per the channel being unbounded (see
+                // docs/parity-deviations.md). Jump straight to the newest
+                // queued frame instead of painting through the backlog one
+                // stale frame at a time, which is what "lag" looks like from
+                // the outside. Stops as soon as something isn't a Frame (an
+                // Ended must still be handled, not skipped) or nothing else
+                // is queued right now.
+                while let player::PlayerEvent::Frame(..) = event {
+                    match events.try_recv() {
+                        Ok(newer) => event = newer,
+                        Err(_) => break,
+                    }
+                }
                 let (tx, rx) = std::sync::mpsc::channel();
                 updates.send(move |this| {
                         if this.player_gen.load(Ordering::SeqCst) != generation {
@@ -2231,8 +2327,16 @@ impl RustyDlp {
 
     /// What actually reaches the audio callback. Mute is kept separate from
     /// the slider's value so un-muting restores the level you had.
+    ///
+    /// Cubed rather than passed straight through: ears perceive loudness
+    /// roughly logarithmically, but the slider position is linear, so a
+    /// linear gain multiplier crams almost all the audible change into the
+    /// top of the track and leaves the bottom half sounding barely quieter.
+    /// Cubing is the standard cheap taper for this — closer to how volume
+    /// controls are expected to feel than true dB math, which would need a
+    /// clamp of its own to avoid -infinity at zero.
     fn effective_volume(&self) -> f32 {
-        if self.muted { 0.0 } else { self.volume }
+        if self.muted { 0.0 } else { self.volume.powi(3) }
     }
 
     fn apply_volume(&mut self) {
@@ -2425,6 +2529,8 @@ impl RustyDlp {
                             .gap_2()
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .text_xs()
                                     .truncate()
                                     .when(!present, |t| {
@@ -2636,6 +2742,7 @@ impl RustyDlp {
 
     fn kv(&self, key: &str, value: &str) -> AnyElement {
         v_flex()
+            .w_full()
             .gap_0p5()
             .child(
                 div()
@@ -2643,7 +2750,7 @@ impl RustyDlp {
                     .text_color(theme().muted_foreground)
                     .child(key.to_string()),
             )
-            .child(div().text_xs().truncate().child(value.to_string()))
+            .child(div().w_full().min_w_0().text_xs().truncate().child(value.to_string()))
             .into_any_element()
     }
 
@@ -2671,9 +2778,12 @@ impl RustyDlp {
                     }
                 };
                 v_flex()
+                    .w_full()
                     .gap_1()
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_sm()
                             .truncate()
                             .child(p.title.clone().unwrap_or_default()),
@@ -2815,6 +2925,8 @@ impl RustyDlp {
                     .child(div().font_bold().child("Convert to…"))
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .text_xs()
                             .truncate()
                             .text_color(theme().muted_foreground)
@@ -3041,30 +3153,41 @@ fn cover(
     // arms need it.
     let height: Length = height.into();
 
-    match existing {
-        Some(path) => img(PathBuf::from(path))
-            .w_full()
-            .h(height)
-            .rounded(theme().radius)
-            .object_fit(ObjectFit::Cover)
-            .into_any_element(),
-        None => div()
-            .w_full()
-            .h(height)
-            .rounded(theme().radius)
-            .bg(theme().muted)
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                svg()
-                    .path("icons/empty-downloads.svg")
-                    .w(glyph)
-                    .h(glyph * 0.75)
-                    .text_color(theme().muted_foreground.opacity(0.4)),
+    // Always builds the placeholder box, then lays the real thumbnail over
+    // it when one exists on disk, rather than choosing one or the other.
+    // This element tree has no decode-failure hook (unlike gpui's
+    // `with_fallback`): `draw_image` just paints nothing when
+    // `skia_safe::Image::from_encoded` fails, so without the placeholder
+    // underneath, a corrupt or unsupported sidecar image (an interrupted
+    // write, a webp variant this build can't decode) would show as an empty
+    // box instead of the glyph. `is_file()` above only proves the path
+    // exists, not that it decodes.
+    div()
+        .w_full()
+        .h(height)
+        .rounded(theme().radius)
+        .bg(theme().muted)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path("icons/empty-downloads.svg")
+                .w(glyph)
+                .h(glyph * 0.75)
+                .text_color(theme().muted_foreground.opacity(0.4)),
+        )
+        .when_some(existing, |this, path| {
+            this.child(
+                img(PathBuf::from(path))
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .rounded(theme().radius)
+                    .object_fit(ObjectFit::Cover),
             )
-            .into_any_element(),
-    }
+        })
+        .into_any_element()
 }
 
 /// Single definition of "still working". The sidebar filter and the detail
