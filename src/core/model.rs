@@ -31,14 +31,14 @@ pub fn now_secs() -> i64 {
 pub struct Preset {
     pub name: String,
     pub is_default: bool,
-    pub options: crate::ytdlp::YtdlpOptions,
+    pub options: crate::core::ytdlp::YtdlpOptions,
 }
 
 impl Preset {
     /// Seeds mirroring yt-dlp's own built-in aliases, so a fresh install is
     /// immediately usable without opening Settings.
     pub fn seeds(download_dir: &str) -> Vec<Preset> {
-        use crate::ytdlp::{FormatMode, YtdlpOptions};
+        use crate::core::ytdlp::{FormatMode, YtdlpOptions};
         let base = YtdlpOptions {
             download_dir: download_dir.to_string(),
             embed_thumbnail: true,
@@ -233,5 +233,61 @@ impl Job {
             kind: JobKind::Convert,
             ..Self::new(source_path, format)
         }
+    }
+}
+
+/// Finds the cover written by `--write-thumbnail` next to a media file.
+/// webp first: that is yt-dlp's native output and zed enables webp decoding,
+/// so no conversion is needed.
+pub fn sibling_thumbnail(media_path: &str) -> Option<String> {
+    let path = std::path::Path::new(media_path);
+    let stem = path.file_stem()?;
+    let dir = path.parent()?;
+    for ext in ["webp", "jpg", "png", "jpeg"] {
+        let candidate = dir.join(stem).with_extension(ext);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sibling_thumbnail;
+
+    /// `after_move` reports only the video file, so the cover has to be located
+    /// by stem. webp must win: it is yt-dlp's native output.
+    #[test]
+    fn sibling_thumbnail_finds_the_cover_by_stem() {
+        let dir = std::env::temp_dir().join(crate::core::model::new_id("thumb-test"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let video = dir.join("Some Video [abc123].mp4");
+        std::fs::write(&video, b"x").unwrap();
+        let video_s = video.to_string_lossy().to_string();
+
+        // No cover on disk yet.
+        assert_eq!(sibling_thumbnail(&video_s), None);
+
+        // A .jpg alone is found.
+        let jpg = dir.join("Some Video [abc123].jpg");
+        std::fs::write(&jpg, b"x").unwrap();
+        assert_eq!(sibling_thumbnail(&video_s), Some(jpg.to_string_lossy().to_string()));
+
+        // With both present, webp wins.
+        let webp = dir.join("Some Video [abc123].webp");
+        std::fs::write(&webp, b"x").unwrap();
+        assert_eq!(
+            sibling_thumbnail(&video_s),
+            Some(webp.to_string_lossy().to_string())
+        );
+
+        // A different video in the same folder must not borrow this cover.
+        let other = dir.join("Other.mp4");
+        std::fs::write(&other, b"x").unwrap();
+        assert_eq!(sibling_thumbnail(&other.to_string_lossy()), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

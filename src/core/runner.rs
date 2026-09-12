@@ -6,9 +6,9 @@
 //! cross to the UI thread over a futures channel, which a gpui background task
 //! awaits and forwards via cx.update().
 
-use crate::ytdlp::{Event, YtdlpOptions, download_args, parse_line, probe_args};
+use crate::core::ytdlp::{Event, YtdlpOptions, download_args, parse_line, probe_args};
 use anyhow::{Context, Result, anyhow};
-use futures::channel::{mpsc, oneshot};
+use futures_channel::{mpsc, oneshot};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -54,15 +54,15 @@ pub fn exe_relative_bin_dir() -> Option<PathBuf> {
 pub fn resolve(stem: &str, override_path: Option<&Path>) -> Option<PathBuf> {
     let name = exe_name(stem);
 
-    if let Some(p) = override_path {
-        if p.is_file() {
-            return Some(p.to_path_buf());
-        }
+    if let Some(p) = override_path
+        && p.is_file()
+    {
+        return Some(p.to_path_buf());
     }
-    if let Some(portable) = exe_relative_bin_dir().map(|d| d.join(&name)) {
-        if portable.is_file() {
-            return Some(portable);
-        }
+    if let Some(portable) = exe_relative_bin_dir().map(|d| d.join(&name))
+        && portable.is_file()
+    {
+        return Some(portable);
     }
     let bundled = bin_dir().join(&name);
     if bundled.is_file() {
@@ -253,10 +253,10 @@ impl CancelHandle {
     /// Kills the child. Partial `.part` files survive, so a retry resumes from
     /// where it stopped rather than starting over.
     pub fn cancel(&self) {
-        if let Ok(mut guard) = self.0.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
-            }
+        if let Ok(mut guard) = self.0.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
         }
     }
 }
@@ -283,8 +283,7 @@ pub fn update_ytdlp(exe: PathBuf) -> oneshot::Receiver<Result<String>> {
             let combined = format!("{text}{err}");
             let last = combined
                 .lines()
-                .filter(|l| !l.trim().is_empty())
-                .next_back()
+                .rfind(|l| !l.trim().is_empty())
                 .unwrap_or("yt-dlp reported nothing")
                 .to_string();
             if out.status.success() {
@@ -614,11 +613,11 @@ mod tests {
     #[test]
     #[ignore = "requires network; downloads ~28 MB"]
     fn download_a_real_video_end_to_end() {
-        use crate::ytdlp::FormatMode;
-        use futures::StreamExt as _;
+        use crate::core::ytdlp::FormatMode;
+        use futures_util::StreamExt as _;
 
         let exe = ytdlp_path(None).expect("bundled yt-dlp");
-        let dir = std::env::temp_dir().join(crate::model::new_id("rustydlp-dl"));
+        let dir = std::env::temp_dir().join(crate::core::model::new_id("rustydlp-dl"));
         std::fs::create_dir_all(&dir).unwrap();
 
         let opts = YtdlpOptions {
@@ -662,7 +661,7 @@ mod tests {
         // --write-thumbnail must leave a cover the grid can find by stem.
         // after_move never reports it, so this is the only thing that proves
         // the flag is doing its job.
-        let cover = crate::app::sibling_thumbnail(&files[0]);
+        let cover = crate::core::model::sibling_thumbnail(&files[0]);
         assert!(
             cover.is_some(),
             "no sibling thumbnail beside {}; dir held: {:?}",

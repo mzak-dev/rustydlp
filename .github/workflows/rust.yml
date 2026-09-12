@@ -11,14 +11,20 @@ permissions:
 
 jobs:
   test:
-    runs-on: windows-latest # the crate is cfg(windows) top to bottom; nothing else can build it
+    # Windows because that is what ships, and because the file picker and the
+    # clipboard are the two Windows-only dependencies. The library itself builds
+    # and tests anywhere: `cargo test --lib` renders whole screens to a CPU Skia
+    # surface with no GPU and no display server.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Skipping the one test whose own doc comment rules out CI: it needs a real D3D12
-      # adapter, and the adapter loop deliberately steps over WARP (render/d3d.rs).
-      - run: cargo test --workspace -- --skip builds_a_skia_context_on_a_real_d3d12_device
+      # No --skip yet: render/d3d.rs is not implemented, so there is no test that
+      # needs a real D3D12 adapter. When the backend lands, its device test will
+      # need skipping here — CI runners have no GPU, and the adapter loop
+      # deliberately steps over WARP.
+      - run: cargo test --workspace
 
   build:
     needs: test

@@ -1,5 +1,5 @@
 //! Native in-app video playback: ffmpeg piped as raw frames + raw PCM,
-//! decoded off-thread and blitted straight into a `gpui::RenderImage`.
+//! decoded off-thread and handed to the UI as plain `VideoFrame` buffers.
 //!
 //! ponytail: frames are paced by a wall-clock timer at the source's own fps
 //! rather than off the audio callback's sample count. The two pipes are
@@ -10,11 +10,8 @@
 //! playback, drive frame presentation off the audio clock instead.
 
 use anyhow::{Context, Result, anyhow};
-use futures::channel::{mpsc, oneshot};
-use gpui::RenderImage;
-use image::{Frame, RgbaImage};
+use futures_channel::{mpsc, oneshot};
 use serde::Deserialize;
-use smallvec::SmallVec;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -23,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::runner::base_command;
+use crate::core::runner::base_command;
 
 #[derive(Debug, Clone, Copy)]
 pub struct VideoInfo {
@@ -132,8 +129,20 @@ fn parse_fraction(s: &str) -> Option<f64> {
     }
 }
 
+/// One decoded frame, owned outright: tightly packed RGBA8, `width * height
+/// * 4` bytes, no stride padding and no row flip.
+///
+/// Deliberately not a renderer type. The UI layer decides what to do with the
+/// bytes — upload them to a texture, wrap them in an image — which is what
+/// keeps this module free of any GUI dependency.
+pub struct VideoFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 pub enum PlayerEvent {
-    Frame(Arc<RenderImage>, f64),
+    Frame(VideoFrame, f64),
     Ended,
 }
 
@@ -193,10 +202,10 @@ impl PlayerControl {
         // Unblock a paused run so its threads reach the stop check instead of
         // sleeping on the pause flag.
         self.paused.store(false, Ordering::Relaxed);
-        if let Ok(mut guard) = self.video_child.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
-            }
+        if let Ok(mut guard) = self.video_child.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
         }
     }
 }
@@ -222,8 +231,8 @@ pub fn load(
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
         let result = (|| {
-            let ffmpeg = crate::runner::ffmpeg_path(None)?;
-            let ffprobe = crate::runner::ffprobe_path(None)?;
+            let ffmpeg = crate::core::runner::ffmpeg_path(None)?;
+            let ffprobe = crate::core::runner::ffprobe_path(None)?;
             let info = probe_video(&ffprobe, &source)?;
             let (control, events) = spawn_player(&ffmpeg, &source, info, start_at_secs, volume)?;
             Ok((info, control, events))
@@ -337,13 +346,18 @@ fn spawn_player(
                 if !read_exact_or_eof(&mut reader, &mut buf) {
                     break;
                 }
-                if let Some(image) = RgbaImage::from_raw(width, height, buf.clone()) {
-                    let render =
-                        Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(image), 1)));
-                    let pts = start_at_secs + n as f64 / info.fps;
-                    if tx.unbounded_send(PlayerEvent::Frame(render, pts)).is_err() {
-                        break; // receiver dropped
-                    }
+                // Hand the filled buffer over and take a fresh one. Cloning
+                // it instead would copy width*height*4 bytes per frame — 8MB
+                // at 1080p, 249MB/s at 30fps — for no benefit, since the
+                // reader overwrites every byte on the next pass anyway.
+                let frame = VideoFrame {
+                    width,
+                    height,
+                    rgba: std::mem::replace(&mut buf, vec![0u8; frame_len]),
+                };
+                let pts = start_at_secs + n as f64 / info.fps;
+                if tx.unbounded_send(PlayerEvent::Frame(frame, pts)).is_err() {
+                    break; // receiver dropped
                 }
                 n += 1;
                 // Pace to real time so decode speed (which can outrun
@@ -603,9 +617,10 @@ fn run_audio_output(
 
 #[cfg(test)]
 mod tests {
-    // Imported one by one rather than with a glob: `use super::*` would pull
-    // in anything gpui re-exports, including its own `test` attribute macro,
-    // which then shadows the built-in one (see the note in app.rs).
+    // Explicit rather than a glob so it stays obvious what is under test.
+    // (This module used to import gpui, whose re-exported `test` attribute
+    // macro shadowed the built-in one and made a glob unsafe; it no longer
+    // does -- see the note in app.rs, which still has that problem.)
     use super::{parse_fraction, parse_probe};
 
     /// ffprobe reports frame rate as a fraction, and NTSC rates are the whole

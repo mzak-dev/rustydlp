@@ -1,35 +1,55 @@
-use gpui::{AssetSource, Result, SharedString};
-use std::borrow::Cow;
+//! Embedded assets: our own illustration plus the Lucide icons the interface
+//! uses.
+//!
+//! The Lucide set was vendored out of `gpui-component-assets` while the gpui
+//! interface still existed, so the replacement draws the same art rather than
+//! art that merely looks similar.
+//!
+//! A plain `include_bytes!` table rather than `rust-embed`: the asset list is
+//! eleven known files that change about once a year, and the macro crate cost 28
+//! dependencies to walk a directory at compile time. `include_bytes!` is in the
+//! language, and a missing file becomes a compile error instead of a `None` at
+//! runtime.
 
-/// Our own SVGs (empty-state illustration, etc).
-#[derive(rust_embed::RustEmbed)]
-#[folder = "assets"]
-#[include = "icons/**/*.svg"]
-struct Local;
+/// Every embedded asset, keyed by the path the interface asks for.
+static ASSETS: &[(&str, &[u8])] = &[
+    ("icons/chevron-left.svg", include_bytes!("../assets/icons/chevron-left.svg")),
+    ("icons/chevron-right.svg", include_bytes!("../assets/icons/chevron-right.svg")),
+    ("icons/empty-downloads.svg", include_bytes!("../assets/icons/empty-downloads.svg")),
+    ("icons/folder.svg", include_bytes!("../assets/icons/folder.svg")),
+    ("icons/pause.svg", include_bytes!("../assets/icons/pause.svg")),
+    ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
+    ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
+    ("icons/replace.svg", include_bytes!("../assets/icons/replace.svg")),
+    ("icons/settings.svg", include_bytes!("../assets/icons/settings.svg")),
+    ("icons/volume-muted.svg", include_bytes!("../assets/icons/volume-muted.svg")),
+    ("icons/volume.svg", include_bytes!("../assets/icons/volume.svg")),
+];
 
-/// Serves our assets first, then falls back to gpui-component's bundled icon set
-/// so `IconName::*` keeps working. gpui-component's loader returns Err (not
-/// Ok(None)) on a miss, so ours must check membership before delegating.
-pub struct AppAssets;
+/// Reads an embedded asset by path, e.g. `icons/play.svg`.
+pub fn load(path: &str) -> Option<&'static [u8]> {
+    ASSETS
+        .iter()
+        .find(|(name, _)| *name == path)
+        .map(|(_, bytes)| *bytes)
+}
 
-impl AssetSource for AppAssets {
-    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
-        if path.is_empty() {
-            return Ok(None);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every icon the interface names has to actually be embedded, and the table
+    /// is what makes that a compile-time guarantee rather than a blank square at
+    /// runtime. This checks the other half: that the names match what is asked
+    /// for.
+    #[test]
+    fn every_named_icon_resolves() {
+        for name in crate::widget::icon::ALL_ICON_PATHS {
+            assert!(load(name).is_some(), "{name} is not embedded");
         }
-        match Local::get(path) {
-            Some(f) => Ok(Some(f.data)),
-            None => gpui_component_assets::Assets.load(path),
-        }
-    }
-
-    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut out = gpui_component_assets::Assets.list(path)?;
-        out.extend(
-            Local::iter()
-                .filter(|p| p.starts_with(path))
-                .map(|p| SharedString::from(p.to_string())),
-        );
-        Ok(out)
+        assert!(load("icons/empty-downloads.svg").is_some());
+        assert!(load("icons/volume.svg").is_some());
+        assert!(load("icons/volume-muted.svg").is_some());
+        assert!(load("icons/nope.svg").is_none());
     }
 }
