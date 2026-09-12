@@ -237,13 +237,15 @@ impl Job {
 }
 
 /// Finds the cover written by `--write-thumbnail` next to a media file.
-/// webp first: that is yt-dlp's native output and zed enables webp decoding,
-/// so no conversion is needed.
+/// png first: `--convert-thumbnails png` targets it, and it's a format
+/// skia-safe's default codecs can actually decode. webp is checked last, as
+/// a fallback for a run where the conversion didn't happen — this build
+/// can't paint it, but at least the file is still findable.
 pub fn sibling_thumbnail(media_path: &str) -> Option<String> {
     let path = std::path::Path::new(media_path);
     let stem = path.file_stem()?;
     let dir = path.parent()?;
-    for ext in ["webp", "jpg", "png", "jpeg"] {
+    for ext in ["png", "jpg", "jpeg", "webp"] {
         let candidate = dir.join(stem).with_extension(ext);
         if candidate.is_file() {
             return Some(candidate.to_string_lossy().to_string());
@@ -257,7 +259,7 @@ mod tests {
     use super::sibling_thumbnail;
 
     /// `after_move` reports only the video file, so the cover has to be located
-    /// by stem. webp must win: it is yt-dlp's native output.
+    /// by stem. png must win over webp: this build can only decode the former.
     #[test]
     fn sibling_thumbnail_finds_the_cover_by_stem() {
         let dir = std::env::temp_dir().join(crate::core::model::new_id("thumb-test"));
@@ -270,17 +272,17 @@ mod tests {
         // No cover on disk yet.
         assert_eq!(sibling_thumbnail(&video_s), None);
 
-        // A .jpg alone is found.
-        let jpg = dir.join("Some Video [abc123].jpg");
-        std::fs::write(&jpg, b"x").unwrap();
-        assert_eq!(sibling_thumbnail(&video_s), Some(jpg.to_string_lossy().to_string()));
-
-        // With both present, webp wins.
+        // A leftover .webp alone (conversion failed or was skipped) is still found.
         let webp = dir.join("Some Video [abc123].webp");
         std::fs::write(&webp, b"x").unwrap();
+        assert_eq!(sibling_thumbnail(&video_s), Some(webp.to_string_lossy().to_string()));
+
+        // With both present, the decodable png wins.
+        let png = dir.join("Some Video [abc123].png");
+        std::fs::write(&png, b"x").unwrap();
         assert_eq!(
             sibling_thumbnail(&video_s),
-            Some(webp.to_string_lossy().to_string())
+            Some(png.to_string_lossy().to_string())
         );
 
         // A different video in the same folder must not borrow this cover.

@@ -9,11 +9,15 @@ use crate::ui::units::{Pixels, px};
 pub enum IconName {
     ChevronLeft,
     ChevronRight,
+    Close,
     Folder,
+    Maximize,
+    Minimize,
     Pause,
     Play,
     Plus,
     Replace,
+    Restore,
     Settings,
 }
 
@@ -22,11 +26,15 @@ impl IconName {
         match self {
             IconName::ChevronLeft => "icons/chevron-left.svg",
             IconName::ChevronRight => "icons/chevron-right.svg",
+            IconName::Close => "icons/close.svg",
             IconName::Folder => "icons/folder.svg",
+            IconName::Maximize => "icons/maximize.svg",
+            IconName::Minimize => "icons/minimize.svg",
             IconName::Pause => "icons/pause.svg",
             IconName::Play => "icons/play.svg",
             IconName::Plus => "icons/plus.svg",
             IconName::Replace => "icons/replace.svg",
+            IconName::Restore => "icons/restore.svg",
             IconName::Settings => "icons/settings.svg",
         }
     }
@@ -36,11 +44,15 @@ impl IconName {
 pub const ALL_ICON_PATHS: &[&str] = &[
     "icons/chevron-left.svg",
     "icons/chevron-right.svg",
+    "icons/close.svg",
     "icons/folder.svg",
+    "icons/maximize.svg",
+    "icons/minimize.svg",
     "icons/pause.svg",
     "icons/play.svg",
     "icons/plus.svg",
     "icons/replace.svg",
+    "icons/restore.svg",
     "icons/settings.svg",
 ];
 

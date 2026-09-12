@@ -24,6 +24,11 @@ pub struct SvgRenderer {
     /// Alpha masks by path and pixel size. Icons are drawn at a handful of
     /// sizes, so this stays small and stops re-rasterizing every frame.
     masks: HashMap<(String, u32, u32), Vec<u8>>,
+    /// Straight RGBA renders of a full-colour icon, by path and pixel size --
+    /// `color_svg()`'s counterpart to `masks`, kept separately because it has
+    /// nothing to do with a tint and a mask has nothing to do with its own
+    /// colour.
+    colors: HashMap<(String, u32, u32), Vec<u8>>,
 }
 
 impl SvgRenderer {
@@ -50,7 +55,12 @@ impl SvgRenderer {
         self.masks.get(&key).map(|m| m.as_slice())
     }
 
-    fn render_mask(&mut self, path: &str, width: u32, height: u32) -> Option<Vec<u8>> {
+    /// Parses (or reuses the parsed tree for) `path` and rasterizes it to
+    /// `width` x `height`, premultiplied, as resvg always produces. Shared by
+    /// `render_mask` (which only wants the alpha channel, where
+    /// premultiplication is irrelevant) and `render_color` (which wants the
+    /// colour too, and so has to undo it).
+    fn rasterize(&mut self, path: &str, width: u32, height: u32) -> Option<tiny_skia::Pixmap> {
         let tree = self.tree(path)?;
         let size = tree.size();
         if size.width() <= 0.0 || size.height() <= 0.0 {
@@ -62,10 +72,32 @@ impl SvgRenderer {
             height as f32 / size.height(),
         );
         resvg::render(tree, transform, &mut pixmap.as_mut());
-        // Only the alpha channel is wanted. tiny-skia's buffer is
-        // premultiplied, which is irrelevant here: premultiplying does not
-        // change alpha itself.
+        Some(pixmap)
+    }
+
+    fn render_mask(&mut self, path: &str, width: u32, height: u32) -> Option<Vec<u8>> {
+        let pixmap = self.rasterize(path, width, height)?;
         Some(pixmap.data().chunks_exact(4).map(|px| px[3]).collect())
+    }
+
+    /// Unlike `render_mask`, the colour itself is wanted here, so
+    /// tiny-skia's premultiplied buffer can't just be read as-is: `ui/paint.rs`
+    /// uploads this as `AlphaType::Unpremul`, and handing it premultiplied
+    /// bytes under that label would paint a dark fringe around every
+    /// translucent edge.
+    fn render_color(&mut self, path: &str, width: u32, height: u32) -> Option<Vec<u8>> {
+        let pixmap = self.rasterize(path, width, height)?;
+        let mut out = Vec::with_capacity(pixmap.data().len());
+        for px in pixmap.data().chunks_exact(4) {
+            let a = px[3];
+            if a == 0 {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            let unpremul = |c: u8| ((c as u32 * 255 + a as u32 / 2) / a as u32) as u8;
+            out.extend_from_slice(&[unpremul(px[0]), unpremul(px[1]), unpremul(px[2]), a]);
+        }
+        Some(out)
     }
 
     /// The icon at `width` x `height` as straight RGBA, every covered pixel set
@@ -88,6 +120,18 @@ impl SvgRenderer {
             out.extend_from_slice(&[r, g, b, (coverage as f32 * tint.a).round() as u8]);
         }
         Some(out)
+    }
+
+    /// The full-colour icon at `width` x `height`, straight RGBA -- for
+    /// `color_svg()`, which keeps the SVG's own colours rather than
+    /// flattening them into one tint the way `tinted_rgba` does.
+    pub fn color_rgba(&mut self, path: &str, width: u32, height: u32) -> Option<&[u8]> {
+        let key = (path.to_string(), width, height);
+        if !self.colors.contains_key(&key) {
+            let rgba = self.render_color(path, width, height)?;
+            self.colors.insert(key.clone(), rgba);
+        }
+        self.colors.get(&key).map(|v| v.as_slice())
     }
 }
 
@@ -129,6 +173,26 @@ mod tests {
             .expect("embedded illustration");
         let alphas: Vec<u8> = rgba.chunks_exact(4).map(|px| px[3]).collect();
         assert!(alphas.iter().any(|&a| a > 0 && a < 255), "expected partial coverage");
+    }
+
+    /// `color_svg()`'s whole point is keeping an icon's own colours, unlike
+    /// `tinted_rgba` which flattens every covered pixel to one. The app mark
+    /// has both an orange frame and a white glyph over it, so covered pixels
+    /// must show more than one distinct colour.
+    #[test]
+    fn color_rgba_keeps_the_icons_own_colours_instead_of_one_tint() {
+        let mut r = SvgRenderer::new();
+        let rgba = r
+            .color_rgba("icons/rustydlp-icon.svg", 64, 64)
+            .expect("rustydlp-icon.svg should be embedded and parseable");
+        assert_eq!(rgba.len(), 64 * 64 * 4);
+
+        let covered: std::collections::HashSet<(u8, u8, u8)> = rgba
+            .chunks_exact(4)
+            .filter(|px| px[3] > 0)
+            .map(|px| (px[0], px[1], px[2]))
+            .collect();
+        assert!(covered.len() > 1, "expected more than one colour among covered pixels: {covered:?}");
     }
 
     /// A missing path must be recorded, not retried, and must not panic.

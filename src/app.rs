@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cosmic_text::FontSystem;
 use futures_util::StreamExt as _;
 
-use crate::ui::element::{IntoAnyElement as _, SharedString, div, h_flex, img, svg, v_flex};
+use crate::ui::element::{
+    IntoAnyElement as _, SharedString, color_svg, div, h_flex, img, svg, v_flex,
+};
 use crate::ui::style::{FluentBuilder as _, ObjectFit, Styled as _};
 use crate::ui::theme::theme;
 use crate::ui::units::{Length, Pixels, px, relative};
@@ -75,6 +77,18 @@ impl Updates {
 pub enum Route {
     Library,
     Settings,
+}
+
+/// A native window chrome action, requested by a click on one of the custom
+/// caption buttons. `app.rs` only records which one was wanted -- `shell.rs`
+/// is what owns the actual `winit::window::Window` and carries it out, the
+/// same split `Updates` draws between "what changed" and "who has the handle
+/// to act on it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowAction {
+    Minimize,
+    ToggleMaximize,
+    Close,
 }
 
 /// Which top-navbar mode is active, and therefore which jobs the sidebar
@@ -218,6 +232,14 @@ pub struct RustyDlp {
     /// signatures that took `&self` — can consult and advance it without
     /// becoming `&mut self`.
     anim: crate::ui::Animator,
+    /// Set by a caption-button click, drained by `shell.rs` after routing the
+    /// click that set it. There is at most one of these in flight at a time —
+    /// a click is a single event -- so "the last one wins" needs no queue.
+    pending_window_action: Option<WindowAction>,
+    /// Mirrors `winit::window::Window::is_maximized`, pushed in by `shell.rs`
+    /// on every redraw: `render()` has no window handle of its own to ask, and
+    /// the maximize button's icon needs to know which state it would toggle to.
+    window_maximized: bool,
 }
 
 /// Live native-playback state for whichever item is currently open in
@@ -309,6 +331,11 @@ struct Frame {
     width: u32,
     height: u32,
     data: Arc<Vec<u8>>,
+    /// This frame's presentation timestamp, doubling as the paint-side
+    /// cache's identity for it (see `ImageSource::Rgba::id`) -- it is
+    /// already unique per decoded frame, so nothing new had to be minted
+    /// just to tell one buffer apart from another.
+    pts: f64,
 }
 
 /// Starting playback volume. Full scale is loud enough to be startling on a
@@ -487,6 +514,8 @@ impl RustyDlp {
             updates,
             focus: None,
             anim: crate::ui::Animator::default(),
+            pending_window_action: None,
+            window_maximized: false,
         }
     }
 
@@ -578,6 +607,44 @@ impl RustyDlp {
             }
             i = boxes[i].parent?;
         }
+    }
+
+    /// Whether an unhandled click at this point should move the window --
+    /// true for the navbar's own background, false over a button, tab, or
+    /// anything else with its own click handler (those are never reached
+    /// here: `shell.rs` only asks this when `dispatch_click` found nothing).
+    pub fn is_titlebar_drag_area<S>(
+        &self,
+        boxes: &[crate::ui::layout::Box_<'_, S>],
+        x: f32,
+        y: f32,
+    ) -> bool {
+        let Some(mut i) = crate::ui::event::hit_test(boxes, x, y) else {
+            return false;
+        };
+        loop {
+            if boxes[i].node.and_then(|n| n.element_id()).is_some_and(|id| &**id == "navbar") {
+                return true;
+            }
+            match boxes[i].parent {
+                Some(p) => i = p,
+                None => return false,
+            }
+        }
+    }
+
+    /// The window action a caption button asked for since the last time this
+    /// was called, if any.
+    pub fn take_window_action(&mut self) -> Option<WindowAction> {
+        self.pending_window_action.take()
+    }
+
+    /// Called by `shell.rs` before every render, so the maximize button's
+    /// icon reflects the window's actual state rather than assuming it drove
+    /// every change to it (a title-bar double-click or a Windows snap
+    /// shortcut changes it without going through `WindowAction` at all).
+    pub fn set_window_maximized(&mut self, maximized: bool) {
+        self.window_maximized = maximized;
     }
 
     /// Steers a slider from a pointer position.
@@ -1433,23 +1500,27 @@ impl RustyDlp {
             });
 
         h_flex()
+            .id("navbar")
             .w_full()
             .flex_shrink_0()
             .h(px(48.))
-            .px_4()
+            .pl(16.0)
             .items_center()
             .bg(theme().sidebar)
             .border_b_1()
             .border_color(theme().sidebar_border)
             // Three columns: wordmark left, tabs centered independent of the
-            // wordmark's own width, empty spacer right to balance the layout.
+            // wordmark's own width, caption buttons right. The left and right
+            // columns share the same min width so the tabs stay centered
+            // rather than drifting toward whichever side has less content.
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
-                    .font_bold()
-                    .text_color(theme().sidebar_foreground)
-                    .child("rustyDLP"),
+                    .min_w(px(132.))
+                    // The source is 1104x240 -- height-driven at that same
+                    // ratio (~4.6:1) so `color_svg` (no object-fit of its
+                    // own, unlike `img()`) doesn't stretch it.
+                    .child(color_svg("icons/rustydlp-logo.svg").w(px(120.)).h(px(26.))),
             )
             // Deliberately no width: a fixed one was wider than the three
             // labels, and TabBar lays its tabs out from the left, so the
@@ -1457,7 +1528,96 @@ impl RustyDlp {
             // right-hand end. Left to size itself, the bar shrink-wraps the
             // tabs and the row stays centered.
             .child(div().flex_shrink_0().child(tabs))
-            .child(div().flex_1().min_w_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(132.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(self.window_controls()),
+            )
+            .into_any_element()
+    }
+
+    /// The custom minimize/maximize/close buttons that replace the native
+    /// title bar (`shell.rs` opens the window with `decorations(false)`, and
+    /// the rest of `navbar()`'s own background is what `shell.rs` drags the
+    /// window from, in place of the chrome that used to do both jobs).
+    fn window_controls(&self) -> AnyElement {
+        h_flex()
+            .h_full()
+            .items_center()
+            .child(
+                Button::new("win-minimize")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Minimize)
+                    .on_click(|this: &mut Self| {
+                        this.pending_window_action = Some(WindowAction::Minimize);
+                    }),
+            )
+            .child(
+                Button::new("win-maximize")
+                    .ghost()
+                    .small()
+                    .icon(if self.window_maximized { IconName::Restore } else { IconName::Maximize })
+                    .on_click(|this: &mut Self| {
+                        this.pending_window_action = Some(WindowAction::ToggleMaximize);
+                    }),
+            )
+            .child(
+                Button::new("win-close")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Close)
+                    .on_click(|this: &mut Self| {
+                        this.pending_window_action = Some(WindowAction::Close);
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// A yt-dlp-not-found (or library-open-failed) notice, floated over
+    /// everything else rather than pushed into the layout flow: the old
+    /// full-width banner shoved the navbar and every pane down a row, and its
+    /// one-line message had no wrap, so the long path-and-flags diagnostic in
+    /// `refresh_ytdlp`'s error string ran straight off the window's edge
+    /// (visible, not just clipped, since nothing there constrained its
+    /// width). Capped width plus `.truncate()` here keeps this a glanceable
+    /// toast; `Open folder`/`Re-check` stay the way to actually act on it.
+    fn startup_error_toast(&self, msg: String) -> AnyElement {
+        v_flex()
+            .id("startup-toast")
+            .absolute()
+            .right(px(16.))
+            .bottom(px(16.))
+            .max_w(px(340.))
+            .p_3()
+            .gap_2()
+            .rounded(theme().radius)
+            .border_1()
+            .border_color(theme().danger.opacity(0.4))
+            .bg(theme().sidebar)
+            .child(div().text_xs().truncate().text_color(theme().danger).child(msg))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("open-bin-dir")
+                            .small()
+                            .icon(IconName::Folder)
+                            .label("Open folder")
+                            .on_click(|_: &mut Self| open_bin_dir()),
+                    )
+                    .child(
+                        Button::new("banner-recheck")
+                            .small()
+                            .label("Re-check")
+                            .on_click(|this: &mut Self| this.refresh_ytdlp()),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2226,6 +2386,7 @@ impl RustyDlp {
                                         width: frame.width,
                                         height: frame.height,
                                         data: Arc::new(frame.rgba),
+                                        pts,
                                     });
                                     // While the thumb is being dragged the
                                     // readout belongs to it, not to the run
@@ -2386,6 +2547,7 @@ impl RustyDlp {
                         width: frame.width,
                         height: frame.height,
                         data: frame.data,
+                        id: frame.pts.to_bits(),
                     })
                         .absolute()
                         .inset_0()
@@ -3108,13 +3270,36 @@ fn open_path(path: &str) {
     let _ = cmd.spawn();
 }
 
-/// Opens Explorer with the file selected. `/select,` needs the path in the same
-/// argument, and Explorer rejects forward slashes here.
-fn reveal_path(path: &str) {
+/// The raw `/select,"path"` argument for Explorer. Split out from
+/// `reveal_path` so the quoting -- the actual bug it exists to fix -- is
+/// testable without spawning a real Explorer process.
+///
+/// `Command::arg` was quoting the *whole* `/select,<path>` string whenever
+/// the path had a space in it -- true of nearly every download, since
+/// yt-dlp's output template embeds the title -- which puts the opening
+/// quote *before* `/select,` in the actual command line Explorer sees.
+/// Explorer's own parser only recognises `/select,` unquoted, so that never
+/// matched and it silently fell back to its default window instead of the
+/// file. Quoting only the path here, then handing the whole thing to
+/// Explorer as one pre-built argument (see `reveal_path`'s `raw_arg`), is
+/// the syntax Explorer actually expects.
+fn select_arg(path: &str) -> String {
     let native = path.replace('/', "\\");
-    let _ = std::process::Command::new("explorer")
-        .arg(format!("/select,{native}"))
-        .spawn();
+    format!("/select,\"{native}\"")
+}
+
+/// Opens Explorer with the file selected. `/select,` needs the path in the
+/// same argument, and Explorer rejects forward slashes here.
+fn reveal_path(path: &str) {
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.raw_arg(select_arg(path));
+    }
+    #[cfg(not(windows))]
+    cmd.arg(select_arg(path));
+    let _ = cmd.spawn();
 }
 
 /// A labelled switch bound to one bool on the preset being edited.
@@ -3260,7 +3445,7 @@ impl RustyDlp {
             .convert_picker
             .is_some()
             .then(|| self.convert_format_picker());
-        let banner = self.startup_error.clone();
+        let toast = self.startup_error.clone().map(|msg| self.startup_error_toast(msg));
 
         div()
             .relative()
@@ -3270,47 +3455,12 @@ impl RustyDlp {
             .child(
                 v_flex()
                     .size_full()
-                    .when_some(banner, |this, msg| {
-                        this.child(
-                            h_flex()
-                                .w_full()
-                                .px_4()
-                                .py_2()
-                                .gap_3()
-                                .items_center()
-                                .bg(theme().danger.opacity(0.15))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_xs()
-                                        .text_color(theme().danger)
-                                        .child(msg),
-                                )
-                                .child(
-                                    Button::new("open-bin-dir")
-                                        .small()
-                                        .flex_shrink_0()
-                                        .icon(IconName::Folder)
-                                        .label("Open folder")
-                                        .on_click(|_: &mut Self| open_bin_dir()),
-                                )
-                                .child(
-                                    Button::new("banner-recheck")
-                                        .small()
-                                        .flex_shrink_0()
-                                        .label("Re-check")
-                                        .on_click(|this: &mut Self| {
-                                            this.refresh_ytdlp();
-                                        }),
-                                ),
-                        )
-                    })
                     .child(navbar)
                     .child(h_flex().flex_1().min_h_0().child(sidebar).child(main)),
             )
             .children(modal)
             .children(convert_modal)
+            .children(toast)
             .into_any_element()
     }
 }
@@ -3341,7 +3491,7 @@ mod tests {
     // actually under test.
     use super::{
         Job, JobKind, JobState, Route, RustyDlp, SidebarTab, Updates, filter_jobs, is_active,
-        is_retryable, state_after_failure,
+        is_retryable, select_arg, state_after_failure,
     };
     use crate::core::model::{File as MFile, FileKind, Item};
     use crate::render::Backend;
@@ -3362,6 +3512,7 @@ mod tests {
         let painter = Painter {
             shaper: Shaper::with_shared_fonts(fonts.clone()),
             svg: Default::default(),
+            ..Default::default()
         };
         let (updates, rx) = Updates::channel();
         // The receiver is what the event loop drains; leaking it here keeps any
@@ -3421,6 +3572,63 @@ mod tests {
         // The main pane, well clear of the sidebar.
         assert_eq!(r.pixel(700, 400).3, 0xff, "main pane is painted");
         assert!(!r.encode_png().is_empty());
+    }
+
+    /// The window has no OS title bar (see `shell.rs`'s `with_decorations`),
+    /// so its own navbar is the only thing left to drag it by. A regression
+    /// here either makes the window immovable, or -- if the id lookup ever
+    /// matched too broadly -- would fight every other click handler in the
+    /// window for the press.
+    #[test]
+    fn the_navbar_is_a_drag_region_and_nothing_below_it_is() {
+        let (mut app, mut painter) = fixture();
+        let tree = app.render();
+        let boxes = layout(
+            &tree,
+            (WINDOW.0 as f32, WINDOW.1 as f32),
+            &mut painter.shaper,
+            &ScrollState::default(),
+        );
+        // Navbar is 48px tall and starts flush with the window's top edge.
+        assert!(app.is_titlebar_drag_area(&boxes, 400.0, 20.0), "navbar background");
+        assert!(!app.is_titlebar_drag_area(&boxes, 400.0, 60.0), "just below the navbar");
+        assert!(!app.is_titlebar_drag_area(&boxes, 10.0, 120.0), "the sidebar");
+    }
+
+    /// Regression guard for the old full-width banner, which pushed the
+    /// navbar and every pane down a row and let a long diagnostic string run
+    /// off the window's edge with nothing to cap or wrap it. The toast must
+    /// float over the corner instead, at a bounded width, with the rest of
+    /// the screen laid out exactly as it would be with no error at all.
+    #[test]
+    fn a_startup_error_floats_as_a_bounded_corner_toast() {
+        let (mut app, mut painter) = fixture();
+        app.startup_error = Some(
+            "yt-dlp not found. app-data: \"C:\\Users\\matis\\AppData\\Local\\rustyDLP\\bin\\yt-dlp.exe\" \
+             (exists false, is_file false) | dir: [<empty>] | portable: None"
+                .to_string(),
+        );
+        let tree = app.render();
+        let boxes = layout(
+            &tree,
+            (WINDOW.0 as f32, WINDOW.1 as f32),
+            &mut painter.shaper,
+            &ScrollState::default(),
+        );
+
+        let find = |id: &str| {
+            boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| n.element_id()).is_some_and(|i| &**i == id))
+                .unwrap_or_else(|| panic!("no box with id {id}"))
+        };
+        assert_eq!(find("navbar").bounds.y, 0.0, "an error must not shove the navbar down");
+
+        let toast = find("startup-toast").bounds;
+        assert!(toast.width <= 340.0, "capped width, not the old full-width bar: {}", toast.width);
+        let (w, h) = (WINDOW.0 as f32, WINDOW.1 as f32);
+        assert!(toast.x + toast.width > w - 340.0, "anchored toward the right edge");
+        assert!(toast.y + toast.height > h - 340.0, "anchored toward the bottom edge");
     }
 
     /// Every screen has to render without panicking, including the empty states,
@@ -3612,5 +3820,19 @@ mod tests {
         assert_eq!(SidebarTab::Download.empty_message(), "No recent downloads");
         assert_eq!(SidebarTab::Convert.empty_message(), "No recent conversions");
         assert_eq!(SidebarTab::InProgress.empty_message(), "Nothing in progress");
+    }
+
+    /// Regression guard for "Show in folder" landing on a default Explorer
+    /// window (Documents, in practice) instead of the actual file: the quote
+    /// has to wrap only the path, not the `/select,` flag ahead of it, or
+    /// Explorer's parser never recognises the flag at all. A downloaded
+    /// file's name almost always has a space in it -- yt-dlp's output
+    /// template embeds the title -- which is exactly the case that used to
+    /// trip this.
+    #[test]
+    fn reveal_path_quotes_only_the_path_not_the_select_flag() {
+        let arg = select_arg("C:/Users/matis/Videos/Some Title [abc123].mp4");
+        assert_eq!(arg, "/select,\"C:\\Users\\matis\\Videos\\Some Title [abc123].mp4\"");
+        assert!(arg.starts_with("/select,\""), "the flag itself must stay unquoted: {arg}");
     }
 }

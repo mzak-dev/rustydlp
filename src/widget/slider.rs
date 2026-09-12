@@ -8,7 +8,7 @@ use std::rc::Rc;
 use crate::ui::element::{Element, IntoElement, SharedString, div, h_flex};
 use crate::ui::style::Styled;
 use crate::ui::theme::theme;
-use crate::ui::units::{Bounds, px, relative};
+use crate::ui::units::{Bounds, px};
 
 /// The retained part of a slider: its range and where the thumb is.
 #[derive(Clone, Debug)]
@@ -121,14 +121,20 @@ impl<S: 'static> IntoElement<S> for Slider<S> {
         let fraction = self.state.fraction();
         let filled = if self.disabled { t.muted_foreground } else { t.primary };
 
-        let track = div()
-            .id(SharedString::from(format!("{}-track", self.state.value)))
-            .w_full()
+        // The thumb sits between two grow-ratio spacers rather than at a
+        // percentage/inset offset -- this layout engine only resolves
+        // fractional lengths for size, not position, so there is no `left:
+        // 40%` to reach for. Splitting the row `fraction` / `1 - fraction`
+        // is the flexbox-native way to land a fixed-size box at a
+        // continuously variable point along a variable-width track, and it
+        // is exactly how the filled portion's width already worked.
+        let filled_bar =
+            div().flex_grow(fraction).h(px(TRACK_H)).rounded_full().bg(filled);
+        let empty_bar = div()
+            .flex_grow(1.0 - fraction)
             .h(px(TRACK_H))
             .rounded_full()
-            .bg(t.muted)
-            .child(div().h_full().rounded_full().bg(filled).w(relative(fraction)));
-
+            .bg(t.muted);
         let thumb = div()
             .w(px(THUMB))
             .h(px(THUMB))
@@ -140,9 +146,9 @@ impl<S: 'static> IntoElement<S> for Slider<S> {
             .id(self.id)
             .w_full()
             .items_center()
-            .gap_2()
-            .child(track)
-            .child(thumb);
+            .child(filled_bar)
+            .child(thumb)
+            .child(empty_bar);
         if !self.disabled {
             el = el.cursor_pointer();
         }
@@ -153,6 +159,30 @@ impl<S: 'static> IntoElement<S> for Slider<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::element::{Element, IntoElement};
+    use crate::ui::layout::{FixedMetrics, ScrollState, layout};
+
+    /// Regression guard for the thumb sitting dead at the track's right edge
+    /// regardless of value: the fix splits the row by `flex_grow` ratios
+    /// rather than laying the thumb out as a plain sibling after a full-width
+    /// track, so its rendered position must actually track the value.
+    #[test]
+    fn the_thumb_moves_along_the_track_with_the_value() {
+        let thumb_x = |value: f32| {
+            let state = SliderState::new().min(0.0).max(1.0).default_value(value);
+            let tree: Element<()> = Slider::new("s", &state).into_element();
+            let boxes = layout(&tree, (200.0, 40.0), &mut FixedMetrics::default(), &ScrollState::default());
+            // Root, filled bar, thumb, empty bar -- see `into_element`.
+            boxes[2].bounds.x
+        };
+        let low = thumb_x(0.0);
+        let mid = thumb_x(0.5);
+        let high = thumb_x(1.0);
+        assert!(low < mid && mid < high, "thumb must move right as the value rises: {low}, {mid}, {high}");
+        // At the very start the thumb should be flush with the track's own
+        // left edge, not floating in from it.
+        assert_eq!(low, 0.0);
+    }
 
     /// The seek bar is a fraction of the duration and the volume a gain factor,
     /// so both live in 0..1 and the thumb fraction is the value itself.

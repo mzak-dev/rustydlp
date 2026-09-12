@@ -53,11 +53,28 @@ pub enum Content<S> {
     /// which is how gpui's `svg()` behaves, and how both call sites in `app.rs`
     /// use it (`.path(..).text_color(..)`).
     Svg(SharedString),
+    /// An SVG drawn with its own colours, unlike `Svg` above. See `color_svg`.
+    ColorSvg(SharedString),
 }
 
 pub enum ImageSource {
     /// Tightly packed RGBA8, `width * height * 4`.
-    Rgba { width: u32, height: u32, data: Arc<Vec<u8>> },
+    Rgba {
+        width: u32,
+        height: u32,
+        data: Arc<Vec<u8>>,
+        /// A caller-chosen tag identifying this exact buffer, distinct from
+        /// any other one the caller will ever produce -- the video player
+        /// uses its frame's presentation timestamp bits, since two frames
+        /// never share one. Not `Arc::as_ptr(&data)`: the paint-side cache
+        /// this exists for (`Painter`, in `ui/paint.rs`) is checked *every*
+        /// redraw, including the many that repaint an unchanged frame while
+        /// waiting for the next one, and an allocator that reuses a
+        /// same-sized just-freed block (which every video frame is) would
+        /// otherwise make a genuinely new frame look identical to the one
+        /// before it.
+        id: u64,
+    },
     Path(std::path::PathBuf),
 }
 
@@ -104,6 +121,17 @@ pub fn img<S>(source: impl Into<ImageSource>) -> Div<S> {
 pub fn svg<S>() -> Div<S> {
     let mut d = div();
     d.content = Content::Svg(SharedString::from(""));
+    d
+}
+
+/// An SVG box painted with its own colours, not tinted -- for a logo mark
+/// like the navbar's, where the whole point is the colour. `svg()` would
+/// flatten it to a silhouette in the box's text colour, same as every
+/// Lucide icon it draws; this is the one exception, so it is its own
+/// element rather than a flag on that one.
+pub fn color_svg<S>(path: impl Into<SharedString>) -> Div<S> {
+    let mut d = div();
+    d.content = Content::ColorSvg(path.into());
     d
 }
 

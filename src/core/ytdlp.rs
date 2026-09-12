@@ -202,10 +202,15 @@ pub fn download_args(url: &str, opts: &YtdlpOptions) -> Vec<String> {
         format!("after_move:{FILE_PREFIX} %(filepath)s"),
         // Sidecar metadata keeps the library rebuildable if the DB is lost.
         s("--write-info-json"),
-        // Cover art for the grid. Left in yt-dlp's native webp: zed enables the
-        // `webp` feature on the image crate, so gpui decodes it directly and we
-        // avoid an ffmpeg conversion per video.
+        // Cover art for the grid. yt-dlp's native thumbnail format is webp,
+        // but skia-safe here only has its default codecs (no `webp-decode` —
+        // see Cargo.toml), so an unconverted cover would never paint,
+        // always falling back to the placeholder glyph. Converting to png
+        // costs one ffmpeg pass per video, which is already a hard
+        // dependency for muxing, so this adds no new dependency.
         s("--write-thumbnail"),
+        s("--convert-thumbnails"),
+        s("png"),
     ]);
     a.extend(opts.to_args());
     a.push(s(url));
