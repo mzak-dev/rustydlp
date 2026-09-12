@@ -2,34 +2,20 @@
 // Kept on for debug builds so panics and logs stay visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod assets;
-mod core;
-
-use gpui::*;
-use gpui_component::{Root, Theme, ThemeMode};
-
+// `legacy` wins when both interfaces are compiled in: during the parity period
+// the gpui build is the reference the new one is diffed against, so it is the
+// one a plain `cargo run` should give you.
+#[cfg(feature = "legacy")]
 fn main() {
-    gpui_platform::application()
-        .with_assets(assets::AppAssets)
-        .run(move |cx| {
-            gpui_component::init(cx);
+    rustydlp::legacy_main();
+}
 
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(1180.), px(760.)), cx)),
-                ..Default::default()
-            };
-
-            cx.spawn(async move |cx| {
-                cx.open_window(options, |window, cx| {
-                    Theme::change(ThemeMode::Dark, Some(window), cx);
-                    let view = cx.new(|cx| app::RustyDlp::new(window, cx));
-                    // The first level inside the window must be a Root — it hosts
-                    // modals, drawers and notifications for everything below it.
-                    cx.new(|cx| Root::new(view, window, cx))
-                })
-                .expect("failed to open window");
-            })
-            .detach();
-        });
+#[cfg(not(feature = "legacy"))]
+fn main() {
+    eprintln!(
+        "rustydlp: this build has no interface. The skia interface is still being \
+         built bottom-up and has no window yet — it is exercised through the \
+         library's golden tests. Build with `--features legacy` to run the app."
+    );
+    std::process::exit(1);
 }

@@ -3,23 +3,73 @@ name = "rustydlp"
 version = "0.0.5"
 edition = "2024"
 
+# Everything except the thin binary entry point lives in the library, so the
+# new interface can be compiled and golden-tested on its own:
+#   cargo test --no-default-features --features skia --lib
+# builds core/ + ui/ + render/ without pulling in gpui at all.
+[lib]
+name = "rustydlp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustydlp"
+path = "src/main.rs"
+
+[features]
+# The gpui interface. Default while it is still the one that ships, so a plain
+# `cargo build` keeps producing today's app.
+default = ["legacy"]
+legacy = [
+    "dep:gpui",
+    "dep:gpui_platform",
+    "dep:gpui-component",
+    "dep:gpui-component-assets",
+    "dep:image",
+    "dep:smallvec",
+]
+# The replacement: skia-safe paints, taffy lays out, cosmic-text shapes.
+skia = ["dep:skia-safe", "dep:cosmic-text", "dep:taffy"]
+
 [dependencies]
+# -- the interface being replaced (feature `legacy`) ------------------------
 # Pinned to an exact rev on purpose: gpui-component floats on zed's main branch,
 # so an unpinned build is not reproducible.
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e", optional = true }
 
 # Deliberately NOT pinned with `rev`, even though that looks wrong.
 # gpui-component references zed unpinned; cargo keys git deps by source spec, so
 # adding `rev = ...` here creates a SECOND source id for the same commit and
 # compiles gpui twice -> "expected Window, found Window" type errors.
 # The actual pin lives in Cargo.lock (commit it). Verify with `cargo tree -d`.
-gpui = { git = "https://github.com/zed-industries/zed" }
+gpui = { git = "https://github.com/zed-industries/zed", optional = true }
 # gpui_platform provides `application()` — the actual entry point. gpui-component
 # does not depend on it, so it must be declared here or bootstrapping is impossible.
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", optional = true }
 # Ships the built-in Lucide icon set as an AssetSource.
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e", optional = true }
 
+# Only `app.rs` needs these, and only to build the `gpui::RenderImage` that
+# gpui's `img()` takes: they must be the exact versions gpui itself compiles
+# against (see Cargo.lock) or the types don't unify. `core/` is free of them,
+# and they go when gpui goes.
+image = { version = "=0.25.10", default-features = false, optional = true }
+smallvec = { version = "=1.15.2", optional = true }
+
+# -- the replacement interface (feature `skia`) -----------------------------
+# default-features matters: `binary-cache` is what downloads the prebuilt
+# static libs. Turning defaults off yields a 404 on the binaries release and a
+# fall back to a full source build, which needs a skia checkout this crate
+# does not ship. That also means `embed-icudtl` comes along whether or not we
+# shape with ICU -- prebuilts are keyed on the feature combo.
+skia-safe = { version = "0.87", optional = true }
+# Shaping only: glyph ids + positions go to Skia's TextBlob, so Skia's own GPU
+# atlas does the rasterizing. No ICU, no SwashCache bitmap bridge.
+cosmic-text = { version = "0.14", optional = true }
+# The same layout engine gpui uses, so flex behaviour matches by construction
+# rather than by eye.
+taffy = { version = "0.9", optional = true }
+
+# -- always on: core/ and assets -------------------------------------------
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,25 +77,18 @@ serde_json = "1"
 # out of the build. Local embedded use only.
 turso = { version = "0.8.0-pre.3", default-features = false }
 anyhow = "1"
-# Only for its channels: a reader thread hands events to a gpui background task.
+# Only for its channels: a reader thread hands events to a background task.
 futures = "0.3"
 # Resolves the real Videos/Downloads folders via the Windows known-folder API
 # rather than assuming %USERPROFILE%\... — correct when they've been relocated.
 dirs = "6"
-# Pinned to the exact version gpui already pulls in (see Cargo.lock): the
-# player builds gpui::RenderImage frames directly, which requires the same
-# image::Frame type gpui itself compiles against.
-image = { version = "=0.25.10", default-features = false }
-# Same reason as `image` above: RenderImage::new takes a SmallVec of the
-# exact smallvec crate instance gpui itself compiles against.
-smallvec = "=1.15.2"
 # Raw PCM audio output for the native player. No decoder features needed —
 # ffmpeg already decodes to raw samples before they reach cpal.
 cpal = "0.15"
 
 [dev-dependencies]
 # Deliberately NOT tokio: if turso's futures complete under pollster's bare
-# block_on, they are runtime-agnostic and will run on gpui's BackgroundExecutor.
+# block_on, they are runtime-agnostic and can be driven from any thread.
 pollster = "0.4"
 
 # ponytail: gpui's dependency tree is huge. opt-level 2 on deps only — our own
