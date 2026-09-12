@@ -4,7 +4,7 @@
 //!
 //! Nothing in here may depend on the UI layer or on any GUI crate. That is
 //! what makes the interface replaceable: the modules below talk to the UI
-//! only through plain data and `futures::channel` receivers, and their tests
+//! only through plain data and `futures_channel` receivers, and their tests
 //! run without a window, a GPU, or a renderer.
 
 pub mod model;

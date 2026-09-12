@@ -1,23 +1,30 @@
-use futures::StreamExt as _;
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::{
-    ActiveTheme, Icon, IconName,
-    button::{Button, ButtonVariants as _},
-    input::{Input, InputEvent, InputState},
-    slider::{Slider, SliderEvent, SliderState},
-    switch::Switch,
-    tab::{Tab, TabBar},
-    *,
-};
-// Only to turn a core `VideoFrame` into the `RenderImage` gpui's `img` wants.
-// Both go away with gpui; nothing under `core/` touches them.
-use image::{Frame as ImageFrame, RgbaImage};
-use smallvec::SmallVec;
+//! The interface.
+//!
+//! Ported from the gpui build this replaced, and kept deliberately parallel to
+//! it -- same order, same helpers, same comments -- so the two can still be
+//! diffed while parity is signed off. The gpui version is at `src/app.rs` in
+//! commit 374d659 and earlier.
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use cosmic_text::FontSystem;
+use futures_util::StreamExt as _;
+
+use crate::ui::element::{IntoAnyElement as _, SharedString, div, h_flex, img, svg, v_flex};
+use crate::ui::style::{FluentBuilder as _, ObjectFit, Styled as _};
+use crate::ui::theme::theme;
+use crate::ui::units::{Length, Pixels, px, relative};
+use crate::ui::black;
+use crate::widget::{
+    Button, Icon, IconName, Input, InputState, Slider, SliderState, Switch, Tab, TabBar,
+};
 
 use crate::core::model::{
     File as MFile, FileKind, Item, Job, JobKind, JobState, Preset, new_id, sibling_thumbnail,
@@ -26,6 +33,43 @@ use crate::core::player;
 use crate::core::runner::{self, ConvertEvent, ConvertFormat, Probe};
 use crate::core::store::Store;
 use crate::core::ytdlp::{Event, FormatMode, YtdlpOptions};
+
+/// Every element-returning helper in this file hands back one of these, exactly
+/// as it did under gpui -- the one line that keeps those ~30 signatures intact.
+pub type AnyElement = crate::ui::element::AnyElement<RustyDlp>;
+
+/// A change to apply to the app, on the thread that owns it.
+pub type Update = Box<dyn FnOnce(&mut RustyDlp) + Send>;
+
+/// Hands work off to a thread and its results back.
+///
+/// This replaces gpui's executor. Every async site in the gpui build was the
+/// same shape -- do something off-thread, then mutate state -- and `core/`
+/// already hands back plain `futures_channel` receivers from threads it spawns
+/// itself, so nothing here needs a runtime. Closures rather than an enum of
+/// messages keeps the ported bodies looking like the `this.update(..)` blocks
+/// they came from.
+#[derive(Clone)]
+pub struct Updates(futures_channel::mpsc::UnboundedSender<Update>);
+
+impl Updates {
+    pub fn channel() -> (Updates, futures_channel::mpsc::UnboundedReceiver<Update>) {
+        let (tx, rx) = futures_channel::mpsc::unbounded();
+        (Updates(tx), rx)
+    }
+
+    /// Queues a mutation. Dropped silently if the app is gone, which is what
+    /// `this.update(..)`'s ignored `Result` did.
+    pub fn send(&self, f: impl FnOnce(&mut RustyDlp) + Send + 'static) {
+        let _ = self.0.unbounded_send(Box::new(f));
+    }
+
+    /// Runs `work` on its own thread, handing it a sender for the results.
+    pub fn spawn(&self, work: impl FnOnce(Updates) + Send + 'static) {
+        let updates = self.clone();
+        std::thread::spawn(move || work(updates));
+    }
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Route {
@@ -103,14 +147,14 @@ pub struct RustyDlp {
     route: Route,
     tab: SidebarTab,
     modal: bool,
-    url_input: Entity<InputState>,
+    url_input: InputState,
     /// Extra yt-dlp args applied to this download only, never saved back to the
     /// preset. Keeps the merge two layers deep: preset, then this run.
-    override_input: Entity<InputState>,
+    override_input: InputState,
     probe: ProbeState,
     /// Bumped on every keystroke; a debounced probe only fires if it still
     /// matches when its timer expires.
-    probe_gen: u64,
+    probe_gen: Arc<AtomicU64>,
     startup_error: Option<String>,
     /// Accepted but not yet spawned. Drained by a single staggering task.
     pending: VecDeque<PendingLaunch>,
@@ -136,7 +180,7 @@ pub struct RustyDlp {
     player_pending: Option<String>,
     /// Bumped on every load/seek so a stray event from a just-replaced
     /// playback run can't clobber the state of the run that replaced it.
-    player_gen: u64,
+    player_gen: Arc<AtomicU64>,
     /// Path whose last load attempt failed. Needed because a failed load
     /// notifies, which re-renders, which calls `ensure_player` again — an
     /// unguarded retry spins a fresh ffprobe every frame for as long as the
@@ -146,9 +190,9 @@ pub struct RustyDlp {
     /// Seek bar position as a fraction of the source's duration, not as
     /// seconds: a `SliderState`'s range is fixed when it is built, and the
     /// duration only becomes known once a file is loaded.
-    seek_slider: Entity<SliderState>,
+    seek_slider: SliderState,
     /// Output gain, `0.0..=1.0`.
-    volume_slider: Entity<SliderState>,
+    volume_slider: SliderState,
     /// Kept here rather than on `PlayerState` so it survives seeks (which
     /// re-spawn ffmpeg) and carries over to the next item played.
     volume: f32,
@@ -157,7 +201,17 @@ pub struct RustyDlp {
     /// picker is open. Set by both the per-item Convert button and the
     /// Convert tab's "Convert File" picker.
     convert_picker: Option<String>,
-    _subs: Vec<Subscription>,
+    /// Shared with the painter's shaper. Text inputs keep their own cosmic-text
+    /// buffers, and they have to be shaped against the same font database the
+    /// paint uses or a caret would be measured with different metrics than the
+    /// glyphs beside it.
+    ///
+    /// Borrow discipline: taken only for the duration of one input mutation, and
+    /// never held across a shaping call.
+    fonts: Rc<RefCell<FontSystem>>,
+    updates: Updates,
+    /// Which field has the keyboard, if any.
+    focus: Option<Focus>,
 }
 
 /// Live native-playback state for whichever item is currently open in
@@ -166,7 +220,8 @@ pub struct RustyDlp {
 struct PlayerState {
     control: player::PlayerControl,
     path: String,
-    frame: Option<Arc<gpui::RenderImage>>,
+    /// The most recent decoded frame, kept as plain RGBA.
+    frame: Option<Frame>,
     position_secs: f64,
     /// Total length: ffprobe's, or the item's recorded one as a fallback.
     /// Without it there is nothing to draw a seek bar against.
@@ -178,6 +233,76 @@ struct PlayerState {
     /// True while the seek bar is being dragged, so arriving frame positions
     /// don't fight the thumb for the slider's value.
     scrubbing: bool,
+}
+
+/// Which text field has the keyboard.
+///
+/// gpui tracked focus itself; here the interface owns it, so a click has to say
+/// which field it landed on and the event loop asks for that field back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Url,
+    Override,
+    Name,
+    MaxHeight,
+    Container,
+    Output,
+    Dir,
+    Subs,
+    Extra,
+    Codec,
+    CustomFmt,
+}
+
+impl Focus {
+    /// The element id the matching `Input` is built with.
+    fn element_id(self) -> &'static str {
+        match self {
+            Focus::Url => "url",
+            Focus::Override => "override",
+            Focus::Name => "field-name",
+            Focus::MaxHeight => "field-max-height",
+            Focus::Container => "field-container",
+            Focus::Output => "field-output",
+            Focus::Dir => "field-dir",
+            Focus::Subs => "field-subs",
+            Focus::Extra => "field-extra",
+            Focus::Codec => "field-codec",
+            Focus::CustomFmt => "field-custom-fmt",
+        }
+    }
+
+    const ALL: [Focus; 11] = [
+        Focus::Url,
+        Focus::Override,
+        Focus::Name,
+        Focus::MaxHeight,
+        Focus::Container,
+        Focus::Output,
+        Focus::Dir,
+        Focus::Subs,
+        Focus::Extra,
+        Focus::Codec,
+        Focus::CustomFmt,
+    ];
+}
+
+/// Which of the two player sliders a drag belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliderKind {
+    Seek,
+    Volume,
+}
+
+/// One decoded frame, split into what an image source needs.
+///
+/// The decode thread's `Vec` moves straight into the `Arc`, so no frame is ever
+/// copied, and handing it to the element tree each render is an `Arc` bump.
+#[derive(Clone)]
+struct Frame {
+    width: u32,
+    height: u32,
+    data: Arc<Vec<u8>>,
 }
 
 /// Starting playback volume. Full scale is loud enough to be startling on a
@@ -221,32 +346,30 @@ const MAX_LAUNCH_ATTEMPTS: u32 = 5;
 /// Text fields of the preset editor. Toggles and the format mode live on
 /// `editing` directly; only free-text needs an InputState.
 struct PresetForm {
-    name: Entity<InputState>,
-    max_height: Entity<InputState>,
-    container: Entity<InputState>,
-    output: Entity<InputState>,
-    dir: Entity<InputState>,
-    subs: Entity<InputState>,
-    extra: Entity<InputState>,
-    codec: Entity<InputState>,
-    custom_fmt: Entity<InputState>,
+    name: InputState,
+    max_height: InputState,
+    container: InputState,
+    output: InputState,
+    dir: InputState,
+    subs: InputState,
+    extra: InputState,
+    codec: InputState,
+    custom_fmt: InputState,
 }
 
 impl PresetForm {
-    fn new(window: &mut Window, cx: &mut App) -> Self {
-        let mk = |window: &mut Window, cx: &mut App, ph: &'static str| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(ph))
-        };
+    fn new(fonts: &mut FontSystem) -> Self {
+        let mut mk = |ph: &'static str| InputState::new(fonts).placeholder(ph);
         Self {
-            name: mk(window, cx, "Preset name"),
-            max_height: mk(window, cx, "1080 (blank = no cap)"),
-            container: mk(window, cx, "mp4 / mkv (blank = leave alone)"),
-            output: mk(window, cx, "%(title)s [%(id)s].%(ext)s"),
-            dir: mk(window, cx, "Download folder"),
-            subs: mk(window, cx, "en,pl (blank = no subtitles)"),
-            extra: mk(window, cx, "--cookies-from-browser firefox"),
-            codec: mk(window, cx, "mp3 / m4a / opus"),
-            custom_fmt: mk(window, cx, "bv*+ba/b"),
+            name: mk("Preset name"),
+            max_height: mk("1080 (blank = no cap)"),
+            container: mk("mp4 / mkv (blank = leave alone)"),
+            output: mk("%(title)s [%(id)s].%(ext)s"),
+            dir: mk("Download folder"),
+            subs: mk("en,pl (blank = no subtitles)"),
+            extra: mk("--cookies-from-browser firefox"),
+            codec: mk("mp3 / m4a / opus"),
+            custom_fmt: mk("bv*+ba/b"),
         }
     }
 }
@@ -280,64 +403,48 @@ fn human_duration(secs: f64) -> String {
 }
 
 impl RustyDlp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let url_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Paste a video or playlist URL")
-        });
-        let override_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Extra args for this download only")
-        });
+    pub fn new(fonts: Rc<RefCell<FontSystem>>, updates: Updates) -> Self {
+        let mut this = Self::build(fonts, updates);
+        this.refresh_ytdlp();
+        this.open_store();
+        this
+    }
+
+    /// The state alone, with nothing started.
+    ///
+    /// Rendering needs neither yt-dlp nor the library, and a test that opened the
+    /// store would write a real database into the user's app data.
+    fn build(fonts: Rc<RefCell<FontSystem>>, updates: Updates) -> Self {
+        let (url_input, override_input, form) = {
+            let mut f = fonts.borrow_mut();
+            (
+                InputState::new(&mut f).placeholder("Paste a video or playlist URL"),
+                InputState::new(&mut f).placeholder("Extra args for this download only"),
+                PresetForm::new(&mut f),
+            )
+        };
 
         // Both player sliders work in normalised units: the seek bar as a
         // fraction of the duration, the volume as a gain factor.
-        let seek_slider = cx.new(|_| {
-            SliderState::new()
-                .min(0.0)
-                .max(1.0)
-                .step(0.001)
-                .default_value(0.0)
-        });
-        let volume_slider = cx.new(|_| {
-            SliderState::new()
-                .min(0.0)
-                .max(1.0)
-                .step(0.01)
-                .default_value(DEFAULT_VOLUME)
-        });
+        let seek_slider = SliderState::new()
+            .min(0.0)
+            .max(1.0)
+            .step(0.001)
+            .default_value(0.0);
+        let volume_slider = SliderState::new()
+            .min(0.0)
+            .max(1.0)
+            .step(0.01)
+            .default_value(DEFAULT_VOLUME);
 
-        let _subs = vec![
-            cx.subscribe_in(&url_input, window, {
-                let input = url_input.clone();
-                move |this: &mut Self, _, ev: &InputEvent, window, cx| {
-                    if matches!(ev, InputEvent::Change) {
-                        let value = input.read(cx).value().to_string();
-                        this.schedule_probe(value, window, cx);
-                    }
-                }
-            }),
-            // Dragging only moves the readout; the seek itself waits for the
-            // release, because every seek re-spawns two ffmpeg processes and
-            // doing that per mouse-move would thrash.
-            cx.subscribe_in(
-                &seek_slider,
-                window,
-                |this: &mut Self, _, ev: &SliderEvent, _, cx| match ev {
-                    SliderEvent::Change(value) => this.scrub_to(value.end(), cx),
-                    SliderEvent::Release(value) => this.seek_to_fraction(value.end(), cx),
-                },
-            ),
-            cx.subscribe_in(
-                &volume_slider,
-                window,
-                |this: &mut Self, _, ev: &SliderEvent, _, cx| {
-                    if let SliderEvent::Change(value) = ev {
-                        this.set_volume(value.end(), cx);
-                    }
-                },
-            ),
-        ];
+        // No subscriptions: the three the gpui build registered (url text
+        // changed, seek slider changed/released, volume changed) are now direct
+        // calls from the input and slider handling -- `url_changed`, `scrub_to`,
+        // `seek_to_fraction`, `set_volume`. The drag/release split is preserved
+        // there, because every seek re-spawns two ffmpeg processes and doing
+        // that per mouse-move would thrash.
 
-        let mut this = Self {
+        Self {
             ytdlp: None,
             store: None,
             jobs: Vec::new(),
@@ -350,7 +457,7 @@ impl RustyDlp {
             url_input,
             override_input,
             probe: ProbeState::Idle,
-            probe_gen: 0,
+            probe_gen: Arc::new(AtomicU64::new(0)),
             startup_error: None,
             pending: VecDeque::new(),
             launcher_active: false,
@@ -359,22 +466,158 @@ impl RustyDlp {
             presets: Vec::new(),
             chosen_preset: None,
             editing: None,
-            form: PresetForm::new(window, cx),
+            form,
             sidebar_collapsed: false,
             player: None,
             player_pending: None,
-            player_gen: 0,
+            player_gen: Arc::new(AtomicU64::new(0)),
             player_failed: None,
             seek_slider,
             volume_slider,
             volume: DEFAULT_VOLUME,
             muted: false,
             convert_picker: None,
-            _subs,
+            fonts,
+            updates,
+            focus: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(fonts: Rc<RefCell<FontSystem>>, updates: Updates) -> Self {
+        Self::build(fonts, updates)
+    }
+
+    // -- driven by the event loop -----------------------------------------
+
+    /// The field with the keyboard, if any.
+    pub fn focused_input_mut(&mut self) -> Option<&mut InputState> {
+        self.input_mut(self.focus?)
+    }
+
+    /// Moves focus to whichever field was clicked, or clears it.
+    ///
+    /// The caret is placed from the click's offset into the field, so clicking
+    /// into the middle of a URL puts the caret there rather than at the end.
+    pub fn focus_input_at<S>(&mut self, boxes: &[crate::ui::layout::Box_<'_, S>], x: f32, y: f32) {
+        let hit = crate::ui::event::hit_test(boxes, x, y);
+        let mut landed = None;
+        if let Some(mut i) = hit {
+            'outer: loop {
+                if let Some(id) = boxes[i].node.and_then(|n| n.element_id()) {
+                    for focus in Focus::ALL {
+                        if &**id == focus.element_id() {
+                            landed = Some((focus, boxes[i].bounds.x));
+                            break 'outer;
+                        }
+                    }
+                }
+                match boxes[i].parent {
+                    Some(p) => i = p,
+                    None => break,
+                }
+            }
+        }
+
+        for focus in Focus::ALL {
+            let is_target = landed.map(|(f, _)| f) == Some(focus);
+            if let Some(input) = self.input_mut(focus) {
+                input.set_focused(is_target);
+            }
+        }
+        self.focus = landed.map(|(f, _)| f);
+        if let Some((focus, origin)) = landed {
+            // 8px is the field's horizontal padding -- see the Input widget.
+            let offset = (x - origin - 8.0).max(0.0);
+            let fonts = self.fonts.clone();
+            let mut fonts = fonts.borrow_mut();
+            if let Some(input) = self.input_mut(focus) {
+                input.click(&mut fonts, offset);
+            }
+        }
+    }
+
+    fn input_mut(&mut self, focus: Focus) -> Option<&mut InputState> {
+        Some(match focus {
+            Focus::Url => &mut self.url_input,
+            Focus::Override => &mut self.override_input,
+            Focus::Name => &mut self.form.name,
+            Focus::MaxHeight => &mut self.form.max_height,
+            Focus::Container => &mut self.form.container,
+            Focus::Output => &mut self.form.output,
+            Focus::Dir => &mut self.form.dir,
+            Focus::Subs => &mut self.form.subs,
+            Focus::Extra => &mut self.form.extra,
+            Focus::Codec => &mut self.form.codec,
+            Focus::CustomFmt => &mut self.form.custom_fmt,
+        })
+    }
+
+    /// Which slider, if either, is under the pointer.
+    pub fn slider_at<S>(
+        &self,
+        boxes: &[crate::ui::layout::Box_<'_, S>],
+        x: f32,
+        y: f32,
+    ) -> Option<SliderKind> {
+        let mut i = crate::ui::event::hit_test(boxes, x, y)?;
+        loop {
+            if let Some(id) = boxes[i].node.and_then(|n| n.element_id()) {
+                match &**id {
+                    "seek" => return Some(SliderKind::Seek),
+                    "volume" => return Some(SliderKind::Volume),
+                    _ => {}
+                }
+            }
+            i = boxes[i].parent?;
+        }
+    }
+
+    /// Steers a slider from a pointer position.
+    ///
+    /// The seek bar deliberately splits drag from release: dragging only moves
+    /// the readout, and the seek itself waits for the release, because every seek
+    /// re-spawns two ffmpeg processes and doing that per mouse-move would thrash.
+    pub fn slider_drag<S>(
+        &mut self,
+        seek: bool,
+        boxes: &[crate::ui::layout::Box_<'_, S>],
+        x: f32,
+        _y: f32,
+        released: bool,
+    ) {
+        let id = if seek { "seek" } else { "volume" };
+        let Some(track) = boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| n.element_id()).is_some_and(|e| &**e == id))
+            .map(|b| b.bounds)
+        else {
+            return;
         };
-        this.refresh_ytdlp();
-        this.open_store(cx);
-        this
+        let state = if seek { &self.seek_slider } else { &self.volume_slider };
+        let value = state.value_at(&track, x);
+        if seek {
+            if released {
+                self.seek_to_fraction(value);
+            } else {
+                self.scrub_to(value);
+            }
+        } else {
+            self.set_volume(value);
+        }
+    }
+
+    /// The debounced probe the gpui build ran from `InputEvent::Change`.
+    pub fn url_input_changed(&mut self) {
+        if self.focus != Some(Focus::Url) {
+            return;
+        }
+        let value = self.url_input.value();
+        self.schedule_probe(value);
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.player.as_ref().is_some_and(|p| p.playing)
     }
 
     /// Re-probes for the yt-dlp binary and clears/sets the banner accordingly.
@@ -396,33 +639,32 @@ impl RustyDlp {
         }
     }
 
-    fn open_store(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
+    fn open_store(&mut self) {
+        self.updates.spawn(|updates| {
             let dir = db_path();
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 let msg = format!("cannot create {}: {e}", dir.display());
-                let _ = this.update(cx, |this, cx| {
+                updates.send(move |this| {
                     this.startup_error = Some(msg);
-                    cx.notify();
                 });
                 return;
             }
             let path = dir.join("library.db");
-            match Store::open(&path.to_string_lossy()).await {
+            match Store::open(&path.to_string_lossy()) {
                 Ok(store) => {
-                    let jobs = store.load_jobs().await.unwrap_or_default();
+                    let jobs = store.load_jobs().unwrap_or_default();
 
                     // Seed on first run so a fresh install has usable presets
                     // without anyone opening Settings.
-                    let mut presets = store.load_presets().await.unwrap_or_default();
+                    let mut presets = store.load_presets().unwrap_or_default();
                     if presets.is_empty() {
                         for p in Preset::seeds(&dirs_download().to_string_lossy()) {
-                            let _ = store.save_preset(&p).await;
+                            let _ = store.save_preset(&p);
                         }
-                        presets = store.load_presets().await.unwrap_or_default();
+                        presets = store.load_presets().unwrap_or_default();
                     }
 
-                    let _ = this.update(cx, |this, cx| {
+                    updates.send(move |this| {
                         this.store = Some(Arc::new(store));
                         this.jobs = jobs;
                         this.chosen_preset = presets
@@ -431,57 +673,49 @@ impl RustyDlp {
                             .or_else(|| presets.first())
                             .map(|p| p.name.clone());
                         this.presets = presets;
-                        cx.notify();
                     });
                 }
                 Err(e) => {
                     let msg = format!("could not open library: {e}");
-                    let _ = this.update(cx, |this, cx| {
+                    updates.send(move |this| {
                         this.startup_error = Some(msg);
-                        cx.notify();
                     });
                 }
             }
-        })
-        .detach();
+        });
     }
 
     // -- probe -------------------------------------------------------------
 
     /// Debounced so a probe does not fire on every keystroke while the user is
     /// still typing or pasting.
-    fn schedule_probe(&mut self, url: String, _window: &mut Window, cx: &mut Context<Self>) {
-        self.probe_gen += 1;
-        let generation = self.probe_gen;
+    fn schedule_probe(&mut self, url: String) {
+        let generation = self.probe_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let counter = self.probe_gen.clone();
 
         if !url.trim_start().starts_with("http") {
             self.probe = ProbeState::Idle;
-            cx.notify();
             return;
         }
         let Some(exe) = self.ytdlp.clone() else {
             return;
         };
 
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
-                .await;
-            // Superseded by a newer keystroke — drop this one.
-            let still_current = this
-                .read_with(cx, |this, _| this.probe_gen == generation)
-                .unwrap_or(false);
-            if !still_current {
+        self.updates.spawn(move |updates| {
+            std::thread::sleep(Duration::from_millis(500));
+            // Superseded by a newer keystroke — drop this one. Read straight off
+            // the shared counter rather than asking the app, so a stale probe
+            // costs nothing and never spawns yt-dlp.
+            if counter.load(Ordering::SeqCst) != generation {
                 return;
             }
-            let _ = this.update(cx, |this, cx| {
+            updates.send(|this| {
                 this.probe = ProbeState::Running;
-                cx.notify();
             });
 
-            let result = runner::probe(exe, url.trim().to_string()).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.probe_gen != generation {
+            let result = pollster::block_on(runner::probe(exe, url.trim().to_string()));
+            updates.send(move |this| {
+                if this.probe_gen.load(Ordering::SeqCst) != generation {
                     return;
                 }
                 this.probe = match result {
@@ -489,16 +723,14 @@ impl RustyDlp {
                     Ok(Err(e)) => ProbeState::Err(e.to_string()),
                     Err(_) => ProbeState::Err("probe cancelled".into()),
                 };
-                cx.notify();
             });
-        })
-        .detach();
+        });
     }
 
     // -- download ----------------------------------------------------------
 
-    fn start_download(&mut self, cx: &mut Context<Self>) {
-        let url = self.url_input.read(cx).value().to_string();
+    fn start_download(&mut self) {
+        let url = self.url_input.value().to_string();
         let url = url.trim().to_string();
         if url.is_empty() {
             return;
@@ -539,7 +771,7 @@ impl RustyDlp {
         self.probe = ProbeState::Idle;
         // Deliberately does NOT switch to the In progress tab: Home already
         // lists the new job, so a jump would only move you off what you had.
-        self.persist(job, cx);
+        self.persist(job);
 
         let mut opts = preset.map(|p| p.options).unwrap_or_else(default_options);
         if opts.download_dir.trim().is_empty() {
@@ -549,7 +781,6 @@ impl RustyDlp {
         // later flags win — same precedence yt-dlp gives a repeated option.
         opts.extra_args.extend(
             self.override_input
-                .read(cx)
                 .value()
                 .split_whitespace()
                 .map(str::to_string),
@@ -561,61 +792,62 @@ impl RustyDlp {
             opts,
             attempts: 0,
         });
-        self.ensure_launcher(cx);
-        cx.notify();
+        self.ensure_launcher();
     }
 
     /// Drains `pending`, spacing launches by [`LAUNCH_STAGGER`]. There is no cap
     /// on how many downloads end up running at once — only on how fast they
     /// start. A failed spawn is requeued with growing backoff, so a transient
     /// resource limit delays a job rather than killing it.
-    fn ensure_launcher(&mut self, cx: &mut Context<Self>) {
+    fn ensure_launcher(&mut self) {
         if self.launcher_active {
             return;
         }
         self.launcher_active = true;
+        self.launch_next();
+    }
 
-        cx.spawn(async move |this, cx| {
-            loop {
-                let next = this
-                    .update(cx, |this, _| this.pending.pop_front())
-                    .ok()
-                    .flatten();
-                let Some(mut pending) = next else { break };
+    /// One turn of the launch queue.
+    ///
+    /// The gpui build ran this as a loop on a background task that reached back
+    /// into the entity for each step. Here the loop is driven from the thread
+    /// that owns the state and only the *waiting* goes to a worker, which keeps
+    /// every read and write of `pending` on one thread. The behaviour is the
+    /// same: launches are spaced by [`LAUNCH_STAGGER`], a failed spawn goes to
+    /// the back of the queue with growing backoff so one sick job cannot starve
+    /// the rest, and the queue is only marked idle once it is empty.
+    fn launch_next(&mut self) {
+        let Some(mut pending) = self.pending.pop_front() else {
+            self.launcher_active = false;
+            return;
+        };
 
-                let launched = this
-                    .update(cx, |this, cx| this.launch(&pending, cx))
-                    .unwrap_or(Ok(()));
-
-                match launched {
-                    Ok(()) => {
-                        cx.background_executor().timer(LAUNCH_STAGGER).await;
-                    }
-                    Err(_) if pending.attempts + 1 < MAX_LAUNCH_ATTEMPTS => {
-                        pending.attempts += 1;
-                        let wait = LAUNCH_BACKOFF * pending.attempts;
-                        // Back of the queue so one sick job cannot starve the rest.
-                        let _ = this.update(cx, |this, cx| {
-                            this.pending.push_back(pending);
-                            cx.notify();
-                        });
-                        cx.background_executor().timer(wait).await;
-                    }
-                    Err(e) => {
-                        let msg = format!("could not start yt-dlp after retries: {e}");
-                        let id = pending.job_id.clone();
-                        let _ = this.update(cx, |this, cx| this.fail_job(&id, msg, cx));
-                    }
-                }
+        match self.launch(&pending) {
+            Ok(()) => self.resume_launcher_after(LAUNCH_STAGGER),
+            Err(_) if pending.attempts + 1 < MAX_LAUNCH_ATTEMPTS => {
+                pending.attempts += 1;
+                let wait = LAUNCH_BACKOFF * pending.attempts;
+                self.pending.push_back(pending);
+                self.resume_launcher_after(wait);
             }
+            Err(e) => {
+                let msg = format!("could not start yt-dlp after retries: {e}");
+                let id = pending.job_id.clone();
+                self.fail_job(&id, msg);
+                self.launch_next();
+            }
+        }
+    }
 
-            let _ = this.update(cx, |this, _| this.launcher_active = false);
-        })
-        .detach();
+    fn resume_launcher_after(&self, wait: Duration) {
+        self.updates.spawn(move |updates| {
+            std::thread::sleep(wait);
+            updates.send(|this| this.launch_next());
+        });
     }
 
     /// Spawns one job and starts pumping its events. Errors here are retryable.
-    fn launch(&mut self, pending: &PendingLaunch, cx: &mut Context<Self>) -> anyhow::Result<()> {
+    fn launch(&mut self, pending: &PendingLaunch) -> anyhow::Result<()> {
         let exe = runner::ytdlp_path(None)?;
         let download = runner::spawn_download(&exe, &pending.url, &pending.opts)?;
 
@@ -625,29 +857,36 @@ impl RustyDlp {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             job.state = JobState::Running;
             let snapshot = job.clone();
-            self.persist(snapshot, cx);
+            self.persist(snapshot);
         }
-        cx.notify();
 
-        cx.spawn(async move |this, cx| {
+        // `download.events` is already a plain futures channel fed by a thread
+        // runner.rs spawned, so pumping it needs a thread and a block_on, not an
+        // executor. `apply_event` still decides when the run ended, but that
+        // decision is made on the app's thread and sent back here.
+        self.updates.spawn(move |updates| {
             let mut events = download.events;
-            while let Some(event) = events.next().await {
-                let ended = this
-                    .update(cx, |this, cx| this.apply_event(&job_id, event, cx))
-                    .unwrap_or(true);
-                if ended {
+            while let Some(event) = pollster::block_on(events.next()) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let id = job_id.clone();
+                updates.send(move |this| {
+                    let _ = tx.send(this.apply_event(&id, event));
+                });
+                // Unwrap-or-true: a closed channel means the app is gone, which
+                // is the same "stop pumping" answer the old `unwrap_or(true)`
+                // gave when the entity had been dropped.
+                if rx.recv().unwrap_or(true) {
                     break;
                 }
             }
-            let _ = this.update(cx, |this, cx| this.finish_job(&job_id, cx));
-        })
-        .detach();
+            updates.send(move |this| this.finish_job(&job_id));
+        });
 
         Ok(())
     }
 
     /// Folds one yt-dlp event into job state. Returns true when the run ended.
-    fn apply_event(&mut self, job_id: &str, event: Event, cx: &mut Context<Self>) -> bool {
+    fn apply_event(&mut self, job_id: &str, event: Event) -> bool {
         let mut ended = false;
         match event {
             Event::Progress(p) => {
@@ -724,7 +963,7 @@ impl RustyDlp {
                         .get(job_id)
                         .map(|l| l.log.iter().rev().take(3).cloned().collect::<Vec<_>>().join(" | "))
                         .unwrap_or_default();
-                    self.fail_job(job_id, format!("yt-dlp exited {code}: {tail}"), cx);
+                    self.fail_job(job_id, format!("yt-dlp exited {code}: {tail}"));
                     ended = true;
                 } else {
                     let live = self.live.entry(job_id.to_string()).or_default();
@@ -736,11 +975,10 @@ impl RustyDlp {
                 }
             }
         }
-        cx.notify();
         ended
     }
 
-    fn fail_job(&mut self, job_id: &str, error: String, cx: &mut Context<Self>) {
+    fn fail_job(&mut self, job_id: &str, error: String) {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             // Killing the child makes yt-dlp exit non-zero, which would
             // otherwise be reported as a failure. A deliberate cancel wins.
@@ -749,34 +987,32 @@ impl RustyDlp {
                 job.error = Some(error);
             }
             let snapshot = job.clone();
-            self.persist(snapshot, cx);
+            self.persist(snapshot);
         }
         self.live.remove(job_id);
         self.cancels.remove(job_id);
-        cx.notify();
     }
 
-    fn finish_job(&mut self, job_id: &str, cx: &mut Context<Self>) {
+    fn finish_job(&mut self, job_id: &str) {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             if job.state == JobState::Running {
                 job.state = JobState::Done;
             }
             let snapshot = job.clone();
-            self.persist(snapshot, cx);
+            self.persist(snapshot);
         }
         self.live.remove(job_id);
         self.cancels.remove(job_id);
-        cx.notify();
     }
 
     /// Marks the job cancelled first, then kills the process — so the non-zero
     /// exit that follows is recognised as intentional.
-    fn cancel_job(&mut self, job_id: &str, cx: &mut Context<Self>) {
+    fn cancel_job(&mut self, job_id: &str) {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             job.state = JobState::Cancelled;
             job.error = None;
             let snapshot = job.clone();
-            self.persist(snapshot, cx);
+            self.persist(snapshot);
         }
         // Drop it from the launch queue too, in case it never started.
         self.pending.retain(|p| p.job_id != job_id);
@@ -784,12 +1020,11 @@ impl RustyDlp {
             handle.cancel();
         }
         self.live.remove(job_id);
-        cx.notify();
     }
 
     /// Removes a job from the list and library. Only for jobs that aren't
     /// actively downloading — cancel first.
-    fn delete_job(&mut self, job_id: &str, cx: &mut Context<Self>) {
+    fn delete_job(&mut self, job_id: &str) {
         self.jobs.retain(|j| j.id != job_id);
         self.live.remove(job_id);
         self.cancels.remove(job_id);
@@ -798,19 +1033,17 @@ impl RustyDlp {
         }
         if let Some(store) = self.store.clone() {
             let job_id = job_id.to_string();
-            cx.background_spawn(async move {
-                if let Err(e) = store.delete_job(&job_id).await {
+            self.updates.spawn(move |_| {
+                if let Err(e) = store.delete_job(&job_id) {
                     eprintln!("rustydlp: failed to delete job {job_id}: {e}");
                 }
-            })
-            .detach();
+            });
         }
-        cx.notify();
     }
 
     /// Re-queues a failed or cancelled job. Partial `.part` files survive a
     /// kill, so yt-dlp resumes rather than starting the transfer again.
-    fn retry_job(&mut self, job_id: &str, cx: &mut Context<Self>) {
+    fn retry_job(&mut self, job_id: &str) {
         let Some(job) = self.jobs.iter().find(|j| j.id == job_id) else {
             return;
         };
@@ -832,7 +1065,7 @@ impl RustyDlp {
             job.state = JobState::Queued;
             job.error = None;
             let snapshot = job.clone();
-            self.persist(snapshot, cx);
+            self.persist(snapshot);
         }
         self.live.insert(job_id.to_string(), Live::default());
         self.pending.push_back(PendingLaunch {
@@ -841,101 +1074,87 @@ impl RustyDlp {
             opts,
             attempts: 0,
         });
-        self.ensure_launcher(cx);
-        cx.notify();
+        self.ensure_launcher();
     }
 
-    fn update_ytdlp(&mut self, cx: &mut Context<Self>) {
+    fn update_ytdlp(&mut self) {
         let Some(exe) = self.ytdlp.clone() else {
             return;
         };
         self.update_status = Some("Updating…".into());
-        cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            let result = runner::update_ytdlp(exe).await;
+        self.updates.spawn(move |updates| {
+            let result = pollster::block_on(runner::update_ytdlp(exe));
             let msg = match result {
                 Ok(Ok(line)) => line,
                 Ok(Err(e)) => format!("Update failed: {e}"),
                 Err(_) => "Update task cancelled".into(),
             };
-            let _ = this.update(cx, |this, cx| {
+            updates.send(move |this| {
                 this.update_status = Some(msg);
                 this.refresh_ytdlp();
-                cx.notify();
             });
-        })
-        .detach();
+        });
     }
 
     /// Writes a job snapshot off the UI thread. Called only on transitions.
-    fn persist(&self, job: Job, cx: &mut Context<Self>) {
+    fn persist(&self, job: Job) {
         let Some(store) = self.store.clone() else {
             return;
         };
-        cx.background_spawn(async move {
-            if let Err(e) = store.save_job(&job).await {
+        self.updates.spawn(move |_| {
+            if let Err(e) = store.save_job(&job) {
                 eprintln!("rustydlp: failed to save job {}: {e}", job.id);
             }
-        })
-        .detach();
+        });
     }
 
     // -- presets -----------------------------------------------------------
 
     /// Copies a preset into the editor's text fields.
-    fn edit_preset(&mut self, preset: Preset, window: &mut Window, cx: &mut Context<Self>) {
+    fn edit_preset(&mut self, preset: Preset) {
         let o = &preset.options;
-        let set = |e: &Entity<InputState>, v: String, window: &mut Window, cx: &mut Context<Self>| {
-            e.update(cx, |s, cx| s.set_value(v, window, cx));
-        };
-        set(&self.form.name, preset.name.clone(), window, cx);
+        let fonts = self.fonts.clone();
+        let mut fonts = fonts.borrow_mut();
+        let mut set = |e: &mut InputState, v: String| e.set_value(&mut fonts, &v);
+        set(&mut self.form.name, preset.name.clone());
         set(
-            &self.form.max_height,
+            &mut self.form.max_height,
             o.max_height.map(|h| h.to_string()).unwrap_or_default(),
-            window,
-            cx,
         );
         set(
-            &self.form.container,
+            &mut self.form.container,
             o.container.clone().unwrap_or_default(),
-            window,
-            cx,
         );
-        set(&self.form.output, o.output_template.clone(), window, cx);
-        set(&self.form.dir, o.download_dir.clone(), window, cx);
-        set(&self.form.subs, o.subtitle_langs.join(","), window, cx);
-        set(&self.form.extra, o.extra_args.join(" "), window, cx);
+        set(&mut self.form.output, o.output_template.clone());
+        set(&mut self.form.dir, o.download_dir.clone());
+        set(&mut self.form.subs, o.subtitle_langs.join(","));
+        set(&mut self.form.extra, o.extra_args.join(" "));
         set(
-            &self.form.codec,
+            &mut self.form.codec,
             match &o.format {
                 FormatMode::AudioOnly { codec } => codec.clone(),
                 _ => String::new(),
             },
-            window,
-            cx,
         );
         set(
-            &self.form.custom_fmt,
+            &mut self.form.custom_fmt,
             match &o.format {
                 FormatMode::Custom(s) => s.clone(),
                 _ => String::new(),
             },
-            window,
-            cx,
         );
         self.editing = Some(preset);
-        cx.notify();
     }
 
     /// Reads the text fields back onto the preset being edited and saves it.
-    fn save_editing(&mut self, cx: &mut Context<Self>) {
+    fn save_editing(&mut self) {
         let Some(mut preset) = self.editing.clone() else {
             return;
         };
-        let read = |e: &Entity<InputState>, cx: &Context<Self>| e.read(cx).value().trim().to_string();
+        let read = |e: &InputState| e.value().trim().to_string();
 
-        let name = read(&self.form.name, cx);
+        let name = read(&self.form.name);
         if name.is_empty() {
             return;
         }
@@ -945,35 +1164,35 @@ impl RustyDlp {
         let o = &mut preset.options;
         // A non-numeric height is treated as "no cap" rather than rejected —
         // the field is advisory and a modal error here would be worse.
-        o.max_height = read(&self.form.max_height, cx).parse::<u32>().ok();
-        o.container = Some(read(&self.form.container, cx)).filter(|s| !s.is_empty());
-        let output = read(&self.form.output, cx);
+        o.max_height = read(&self.form.max_height).parse::<u32>().ok();
+        o.container = Some(read(&self.form.container)).filter(|s| !s.is_empty());
+        let output = read(&self.form.output);
         o.output_template = if output.is_empty() {
             YtdlpOptions::default().output_template
         } else {
             output
         };
-        o.download_dir = read(&self.form.dir, cx);
-        o.subtitle_langs = read(&self.form.subs, cx)
+        o.download_dir = read(&self.form.dir);
+        o.subtitle_langs = read(&self.form.subs)
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         // Split on whitespace: this is a CLI fragment, so quoting is the
         // user's problem, same as typing it into a shell.
-        o.extra_args = read(&self.form.extra, cx)
+        o.extra_args = read(&self.form.extra)
             .split_whitespace()
             .map(str::to_string)
             .collect();
         o.format = match &o.format {
             FormatMode::AudioOnly { .. } => FormatMode::AudioOnly {
                 codec: {
-                    let c = read(&self.form.codec, cx);
+                    let c = read(&self.form.codec);
                     if c.is_empty() { "mp3".into() } else { c }
                 },
             },
             FormatMode::Custom(_) => FormatMode::Custom({
-                let c = read(&self.form.custom_fmt, cx);
+                let c = read(&self.form.custom_fmt);
                 if c.is_empty() { "bv*+ba/b".into() } else { c }
             }),
             FormatMode::BestVideoAudio => FormatMode::BestVideoAudio,
@@ -998,20 +1217,18 @@ impl RustyDlp {
         self.editing = Some(preset.clone());
 
         if let Some(store) = self.store.clone() {
-            cx.background_spawn(async move {
+            self.updates.spawn(move |_| {
                 if renamed {
-                    let _ = store.delete_preset(&previous_name).await;
+                    let _ = store.delete_preset(&previous_name);
                 }
-                if let Err(e) = store.save_preset(&preset).await {
+                if let Err(e) = store.save_preset(&preset) {
                     eprintln!("rustydlp: failed to save preset: {e}");
                 }
-            })
-            .detach();
+            });
         }
-        cx.notify();
     }
 
-    fn delete_editing(&mut self, cx: &mut Context<Self>) {
+    fn delete_editing(&mut self) {
         let Some(preset) = self.editing.take() else {
             return;
         };
@@ -1021,12 +1238,10 @@ impl RustyDlp {
         }
         if let Some(store) = self.store.clone() {
             let name = preset.name.clone();
-            cx.background_spawn(async move {
-                let _ = store.delete_preset(&name).await;
-            })
-            .detach();
+            self.updates.spawn(move |_| {
+                let _ = store.delete_preset(&name);
+            });
         }
-        cx.notify();
     }
 
     // -- rendering ---------------------------------------------------------
@@ -1043,32 +1258,32 @@ impl RustyDlp {
         self.sidebar_collapsed || self.tab == SidebarTab::InProgress
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar(&self) -> AnyElement {
         if self.sidebar_is_collapsed() {
             return v_flex()
                 .w(px(56.))
                 .h_full()
                 .flex_shrink_0()
                 .items_center()
-                .bg(cx.theme().sidebar)
+                .bg(theme().sidebar)
                 .border_r_1()
-                .border_color(cx.theme().sidebar_border)
+                .border_color(theme().sidebar_border)
                 .child(v_flex().flex_1())
-                .child(self.sidebar_actions(true, cx))
+                .child(self.sidebar_actions(true))
                 .into_any_element();
         }
 
         let visible = self.visible_jobs();
-        let rows: Vec<AnyElement> = visible.iter().map(|job| self.job_row(job, cx)).collect();
+        let rows: Vec<AnyElement> = visible.iter().map(|job| self.job_row(job)).collect();
         let is_empty = rows.is_empty();
 
         v_flex()
             .w(px(260.))
             .h_full()
             .flex_shrink_0()
-            .bg(cx.theme().sidebar)
+            .bg(theme().sidebar)
             .border_r_1()
-            .border_color(cx.theme().sidebar_border)
+            .border_color(theme().sidebar_border)
             .child(
                 v_flex()
                     // .id() is required before .overflow_y_scroll(): the scroll
@@ -1084,32 +1299,32 @@ impl RustyDlp {
                             div()
                                 .px_2()
                                 .text_sm()
-                                .text_color(cx.theme().sidebar_foreground.opacity(0.55))
+                                .text_color(theme().sidebar_foreground.opacity(0.55))
                                 .child(self.tab.empty_message()),
                         )
                     })
                     .children(rows),
             )
-            .child(self.sidebar_actions(false, cx))
+            .child(self.sidebar_actions(false))
             .into_any_element()
     }
 
     /// The bottom action row, shared between the full sidebar and its
     /// collapsed icon rail — `icon_only` drops the labels and shrinks the
     /// buttons to fit the narrow rail.
-    fn sidebar_actions(&self, icon_only: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn sidebar_actions(&self, icon_only: bool) -> AnyElement {
         v_flex()
             .p_3()
             .gap_2()
             .border_t_1()
-            .border_color(cx.theme().sidebar_border)
+            .border_color(theme().sidebar_border)
             .child(
                 Button::new("new-download")
                     .primary()
                     .when(!icon_only, |b| b.w_full())
                     .icon(IconName::Plus)
                     .when(!icon_only, |b| b.label("New download"))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(|this: &mut Self| {
                         this.modal = true;
                         this.probe = ProbeState::Idle;
                         // Re-probe here so installing yt-dlp while the app is
@@ -1117,11 +1332,11 @@ impl RustyDlp {
                         this.refresh_ytdlp();
                         // Overrides are per-download; never carry one
                         // silently into the next job.
-                        this.override_input
-                            .update(cx, |s, cx| s.set_value("", window, cx));
-                        this.url_input.update(cx, |s, cx| s.focus(window, cx));
-                        cx.notify();
-                    })),
+                        let fonts = this.fonts.clone();
+                        let mut fonts = fonts.borrow_mut();
+                        this.override_input.set_value(&mut fonts, "");
+                        this.url_input.set_focused(true);
+                    }),
             )
             .child(
                 Button::new("settings")
@@ -1129,14 +1344,13 @@ impl RustyDlp {
                     .when(!icon_only, |b| b.w_full())
                     .icon(IconName::Settings)
                     .when(!icon_only, |b| b.label("Settings"))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(|this: &mut Self| {
                         this.route = if this.route == Route::Settings {
                             Route::Library
                         } else {
                             Route::Settings
                         };
-                        cx.notify();
-                    })),
+                    }),
             )
             .when(self.tab != SidebarTab::InProgress, |this| {
                 this.child(
@@ -1149,10 +1363,9 @@ impl RustyDlp {
                             IconName::ChevronLeft
                         })
                         .when(!icon_only, |b| b.label("Collapse"))
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(|this: &mut Self| {
                             this.sidebar_collapsed = !this.sidebar_collapsed;
-                            cx.notify();
-                        })),
+                        }),
                 )
             })
             .into_any_element()
@@ -1161,8 +1374,7 @@ impl RustyDlp {
     /// Full-width row above the sidebar+main split: wordmark pinned left,
     /// Download/Convert/In progress tabs true-centered regardless of the
     /// wordmark's width.
-    fn navbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let entity = cx.entity();
+    fn navbar(&self) -> AnyElement {
         let tabs = TabBar::new("navbar-tabs")
             .segmented()
             .selected_index(self.tab.index())
@@ -1171,24 +1383,20 @@ impl RustyDlp {
                 Tab::new().label("Convert"),
                 Tab::new().label("In Progress"),
             ])
-            // TabBar::on_click hands back &mut App rather than &mut
-            // Context<Self>, so cx.listener is unusable here; go through the
-            // entity handle instead.
-            .on_click(move |ix, _window, cx| {
-                let tab = SidebarTab::from_index(*ix);
-                entity.update(cx, |this, cx| {
-                    // In progress has nothing to show in the (now narrow)
-                    // sidebar — collapse it automatically so the main pane's
-                    // in-progress list gets the room instead. Manually
-                    // re-expanding is still available on the other tabs.
-                    if tab == SidebarTab::InProgress {
-                        this.sidebar_collapsed = true;
-                    }
-                    this.tab = tab;
-                    this.selected = None;
-                    this.open_item = None;
-                    cx.notify();
-                });
+            // The handler gets `&mut Self` directly, so the entity round-trip
+            // the gpui build needed here is gone.
+            .on_click(|this: &mut Self, ix: usize| {
+                let tab = SidebarTab::from_index(ix);
+                // In progress has nothing to show in the (now narrow)
+                // sidebar — collapse it automatically so the main pane's
+                // in-progress list gets the room instead. Manually
+                // re-expanding is still available on the other tabs.
+                if tab == SidebarTab::InProgress {
+                    this.sidebar_collapsed = true;
+                }
+                this.tab = tab;
+                this.selected = None;
+                this.open_item = None;
             });
 
         h_flex()
@@ -1197,9 +1405,9 @@ impl RustyDlp {
             .h(px(48.))
             .px_4()
             .items_center()
-            .bg(cx.theme().sidebar)
+            .bg(theme().sidebar)
             .border_b_1()
-            .border_color(cx.theme().sidebar_border)
+            .border_color(theme().sidebar_border)
             // Three columns: wordmark left, tabs centered independent of the
             // wordmark's own width, empty spacer right to balance the layout.
             .child(
@@ -1207,7 +1415,7 @@ impl RustyDlp {
                     .flex_1()
                     .min_w_0()
                     .font_bold()
-                    .text_color(cx.theme().sidebar_foreground)
+                    .text_color(theme().sidebar_foreground)
                     .child("rustyDLP"),
             )
             // Deliberately no width: a fixed one was wider than the three
@@ -1220,7 +1428,7 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn job_row(&self, job: &Job, cx: &mut Context<Self>) -> AnyElement {
+    fn job_row(&self, job: &Job) -> AnyElement {
         let id = job.id.clone();
         let active = self.selected.as_deref() == Some(job.id.as_str())
             && self.route == Route::Library;
@@ -1244,30 +1452,29 @@ impl RustyDlp {
             .px_2()
             .py_1p5()
             .gap_0p5()
-            .rounded(cx.theme().radius)
-            .when(active, |this| this.bg(cx.theme().sidebar_accent))
-            .hover(|this| this.bg(cx.theme().list_hover))
+            .rounded(theme().radius)
+            .when(active, |this| this.bg(theme().sidebar_accent))
+            .hover(|this| this.bg(theme().list_hover))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(move |this: &mut Self| {
                 this.selected = Some(id.clone());
                 this.open_item = None;
                 this.route = Route::Library;
-                cx.notify();
-            }))
+            })
             .child(
                 div()
                     .text_sm()
                     .truncate()
-                    .text_color(cx.theme().sidebar_foreground)
+                    .text_color(theme().sidebar_foreground)
                     .child(job.title.clone()),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(if job.state == JobState::Failed {
-                        cx.theme().danger
+                        theme().danger
                     } else {
-                        cx.theme().sidebar_foreground.opacity(0.55)
+                        theme().sidebar_foreground.opacity(0.55)
                     })
                     .child(subtitle),
             )
@@ -1278,12 +1485,12 @@ impl RustyDlp {
                         .w_full()
                         .h(px(3.))
                         .rounded_full()
-                        .bg(cx.theme().muted)
+                        .bg(theme().muted)
                         .child(
                             div()
                                 .h_full()
                                 .rounded_full()
-                                .bg(cx.theme().progress_bar)
+                                .bg(theme().progress_bar)
                                 .w(relative(pct.clamp(0.0, 1.0))),
                         ),
                 )
@@ -1291,10 +1498,10 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn main_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn main_pane(&mut self) -> AnyElement {
         if self.route == Route::Settings {
-            self.ensure_player(None, None, cx);
-            return self.settings(cx);
+            self.ensure_player(None, None);
+            return self.settings();
         }
         // A selected job always wins over the tab's own landing view — this
         // is how clicking a row in the in-progress list (which lives here in
@@ -1310,29 +1517,29 @@ impl RustyDlp {
             .and_then(|id| self.jobs.iter().find(|j| &j.id == id))
             .cloned()
         else {
-            self.ensure_player(None, None, cx);
+            self.ensure_player(None, None);
             return match self.tab {
-                SidebarTab::InProgress => self.in_progress_pane(cx),
-                SidebarTab::Convert => self.convert_page(cx),
-                SidebarTab::Download => self.empty_state(cx),
+                SidebarTab::InProgress => self.in_progress_pane(),
+                SidebarTab::Convert => self.convert_page(),
+                SidebarTab::Download => self.empty_state(),
             };
         };
 
         // Job -> Item -> File: one item goes straight to detail, many show a grid.
         match job.items.len() {
-            0 => self.detail(&job, None, window, cx),
+            0 => self.detail(&job, None),
             1 => {
                 let item = job.items.first().cloned();
-                self.detail(&job, item.as_ref(), window, cx)
+                self.detail(&job, item.as_ref())
             }
             _ => match self.open_item.clone() {
                 Some(item_id) => {
                     let item = job.items.iter().find(|i| i.id == item_id).cloned();
-                    self.detail(&job, item.as_ref(), window, cx)
+                    self.detail(&job, item.as_ref())
                 }
                 None => {
-                    self.ensure_player(None, None, cx);
-                    self.grid(&job, cx)
+                    self.ensure_player(None, None);
+                    self.grid(&job)
                 }
             },
         }
@@ -1341,10 +1548,10 @@ impl RustyDlp {
     /// In progress moved out of the sidebar and into here because it mixes
     /// download and convert jobs and needs room for a progress bar per row —
     /// the 260px sidebar column was too cramped for that.
-    fn in_progress_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn in_progress_pane(&self) -> AnyElement {
         let jobs = filter_jobs(&self.jobs, SidebarTab::InProgress);
         let is_empty = jobs.is_empty();
-        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job, cx)).collect();
+        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job)).collect();
 
         v_flex()
             .id("in-progress-scroll")
@@ -1359,7 +1566,7 @@ impl RustyDlp {
                 this.child(
                     div()
                         .text_sm()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(theme().muted_foreground)
                         .child(SidebarTab::InProgress.empty_message()),
                 )
             })
@@ -1370,10 +1577,10 @@ impl RustyDlp {
     /// The Convert tab's landing view when nothing is selected: recent
     /// conversions plus the "Convert File" action that makes conversion work
     /// on any local file, not just something this app downloaded.
-    fn convert_page(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn convert_page(&self) -> AnyElement {
         let jobs = filter_jobs(&self.jobs, SidebarTab::Convert);
         let is_empty = jobs.is_empty();
-        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job, cx)).collect();
+        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job)).collect();
 
         v_flex()
             .id("convert-scroll")
@@ -1394,9 +1601,9 @@ impl RustyDlp {
                             .primary()
                             .icon(IconName::Plus)
                             .label("Convert File")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.pick_file_to_convert(cx);
-                            })),
+                            .on_click(|this: &mut Self| {
+                                this.pick_file_to_convert();
+                            }),
                     ),
             )
             .child(div().font_bold().text_sm().mt_2().child("Recent conversions"))
@@ -1404,7 +1611,7 @@ impl RustyDlp {
                 this.child(
                     div()
                         .text_sm()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(theme().muted_foreground)
                         .child(SidebarTab::Convert.empty_message()),
                 )
             })
@@ -1412,7 +1619,7 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn empty_state(&self) -> AnyElement {
         v_flex()
             .flex_1()
             .min_w_0()
@@ -1425,30 +1632,30 @@ impl RustyDlp {
                     .path("icons/empty-downloads.svg")
                     .w(px(128.))
                     .h(px(96.))
-                    .text_color(cx.theme().muted_foreground.opacity(0.5)),
+                    .text_color(theme().muted_foreground.opacity(0.5)),
             )
             .child(
                 div()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(theme().muted_foreground)
                     .child("No selected download, select or download new video"),
             )
             .into_any_element()
     }
 
-    fn field(&self, label: &str, input: &Entity<InputState>, cx: &mut Context<Self>) -> AnyElement {
+    fn field(&self, label: &str, focus: Focus, input: &InputState) -> AnyElement {
         v_flex()
             .gap_1()
             .child(
                 div()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(theme().muted_foreground)
                     .child(label.to_string()),
             )
-            .child(Input::new(input))
+            .child(Input::new(focus.element_id(), input))
             .into_any_element()
     }
 
-    fn settings(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn settings(&self) -> AnyElement {
         let preset_rows: Vec<AnyElement> = self
             .presets
             .iter()
@@ -1462,22 +1669,22 @@ impl RustyDlp {
                     .items_center()
                     .px_2()
                     .py_1p5()
-                    .rounded(cx.theme().radius)
-                    .when(active, |t| t.bg(cx.theme().sidebar_accent))
-                    .hover(|t| t.bg(cx.theme().list_hover))
+                    .rounded(theme().radius)
+                    .when(active, |t| t.bg(theme().sidebar_accent))
+                    .hover(|t| t.bg(theme().list_hover))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.edit_preset(preset.clone(), window, cx);
-                    }))
+                    .on_click(move |this: &mut Self| {
+                        this.edit_preset(preset.clone());
+                    })
                     .child(div().text_sm().truncate().child(p.name.clone()))
                     .when(p.is_default, |t| {
                         t.child(
                             div()
                                 .text_xs()
                                 .px_1p5()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().muted)
-                                .text_color(cx.theme().muted_foreground)
+                                .rounded(theme().radius)
+                                .bg(theme().muted)
+                                .text_color(theme().muted_foreground)
                                 .child("Default"),
                         )
                     })
@@ -1488,7 +1695,7 @@ impl RustyDlp {
         let editor: AnyElement = match &self.editing {
             None => div()
                 .text_sm()
-                .text_color(cx.theme().muted_foreground)
+                .text_color(theme().muted_foreground)
                 .child("Select a preset to edit, or create a new one.")
                 .into_any_element(),
             Some(editing) => {
@@ -1500,14 +1707,14 @@ impl RustyDlp {
 
                 v_flex()
                     .gap_3()
-                    .child(self.field("Name", &self.form.name, cx))
+                    .child(self.field("Name", Focus::Name, &self.form.name))
                     .child(
                         v_flex()
                             .gap_1()
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(theme().muted_foreground)
                                     .child("Format"),
                             )
                             .child(
@@ -1518,55 +1725,52 @@ impl RustyDlp {
                                             .small()
                                             .selected(is_best)
                                             .label("Video + audio")
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                            .on_click(|this: &mut Self| {
                                                 if let Some(e) = this.editing.as_mut() {
                                                     e.options.format = FormatMode::BestVideoAudio;
                                                 }
-                                                cx.notify();
-                                            })),
+                                            }),
                                     )
                                     .child(
                                         Button::new("fmt-audio")
                                             .small()
                                             .selected(is_audio)
                                             .label("Audio only")
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                            .on_click(|this: &mut Self| {
                                                 if let Some(e) = this.editing.as_mut() {
                                                     e.options.format = FormatMode::AudioOnly {
                                                         codec: "mp3".into(),
                                                     };
                                                 }
-                                                cx.notify();
-                                            })),
+                                            }),
                                     )
                                     .child(
                                         Button::new("fmt-custom")
                                             .small()
                                             .selected(is_custom)
                                             .label("Custom -f")
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                            .on_click(|this: &mut Self| {
                                                 if let Some(e) = this.editing.as_mut() {
                                                     e.options.format =
                                                         FormatMode::Custom("bv*+ba/b".into());
                                                 }
-                                                cx.notify();
-                                            })),
+                                            }),
                                     ),
                             ),
                     )
                     .when(is_audio, |t| {
-                        t.child(self.field("Audio codec", &self.form.codec, cx))
+                        t.child(self.field("Audio codec", Focus::Codec, &self.form.codec))
                     })
                     .when(is_custom, |t| {
-                        t.child(self.field("Format selector", &self.form.custom_fmt, cx))
+                        t.child(self.field("Format selector", Focus::CustomFmt, &self.form.custom_fmt))
                     })
                     .when(is_best, |t| {
-                        t.child(self.field("Max height", &self.form.max_height, cx))
-                            .child(self.field("Container", &self.form.container, cx))
+                        t.child(self.field("Max height", Focus::MaxHeight, &self.form.max_height))
+                            .child(self.field("Container", Focus::Container, &self.form.container))
                     })
-                    .child(self.field("Output template", &self.form.output, cx))
-                    .child(self.field("Download folder", &self.form.dir, cx))
-                    .child(self.field("Subtitle languages", &self.form.subs, cx))
+                    .child(self.field("Output template", Focus::Output, &self.form.output))
+                    .child(self.field("Download folder", Focus::Dir, &self.form.dir))
+                    .child(self.field("Subtitle languages", Focus::Subs, &self.form.subs))
                     .child(
                         v_flex()
                             .gap_2()
@@ -1574,30 +1778,27 @@ impl RustyDlp {
                                 "sw-thumb",
                                 "Embed thumbnail",
                                 o.embed_thumbnail,
-                                cx,
                                 |o| &mut o.embed_thumbnail,
                             ))
                             .child(toggle(
                                 "sw-meta",
                                 "Embed metadata",
                                 o.embed_metadata,
-                                cx,
                                 |o| &mut o.embed_metadata,
                             ))
-                            .child(toggle("sw-subs", "Embed subtitles", o.embed_subs, cx, |o| {
+                            .child(toggle("sw-subs", "Embed subtitles", o.embed_subs, |o| {
                                 &mut o.embed_subs
                             }))
                             .child(toggle(
                                 "sw-archive",
                                 "Skip already-downloaded (archive)",
                                 o.download_archive,
-                                cx,
                                 |o| &mut o.download_archive,
                             )),
                     )
                     .child(
                         // The escape hatch that makes "all yt-dlp options" true.
-                        self.field("Additional arguments", &self.form.extra, cx),
+                        self.field("Additional arguments", Focus::Extra, &self.form.extra),
                     )
                     .child(
                         h_flex()
@@ -1607,12 +1808,11 @@ impl RustyDlp {
                                 Switch::new("sw-default")
                                     .checked(is_default)
                                     .label("Use as default")
-                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    .on_click(|this: &mut Self, checked: bool| {
                                         if let Some(e) = this.editing.as_mut() {
-                                            e.is_default = *checked;
+                                            e.is_default = checked;
                                         }
-                                        cx.notify();
-                                    })),
+                                    }),
                             ),
                     )
                     .child(
@@ -1622,17 +1822,17 @@ impl RustyDlp {
                                 Button::new("preset-save")
                                     .primary()
                                     .label("Save preset")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.save_editing(cx);
-                                    })),
+                                    .on_click(|this: &mut Self| {
+                                        this.save_editing();
+                                    }),
                             )
                             .child(
                                 Button::new("preset-delete")
                                     .danger()
                                     .label("Delete")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.delete_editing(cx);
-                                    })),
+                                    .on_click(|this: &mut Self| {
+                                        this.delete_editing();
+                                    }),
                             ),
                     )
                     .into_any_element()
@@ -1651,7 +1851,7 @@ impl RustyDlp {
                     .p_4()
                     .gap_2()
                     .border_r_1()
-                    .border_color(cx.theme().border)
+                    .border_color(theme().border)
                     .child(div().font_bold().text_sm().child("Presets"))
                     .child(v_flex().gap_1().children(preset_rows))
                     .child(
@@ -1659,14 +1859,14 @@ impl RustyDlp {
                             .w_full()
                             .icon(IconName::Plus)
                             .label("New preset")
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(|this: &mut Self| {
                                 let preset = Preset {
                                     name: "New preset".into(),
                                     is_default: false,
                                     options: default_options(),
                                 };
-                                this.edit_preset(preset, window, cx);
-                            })),
+                                this.edit_preset(preset);
+                            }),
                     )
                     .child(div().flex_1())
                     .child(
@@ -1674,12 +1874,12 @@ impl RustyDlp {
                             .gap_1()
                             .pt_3()
                             .border_t_1()
-                            .border_color(cx.theme().border)
+                            .border_color(theme().border)
                             .child(div().font_bold().text_sm().child("Application"))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(theme().muted_foreground)
                                     .child(format!(
                                         "yt-dlp: {}",
                                         self.ytdlp
@@ -1691,7 +1891,7 @@ impl RustyDlp {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(theme().muted_foreground)
                                     .child("Downloads start staggered; no concurrency cap."),
                             )
                             .child(
@@ -1699,25 +1899,24 @@ impl RustyDlp {
                                     .small()
                                     .w_full()
                                     .label("Re-check binaries")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(|this: &mut Self| {
                                         this.refresh_ytdlp();
-                                        cx.notify();
-                                    })),
+                                    }),
                             )
                             .child(
                                 Button::new("update-ytdlp")
                                     .small()
                                     .w_full()
                                     .label("Update yt-dlp")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.update_ytdlp(cx);
-                                    })),
+                                    .on_click(|this: &mut Self| {
+                                        this.update_ytdlp();
+                                    }),
                             )
                             .when_some(self.update_status.clone(), |t, msg| {
                                 t.child(
                                     div()
                                         .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
+                                        .text_color(theme().muted_foreground)
                                         .child(msg),
                                 )
                             }),
@@ -1738,7 +1937,7 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn grid(&self, job: &Job, cx: &mut Context<Self>) -> AnyElement {
+    fn grid(&self, job: &Job) -> AnyElement {
         let cards: Vec<AnyElement> = job
             .items
             .iter()
@@ -1749,21 +1948,20 @@ impl RustyDlp {
                     .w(px(220.))
                     .gap_2()
                     .p_2()
-                    .rounded(cx.theme().radius)
+                    .rounded(theme().radius)
                     .border_1()
-                    .border_color(cx.theme().border)
-                    .hover(|this| this.bg(cx.theme().list_hover))
+                    .border_color(theme().border)
+                    .hover(|this| this.bg(theme().list_hover))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(move |this: &mut Self| {
                         this.open_item = Some(item_id.clone());
-                        cx.notify();
-                    }))
-                    .child(cover(item.thumb_path.as_deref(), px(112.), px(48.), cx))
+                    })
+                    .child(cover(item.thumb_path.as_deref(), px(112.), px(48.)))
                     .child(div().text_sm().truncate().child(item.title.clone()))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(theme().muted_foreground)
                             .child(match item.duration {
                                 Some(d) => human_duration(d),
                                 None => format!("{} files", item.files.len()),
@@ -1804,7 +2002,6 @@ impl RustyDlp {
         &mut self,
         target: Option<&str>,
         duration_hint: Option<f64>,
-        cx: &mut Context<Self>,
     ) {
         match target {
             None => self.stop_player(),
@@ -1817,7 +2014,7 @@ impl RustyDlp {
                 }
                 self.stop_player();
                 self.player_pending = Some(path.to_string());
-                self.load_player(path.to_string(), 0.0, duration_hint, cx);
+                self.load_player(path.to_string(), 0.0, duration_hint);
             }
         }
     }
@@ -1830,7 +2027,7 @@ impl RustyDlp {
         self.player_failed = None;
         // Any in-flight load's result will still arrive, but its generation
         // will no longer match — see `load_player`.
-        self.player_gen += 1;
+        self.player_gen.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Resolves ffmpeg/ffprobe, probes, and starts playback entirely off the
@@ -1840,18 +2037,16 @@ impl RustyDlp {
         path: String,
         start_at_secs: f64,
         duration_hint: Option<f64>,
-        cx: &mut Context<Self>,
     ) {
-        self.player_gen += 1;
-        let generation = self.player_gen;
+        let generation = self.player_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let rx = player::load(
             PathBuf::from(&path),
             start_at_secs,
             self.effective_volume(),
         );
 
-        cx.spawn(async move |this, cx| {
-            let loaded = rx.await;
+        self.updates.spawn(move |updates| {
+            let loaded = pollster::block_on(rx);
             let (info, control, mut events) = match loaded {
                 Ok(Ok((info, control, events))) => (info, control, events),
                 _ => {
@@ -1859,7 +2054,7 @@ impl RustyDlp {
                     // Open Externally, which always works regardless of why
                     // native playback couldn't start (missing ffmpeg, no
                     // video stream, unsupported codec, ...).
-                    let _ = this.update(cx, |this, cx| {
+                    updates.send(move |this| {
                         if this.player_pending.as_deref() == Some(path.as_str()) {
                             this.player_pending = None;
                             this.player_failed = Some(path.clone());
@@ -1870,22 +2065,25 @@ impl RustyDlp {
                             if this.player.as_ref().is_some_and(|p| p.path == path) {
                                 this.player = None;
                             }
-                            cx.notify();
                         }
                     });
                     return;
                 }
             };
 
-            let installed = this
-                .update(cx, |this, cx| {
+            // The install has to happen on the app's thread but its answer is
+            // needed here, so it round-trips through a one-shot.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let install_path = path.clone();
+            updates.send(move |this| {
                     // Superseded by a newer load (navigated away, sought
                     // again) before this one finished starting up — tear it
                     // down rather than let it leak an ffmpeg process nobody
                     // is watching.
-                    if this.player_gen != generation {
+                    if this.player_gen.load(Ordering::SeqCst) != generation {
                         control.stop();
-                        return false;
+                        let _ = tx.send(false);
+                        return;
                     }
                     // A seek keeps the outgoing run's last frame on screen so
                     // the view doesn't drop back to the poster (losing the
@@ -1893,12 +2091,12 @@ impl RustyDlp {
                     let carried_frame = this
                         .player
                         .as_ref()
-                        .filter(|p| p.path == path)
+                        .filter(|p| p.path == install_path)
                         .and_then(|p| p.frame.clone());
                     this.player_pending = None;
                     this.player = Some(PlayerState {
                         control,
-                        path: path.clone(),
+                        path: install_path,
                         frame: carried_frame,
                         position_secs: start_at_secs,
                         duration_secs: info.duration.or(duration_hint),
@@ -1906,34 +2104,33 @@ impl RustyDlp {
                         ended: false,
                         scrubbing: false,
                     });
-                    cx.notify();
-                    true
-                })
-                .unwrap_or(false);
+                    let _ = tx.send(true);
+            });
 
-            if !installed {
+            // A closed channel means the app is gone, so there is nothing left
+            // to pump frames to.
+            if !rx.recv().unwrap_or(false) {
                 return;
             }
 
-            while let Some(event) = events.next().await {
-                let keep_going = this
-                    .update(cx, |this, cx| {
-                        if this.player_gen != generation {
-                            return false;
+            while let Some(event) = pollster::block_on(events.next()) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                updates.send(move |this| {
+                        if this.player_gen.load(Ordering::SeqCst) != generation {
+                            let _ = tx.send(false);
+                            return;
                         }
                         match event {
                             player::PlayerEvent::Frame(frame, pts) => {
                                 if let Some(p) = this.player.as_mut() {
-                                    // The decode threads hand over plain RGBA so
-                                    // that `core/` owns no renderer types; wrapping
-                                    // it for gpui is the UI layer's job.
-                                    if let Some(image) =
-                                        RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
-                                    {
-                                        p.frame = Some(Arc::new(gpui::RenderImage::new(
-                                            SmallVec::from_elem(ImageFrame::new(image), 1),
-                                        )));
-                                    }
+                                    // The decode threads hand over plain RGBA; the
+                                    // interface wraps it as an image source. No
+                                    // renderer type crosses into `core/`.
+                                    p.frame = Some(Frame {
+                                        width: frame.width,
+                                        height: frame.height,
+                                        data: Arc::new(frame.rgba),
+                                    });
                                     // While the thumb is being dragged the
                                     // readout belongs to it, not to the run
                                     // still playing behind it.
@@ -1949,35 +2146,33 @@ impl RustyDlp {
                                 }
                             }
                         }
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep_going {
+                        let _ = tx.send(true);
+                });
+                // A closed channel means the app is gone; stop pumping rather
+                // than decode frames nobody will draw.
+                if !rx.recv().unwrap_or(false) {
                     break;
                 }
             }
-        })
-        .detach();
+        });
     }
 
-    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+    fn toggle_play(&mut self) {
         // Once the pipes have run dry there is nothing to un-pause, so Play
         // on a finished file means "play it again".
         if self.player.as_ref().is_some_and(|p| p.ended) {
-            self.seek_to(0.0, cx);
+            self.seek_to(0.0);
             return;
         }
         if let Some(p) = self.player.as_mut() {
             p.playing = !p.playing;
             p.control.set_paused(!p.playing);
-            cx.notify();
         }
     }
 
     /// Drag feedback only: moves the readout without touching playback, so a
     /// drag across the bar doesn't spawn an ffmpeg per pixel.
-    fn scrub_to(&mut self, fraction: f32, cx: &mut Context<Self>) {
+    fn scrub_to(&mut self, fraction: f32) {
         let Some(p) = self.player.as_mut() else {
             return;
         };
@@ -1986,14 +2181,13 @@ impl RustyDlp {
         };
         p.scrubbing = true;
         p.position_secs = (fraction as f64 * duration).clamp(0.0, duration);
-        cx.notify();
     }
 
-    fn seek_to_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
+    fn seek_to_fraction(&mut self, fraction: f32) {
         let Some(duration) = self.player.as_ref().and_then(|p| p.duration_secs) else {
             return;
         };
-        self.seek_to((fraction as f64 * duration).clamp(0.0, duration), cx);
+        self.seek_to((fraction as f64 * duration).clamp(0.0, duration));
     }
 
     /// ffmpeg can't seek in place over a pipe, so a seek is a fresh pair of
@@ -2001,7 +2195,7 @@ impl RustyDlp {
     /// (otherwise its audio keeps playing through the restart) but its state
     /// — including the last frame — stays on screen until the new run
     /// delivers.
-    fn seek_to(&mut self, secs: f64, cx: &mut Context<Self>) {
+    fn seek_to(&mut self, secs: f64) {
         let Some(p) = self.player.as_mut() else {
             return;
         };
@@ -2020,19 +2214,19 @@ impl RustyDlp {
         // Without this, the `ensure_player` call in the next render sees no
         // load in flight and restarts the file from the beginning.
         self.player_pending = Some(path.clone());
-        self.load_player(path, secs, duration, cx);
+        self.load_player(path, secs, duration);
     }
 
-    fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+    fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
         // Reaching for the slider is also how you come back from mute.
         self.muted = false;
-        self.apply_volume(cx);
+        self.apply_volume();
     }
 
-    fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+    fn toggle_mute(&mut self) {
         self.muted = !self.muted;
-        self.apply_volume(cx);
+        self.apply_volume();
     }
 
     /// What actually reaches the audio callback. Mute is kept separate from
@@ -2041,34 +2235,35 @@ impl RustyDlp {
         if self.muted { 0.0 } else { self.volume }
     }
 
-    fn apply_volume(&mut self, cx: &mut Context<Self>) {
+    fn apply_volume(&mut self) {
         if let Some(p) = self.player.as_ref() {
             p.control.set_volume(self.effective_volume());
         }
-        cx.notify();
     }
 
     /// The poster/player element that replaces the old static thumbnail:
     /// shows the live decoded frame once playback has started, otherwise
     /// falls back to the plain cover art.
     fn player_view(
-        &self,
+        &mut self,
         item: Option<&Item>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         let thumb = item.and_then(|i| i.thumb_path.as_deref());
 
         let Some(player) = &self.player else {
-            return self.stage(cover(thumb, relative(1.), px(96.), cx), cx);
+            return self.stage(cover(thumb, relative(1.), px(96.)));
         };
         let Some(frame) = player.frame.clone() else {
-            return self.stage(cover(thumb, relative(1.), px(96.), cx), cx);
+            return self.stage(cover(thumb, relative(1.), px(96.)));
         };
 
+        // Read out before syncing: the slider is behind `&mut self`, and the
+        // borrow of `self.player` above would still be live otherwise.
         let position = player.position_secs;
         let duration = player.duration_secs;
-        self.sync_seek_slider(position, duration, player.scrubbing, window, cx);
+        let scrubbing = player.scrubbing;
+        let playing = player.playing;
+        self.sync_seek_slider(position, duration, scrubbing);
 
         v_flex()
             // Takes the detail pane's leftover height so the picture grows
@@ -2083,13 +2278,16 @@ impl RustyDlp {
                     // percentages: an `img` left at Length::Auto gets the
                     // frame's natural size (1920x1080) forced on it, which
                     // would overflow and clip.
-                    img(frame)
+                    img(crate::ui::element::ImageSource::Rgba {
+                        width: frame.width,
+                        height: frame.height,
+                        data: frame.data,
+                    })
                         .absolute()
                         .inset_0()
                         .size_full()
                         .object_fit(ObjectFit::Contain)
                         .into_any_element(),
-                    cx,
                 ),
             )
             .child(
@@ -2101,18 +2299,18 @@ impl RustyDlp {
                     .child(
                         Button::new("player-toggle")
                             .small()
-                            .icon(if player.playing {
+                            .icon(if playing {
                                 IconName::Pause
                             } else {
                                 IconName::Play
                             })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
+                            .on_click(|this: &mut Self| this.toggle_play()),
                     )
                     .child(
                         div()
                             .flex_shrink_0()
                             .text_xs()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(theme().muted_foreground)
                             .child(match duration {
                                 Some(d) => {
                                     format!("{} / {}", human_duration(position), human_duration(d))
@@ -2127,9 +2325,9 @@ impl RustyDlp {
                             // Nothing to seek against without a duration: a
                             // live stream, or a container ffprobe can't
                             // measure.
-                            .child(Slider::new(&self.seek_slider).disabled(duration.is_none())),
+                            .child(Slider::new("seek", &self.seek_slider).disabled(duration.is_none())),
                     )
-                    .child(self.volume_controls(cx)),
+                    .child(self.volume_controls()),
             )
             .into_any_element()
     }
@@ -2142,7 +2340,7 @@ impl RustyDlp {
     /// 1080p frame stayed letterboxed into the same short strip. `Contain`
     /// keeps the whole frame visible whatever shape the pane ends up, and
     /// `relative` is what the frame positions itself against.
-    fn stage(&self, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+    fn stage(&self, content: AnyElement) -> AnyElement {
         div()
             .relative()
             .w_full()
@@ -2150,9 +2348,9 @@ impl RustyDlp {
             // A floor, so a short window shrinks the picture rather than
             // losing it entirely behind the controls.
             .min_h(px(180.))
-            .rounded(cx.theme().radius)
+            .rounded(theme().radius)
             .overflow_hidden()
-            .bg(gpui::black())
+            .bg(black())
             .child(content)
             .into_any_element()
     }
@@ -2161,12 +2359,10 @@ impl RustyDlp {
     /// `set_value` notifies, and notifying every frame for a value that
     /// hasn't moved is a render loop.
     fn sync_seek_slider(
-        &self,
+        &mut self,
         position: f64,
         duration: Option<f64>,
         scrubbing: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
     ) {
         // While the thumb is under the mouse it owns the value.
         if scrubbing {
@@ -2176,14 +2372,13 @@ impl RustyDlp {
             Some(d) if d > 0.0 => (position / d).clamp(0.0, 1.0) as f32,
             _ => 0.0,
         };
-        if (self.seek_slider.read(cx).value().end() - fraction).abs() <= 0.0005 {
+        if (self.seek_slider.value() - fraction).abs() <= 0.0005 {
             return;
         }
-        self.seek_slider
-            .update(cx, |state, cx| state.set_value(fraction, window, cx));
+        self.seek_slider.set_value(fraction);
     }
 
-    fn volume_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn volume_controls(&self) -> AnyElement {
         h_flex()
             .flex_shrink_0()
             .gap_1()
@@ -2197,9 +2392,9 @@ impl RustyDlp {
                     } else {
                         "icons/volume.svg"
                     }))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
+                    .on_click(|this: &mut Self| this.toggle_mute()),
             )
-            .child(div().w(px(88.)).child(Slider::new(&self.volume_slider)))
+            .child(div().w(px(88.)).child(Slider::new("volume", &self.volume_slider)))
             .into_any_element()
     }
 
@@ -2207,8 +2402,6 @@ impl RustyDlp {
         &mut self,
         job: &Job,
         item: Option<&Item>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
         let title = item
             .map(|i| i.title.clone())
@@ -2235,7 +2428,7 @@ impl RustyDlp {
                                     .text_xs()
                                     .truncate()
                                     .when(!present, |t| {
-                                        t.text_color(cx.theme().muted_foreground.opacity(0.6))
+                                        t.text_color(theme().muted_foreground.opacity(0.6))
                                     })
                                     .child(file_name(&f.path)),
                             )
@@ -2244,9 +2437,9 @@ impl RustyDlp {
                                     .text_xs()
                                     .flex_shrink_0()
                                     .text_color(if present {
-                                        cx.theme().muted_foreground
+                                        theme().muted_foreground
                                     } else {
-                                        cx.theme().danger
+                                        theme().danger
                                     })
                                     .child(if present {
                                         match f.bytes {
@@ -2277,8 +2470,8 @@ impl RustyDlp {
         let running = is_active(job.state);
         let retryable = is_retryable(job.state);
 
-        self.ensure_player(playable.as_deref(), item.and_then(|i| i.duration), cx);
-        let player_view = self.player_view(item, window, cx);
+        self.ensure_player(playable.as_deref(), item.and_then(|i| i.duration));
+        let player_view = self.player_view(item);
         // Borrowed only after the `&mut self` calls above — holding this
         // across them would conflict with the mutable borrow they need.
         let live = self.live.get(&job.id);
@@ -2300,10 +2493,9 @@ impl RustyDlp {
                                 .ghost()
                                 .small()
                                 .label("← All videos")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(|this: &mut Self| {
                                     this.open_item = None;
-                                    cx.notify();
-                                })),
+                                }),
                         )
                     })
                     .child(player_view)
@@ -2320,24 +2512,23 @@ impl RustyDlp {
                                         .small()
                                         .icon(IconName::Play)
                                         .label("Open Externally")
-                                        .on_click(move |_, _, _| open_path(&open)),
+                                        .on_click(move |_: &mut Self| open_path(&open)),
                                 )
                                 .child(
                                     Button::new("convert")
                                         .small()
                                         .icon(IconName::Replace)
                                         .label("Convert")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                        .on_click(move |this: &mut Self| {
                                             this.convert_picker = Some(convert_source.clone());
-                                            cx.notify();
-                                        })),
+                                        }),
                                 )
                                 .child(
                                     Button::new("reveal")
                                         .small()
                                         .icon(IconName::Folder)
                                         .label("Show in folder")
-                                        .on_click(move |_, _, _| reveal_path(&path)),
+                                        .on_click(move |_: &mut Self| reveal_path(&path)),
                                 )
                             })
                             .when(running, |this| {
@@ -2347,9 +2538,9 @@ impl RustyDlp {
                                         .small()
                                         .danger()
                                         .label("Cancel")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.cancel_job(&id, cx);
-                                        })),
+                                        .on_click(move |this: &mut Self| {
+                                            this.cancel_job(&id);
+                                        }),
                                 )
                             })
                             .when(retryable, |this| {
@@ -2359,9 +2550,9 @@ impl RustyDlp {
                                         .small()
                                         .primary()
                                         .label("Retry")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.retry_job(&id, cx);
-                                        })),
+                                        .on_click(move |this: &mut Self| {
+                                            this.retry_job(&id);
+                                        }),
                                 )
                             })
                             .when(!running, |this| {
@@ -2372,9 +2563,9 @@ impl RustyDlp {
                                         .ghost()
                                         .danger()
                                         .label("Delete")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.delete_job(&id, cx);
-                                        })),
+                                        .on_click(move |this: &mut Self| {
+                                            this.delete_job(&id);
+                                        }),
                                 )
                             }),
                     )
@@ -2382,10 +2573,10 @@ impl RustyDlp {
                         this.child(
                             div()
                                 .p_3()
-                                .rounded(cx.theme().radius)
-                                .bg(cx.theme().danger.opacity(0.12))
+                                .rounded(theme().radius)
+                                .bg(theme().danger.opacity(0.12))
                                 .text_xs()
-                                .text_color(cx.theme().danger)
+                                .text_color(theme().danger)
                                 .child(err),
                         )
                     })
@@ -2398,19 +2589,19 @@ impl RustyDlp {
                                         .w_full()
                                         .h(px(6.))
                                         .rounded_full()
-                                        .bg(cx.theme().muted)
+                                        .bg(theme().muted)
                                         .child(
                                             div()
                                                 .h_full()
                                                 .rounded_full()
-                                                .bg(cx.theme().progress_bar)
+                                                .bg(theme().progress_bar)
                                                 .w(relative(pct)),
                                         ),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
+                                        .text_color(theme().muted_foreground)
                                         .child(format!("{:.0}%", pct * 100.0)),
                                 ),
                         )
@@ -2425,12 +2616,12 @@ impl RustyDlp {
                     .p_4()
                     .gap_3()
                     .border_l_1()
-                    .border_color(cx.theme().border)
+                    .border_color(theme().border)
                     .child(div().font_bold().text_sm().child("Details"))
-                    .child(self.kv("State", job.state.as_str(), cx))
-                    .child(self.kv("Preset", &job.preset, cx))
-                    .child(self.kv("Videos", &job.items.len().to_string(), cx))
-                    .child(self.kv("Source", &job.url, cx))
+                    .child(self.kv("State", job.state.as_str()))
+                    .child(self.kv("Preset", &job.preset))
+                    .child(self.kv("Videos", &job.items.len().to_string()))
+                    .child(self.kv("Source", &job.url))
                     .when(!files.is_empty(), |this| {
                         this.child(
                             v_flex()
@@ -2443,30 +2634,30 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn kv(&self, key: &str, value: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn kv(&self, key: &str, value: &str) -> AnyElement {
         v_flex()
             .gap_0p5()
             .child(
                 div()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(theme().muted_foreground)
                     .child(key.to_string()),
             )
             .child(div().text_xs().truncate().child(value.to_string()))
             .into_any_element()
     }
 
-    fn modal(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn modal(&self) -> AnyElement {
         let preview: AnyElement = match &self.probe {
             ProbeState::Idle => div().into_any_element(),
             ProbeState::Running => div()
                 .text_xs()
-                .text_color(cx.theme().muted_foreground)
+                .text_color(theme().muted_foreground)
                 .child("Fetching info…")
                 .into_any_element(),
             ProbeState::Err(e) => div()
                 .text_xs()
-                .text_color(cx.theme().danger)
+                .text_color(theme().danger)
                 .child(e.clone())
                 .into_any_element(),
             ProbeState::Ok(p) => {
@@ -2490,7 +2681,7 @@ impl RustyDlp {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(theme().muted_foreground)
                             .child(sub),
                     )
                     .into_any_element()
@@ -2505,18 +2696,18 @@ impl RustyDlp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::black().opacity(0.5))
+            .bg(black().opacity(0.5))
             .child(
                 v_flex()
                     .w(px(520.))
                     .p_5()
                     .gap_4()
-                    .rounded(cx.theme().radius)
+                    .rounded(theme().radius)
                     .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
+                    .border_color(theme().border)
+                    .bg(theme().background)
                     .child(div().font_bold().child("New download"))
-                    .child(Input::new(&self.url_input))
+                    .child(Input::new("url", &self.url_input))
                     .child(preview)
                     .child(
                         v_flex()
@@ -2524,7 +2715,7 @@ impl RustyDlp {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(theme().muted_foreground)
                                     .child("Preset"),
                             )
                             .child(
@@ -2539,10 +2730,9 @@ impl RustyDlp {
                                             .small()
                                             .selected(active)
                                             .label(p.name.clone())
-                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                            .on_click(move |this: &mut Self| {
                                                 this.chosen_preset = Some(name.clone());
-                                                cx.notify();
-                                            }))
+                                            })
                                     })),
                             ),
                     )
@@ -2552,10 +2742,10 @@ impl RustyDlp {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(theme().muted_foreground)
                                     .child("Override for this download (optional)"),
                             )
-                            .child(Input::new(&self.override_input)),
+                            .child(Input::new("override", &self.override_input)),
                     )
                     .child(
                         h_flex()
@@ -2565,18 +2755,17 @@ impl RustyDlp {
                                 Button::new("cancel")
                                     .ghost()
                                     .label("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(|this: &mut Self| {
                                         this.modal = false;
-                                        cx.notify();
-                                    })),
+                                    }),
                             )
                             .child(
                                 Button::new("go")
                                     .primary()
                                     .label("Download")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.start_download(cx);
-                                    })),
+                                    .on_click(|this: &mut Self| {
+                                        this.start_download();
+                                    }),
                             ),
                     ),
             )
@@ -2587,27 +2776,20 @@ impl RustyDlp {
 
     /// Opens the native file picker so conversion works on any local video,
     /// not just something this app downloaded.
-    fn pick_file_to_convert(&mut self, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Select a video to convert".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(mut paths))) = rx.await else {
+    fn pick_file_to_convert(&mut self) {
+        // On a worker thread: the dialog is modal and blocking, and running it on
+        // the thread that owns the interface would freeze the window behind it.
+        self.updates.spawn(|updates| {
+            let Some(path) = native_file_prompt("Select a video to convert") else {
                 return;
             };
-            let Some(path) = paths.pop() else { return };
-            let _ = this.update(cx, |this, cx| {
+            updates.send(move |this| {
                 this.convert_picker = Some(path.to_string_lossy().to_string());
-                cx.notify();
             });
-        })
-        .detach();
+        });
     }
 
-    fn convert_format_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn convert_format_picker(&self) -> AnyElement {
         let Some(source) = self.convert_picker.clone() else {
             return div().into_any_element();
         };
@@ -2620,22 +2802,22 @@ impl RustyDlp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::black().opacity(0.5))
+            .bg(black().opacity(0.5))
             .child(
                 v_flex()
                     .w(px(420.))
                     .p_5()
                     .gap_3()
-                    .rounded(cx.theme().radius)
+                    .rounded(theme().radius)
                     .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
+                    .border_color(theme().border)
+                    .bg(theme().background)
                     .child(div().font_bold().child("Convert to…"))
                     .child(
                         div()
                             .text_xs()
                             .truncate()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(theme().muted_foreground)
                             .child(file_name(&source)),
                     )
                     .child(v_flex().gap_2().children(ConvertFormat::ALL.into_iter().map(|format| {
@@ -2643,19 +2825,18 @@ impl RustyDlp {
                         Button::new(SharedString::from(format!("convert-as-{}", format.as_str())))
                             .w_full()
                             .label(format.label())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.start_convert(source.clone(), format, cx);
-                            }))
+                            .on_click(move |this: &mut Self| {
+                                this.start_convert(source.clone(), format);
+                            })
                     })))
                     .child(
                         h_flex().justify_end().child(
                             Button::new("cancel-convert")
                                 .ghost()
                                 .label("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(|this: &mut Self| {
                                     this.convert_picker = None;
-                                    cx.notify();
-                                })),
+                                }),
                         ),
                     ),
             )
@@ -2668,7 +2849,7 @@ impl RustyDlp {
     /// network-rate-limited, so there is no equivalent reason to space them
     /// out. ponytail: if concurrent converts become common, give this the
     /// same PendingLaunch/backoff treatment as downloads.
-    fn start_convert(&mut self, source: String, format: ConvertFormat, cx: &mut Context<Self>) {
+    fn start_convert(&mut self, source: String, format: ConvertFormat) {
         self.convert_picker = None;
 
         let mut job = Job::new_convert(source.clone(), format.as_str());
@@ -2679,20 +2860,19 @@ impl RustyDlp {
         self.live.insert(job_id.clone(), Live::default());
         self.selected = Some(job_id.clone());
         self.open_item = None;
-        self.persist(job, cx);
-        cx.notify();
+        self.persist(job);
 
         let ffmpeg = match runner::ffmpeg_path(None) {
             Ok(p) => p,
             Err(e) => {
-                self.fail_job(&job_id, format!("ffmpeg not available: {e}"), cx);
+                self.fail_job(&job_id, format!("ffmpeg not available: {e}"));
                 return;
             }
         };
         let convert = match runner::spawn_convert(&ffmpeg, std::path::Path::new(&source), format) {
             Ok(c) => c,
             Err(e) => {
-                self.fail_job(&job_id, format!("could not start ffmpeg: {e}"), cx);
+                self.fail_job(&job_id, format!("could not start ffmpeg: {e}"));
                 return;
             }
         };
@@ -2701,7 +2881,7 @@ impl RustyDlp {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             job.state = JobState::Running;
             let snapshot = job.clone();
-            self.persist(snapshot, cx);
+            self.persist(snapshot);
         }
 
         // Duration is only known once ffmpeg reports it isn't — fall back to
@@ -2715,23 +2895,20 @@ impl RustyDlp {
             .and_then(|i| i.duration);
         let output_path = convert.output_path.to_string_lossy().to_string();
 
-        cx.spawn(async move |this, cx| {
+        self.updates.spawn(move |updates| {
             let mut events = convert.events;
-            while let Some(event) = events.next().await {
-                let ended = this
-                    .update(cx, |this, cx| {
-                        this.apply_convert_event(&job_id, duration, event, cx)
-                    })
-                    .unwrap_or(true);
-                if ended {
+            while let Some(event) = pollster::block_on(events.next()) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let id = job_id.clone();
+                updates.send(move |this| {
+                    let _ = tx.send(this.apply_convert_event(&id, duration, event));
+                });
+                if rx.recv().unwrap_or(true) {
                     break;
                 }
             }
-            let _ = this.update(cx, |this, cx| {
-                this.finish_convert(&job_id, &output_path, cx)
-            });
-        })
-        .detach();
+            updates.send(move |this| this.finish_convert(&job_id, &output_path));
+        });
     }
 
     fn apply_convert_event(
@@ -2739,7 +2916,6 @@ impl RustyDlp {
         job_id: &str,
         duration: Option<f64>,
         event: ConvertEvent,
-        cx: &mut Context<Self>,
     ) -> bool {
         let mut ended = false;
         match event {
@@ -2755,19 +2931,18 @@ impl RustyDlp {
                 if line == crate::core::runner::EXIT_OK {
                     ended = true;
                 } else if let Some(code) = line.strip_prefix(crate::core::runner::EXIT_FAIL_PREFIX) {
-                    self.fail_job(job_id, format!("ffmpeg exited {code}"), cx);
+                    self.fail_job(job_id, format!("ffmpeg exited {code}"));
                     ended = true;
                 }
             }
         }
-        cx.notify();
         ended
     }
 
     /// Attaches the converted file as a single-item Job (mirroring what a
     /// download job looks like) so it shows up in the Convert tab's list and
     /// can be played/opened the same way.
-    fn finish_convert(&mut self, job_id: &str, output_path: &str, cx: &mut Context<Self>) {
+    fn finish_convert(&mut self, job_id: &str, output_path: &str) {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
             if job.state == JobState::Running {
                 job.state = JobState::Done;
@@ -2789,11 +2964,10 @@ impl RustyDlp {
                 }];
             }
             let snapshot = job.clone();
-            self.persist(snapshot, cx);
+            self.persist(snapshot);
         }
         self.live.remove(job_id);
         self.cancels.remove(job_id);
-        cx.notify();
     }
 }
 
@@ -2837,18 +3011,16 @@ fn toggle(
     id: &'static str,
     label: &'static str,
     checked: bool,
-    cx: &mut Context<RustyDlp>,
     field: fn(&mut YtdlpOptions) -> &mut bool,
 ) -> AnyElement {
     Switch::new(id)
         .checked(checked)
         .label(label)
-        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+        .on_click(move |this: &mut RustyDlp, checked: bool| {
             if let Some(editing) = this.editing.as_mut() {
-                *field(&mut editing.options) = *checked;
+                *field(&mut editing.options) = checked;
             }
-            cx.notify();
-        }))
+        })
         .into_any_element()
 }
 
@@ -2863,7 +3035,6 @@ fn cover(
     thumb: Option<&str>,
     height: impl Into<Length>,
     glyph: Pixels,
-    cx: &mut Context<RustyDlp>,
 ) -> AnyElement {
     let existing = thumb.filter(|p| std::path::Path::new(p).is_file());
     // Converted up front: `Styled::h` takes its argument by value and both
@@ -2874,14 +3045,14 @@ fn cover(
         Some(path) => img(PathBuf::from(path))
             .w_full()
             .h(height)
-            .rounded(cx.theme().radius)
+            .rounded(theme().radius)
             .object_fit(ObjectFit::Cover)
             .into_any_element(),
         None => div()
             .w_full()
             .h(height)
-            .rounded(cx.theme().radius)
-            .bg(cx.theme().muted)
+            .rounded(theme().radius)
+            .bg(theme().muted)
             .flex()
             .items_center()
             .justify_center()
@@ -2890,7 +3061,7 @@ fn cover(
                     .path("icons/empty-downloads.svg")
                     .w(glyph)
                     .h(glyph * 0.75)
-                    .text_color(cx.theme().muted_foreground.opacity(0.4)),
+                    .text_color(theme().muted_foreground.opacity(0.4)),
             )
             .into_any_element(),
     }
@@ -2952,23 +3123,27 @@ fn classify(path: &str) -> FileKind {
     }
 }
 
-impl Render for RustyDlp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let navbar = self.navbar(cx);
-        let sidebar = self.sidebar(cx);
-        let main = self.main_pane(window, cx);
-        let modal = if self.modal { Some(self.modal(cx)) } else { None };
+impl RustyDlp {
+    /// Builds this frame's element tree.
+    ///
+    /// A plain method rather than a trait impl: there is no framework to satisfy,
+    /// and the caller is the event loop, which lays the tree out and paints it.
+    pub fn render(&mut self) -> AnyElement {
+        let navbar = self.navbar();
+        let sidebar = self.sidebar();
+        let main = self.main_pane();
+        let modal = if self.modal { Some(self.modal()) } else { None };
         let convert_modal = self
             .convert_picker
             .is_some()
-            .then(|| self.convert_format_picker(cx));
+            .then(|| self.convert_format_picker());
         let banner = self.startup_error.clone();
 
         div()
             .relative()
             .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+            .bg(theme().background)
+            .text_color(theme().foreground)
             .child(
                 v_flex()
                     .size_full()
@@ -2980,13 +3155,13 @@ impl Render for RustyDlp {
                                 .py_2()
                                 .gap_3()
                                 .items_center()
-                                .bg(cx.theme().danger.opacity(0.15))
+                                .bg(theme().danger.opacity(0.15))
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
                                         .text_xs()
-                                        .text_color(cx.theme().danger)
+                                        .text_color(theme().danger)
                                         .child(msg),
                                 )
                                 .child(
@@ -2995,17 +3170,16 @@ impl Render for RustyDlp {
                                         .flex_shrink_0()
                                         .icon(IconName::Folder)
                                         .label("Open folder")
-                                        .on_click(|_, _, _| open_bin_dir()),
+                                        .on_click(|_: &mut Self| open_bin_dir()),
                                 )
                                 .child(
                                     Button::new("banner-recheck")
                                         .small()
                                         .flex_shrink_0()
                                         .label("Re-check")
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .on_click(|this: &mut Self| {
                                             this.refresh_ytdlp();
-                                            cx.notify();
-                                        })),
+                                        }),
                                 ),
                         )
                     })
@@ -3014,18 +3188,182 @@ impl Render for RustyDlp {
             )
             .children(modal)
             .children(convert_modal)
+            .into_any_element()
+    }
+}
+
+/// The native open-file dialog.
+///
+/// Windows-only: rfd's Linux backend is xdg-portal, which pulls in tokio — the
+/// runtime this crate deliberately keeps out. The app ships for Windows; builds
+/// elsewhere exist to run the interface's tests, where no dialog is opened.
+fn native_file_prompt(title: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        rfd::FileDialog::new().set_title(title).pick_file()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // NOT `use super::*`: that re-globs gpui's own `test` attribute macro over
-    // the built-in one, and #[test] then expands into itself until the
-    // recursion limit. Import explicitly.
+    // Explicit rather than a glob. Under gpui this was mandatory -- `use super::*`
+    // re-globbed gpui's own `test` attribute macro over the built-in one and
+    // `#[test]` expanded into itself until the recursion limit. That hazard is
+    // gone with gpui; the explicit list stays because it documents what is
+    // actually under test.
     use super::{
-        Job, JobKind, JobState, SidebarTab, filter_jobs, is_active, is_retryable,
-        state_after_failure,
+        Job, JobKind, JobState, Route, RustyDlp, SidebarTab, Updates, filter_jobs, is_active,
+        is_retryable, state_after_failure,
     };
+    use crate::core::model::{File as MFile, FileKind, Item};
+    use crate::render::Backend;
+    use crate::render::raster::RasterBackend;
+    use crate::ui::layout::{ScrollState, layout};
+    use crate::ui::paint::{Painter, paint};
+    use crate::ui::text::Shaper;
+    use crate::ui::theme::theme;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The window size `main.rs` opened with, and so the size parity is judged at.
+    const WINDOW: (u32, u32) = (1180, 760);
+
+    /// An app with no store and no yt-dlp, which is all a render needs.
+    fn fixture() -> (RustyDlp, Painter) {
+        let fonts = Rc::new(RefCell::new(cosmic_text::FontSystem::new()));
+        let painter = Painter {
+            shaper: Shaper::with_shared_fonts(fonts.clone()),
+            svg: Default::default(),
+        };
+        let (updates, rx) = Updates::channel();
+        // The receiver is what the event loop drains; leaking it here keeps any
+        // queued update from cancelling the sender mid-test.
+        std::mem::forget(rx);
+        (RustyDlp::for_test(fonts, updates), painter)
+    }
+
+    /// Renders the whole window and hands back the surface for pixel checks.
+    fn render(app: &mut RustyDlp, painter: &mut Painter) -> RasterBackend {
+        let (w, h) = WINDOW;
+        let mut backend = RasterBackend::new(w, h);
+        backend.begin_frame(w, h, theme().background);
+        let tree = app.render();
+        let boxes = layout(
+            &tree,
+            (w as f32, h as f32),
+            &mut painter.shaper,
+            &ScrollState::default(),
+        );
+        paint(backend.canvas(), &boxes, painter, None);
+        backend
+    }
+
+    fn download_job(title: &str, state: JobState) -> Job {
+        let mut j = Job::new("https://x/y", "default");
+        j.title = title.to_string();
+        j.state = state;
+        j.items.push(Item {
+            id: "i1".into(),
+            index: 0,
+            title: title.to_string(),
+            duration: Some(61.0),
+            thumb_path: None,
+            webpage_url: "https://x/y".into(),
+            files: vec![MFile {
+                id: "f1".into(),
+                path: "C:/dl/video.mp4".into(),
+                kind: FileKind::Video,
+                format_id: None,
+                bytes: Some(1024 * 1024),
+            }],
+        });
+        j
+    }
+
+    /// The shell renders at the window size the app opens with, and the sidebar
+    /// and main pane land where the gpui build put them.
+    #[test]
+    fn the_library_screen_renders_at_the_shipped_window_size() {
+        let (mut app, mut painter) = fixture();
+        app.jobs = vec![download_job("Some Video", JobState::Done)];
+        let mut r = render(&mut app, &mut painter);
+
+        // Inside the 260px sidebar, below the navbar.
+        assert_eq!(r.pixel(10, 120).3, 0xff, "sidebar is painted");
+        // The main pane, well clear of the sidebar.
+        assert_eq!(r.pixel(700, 400).3, 0xff, "main pane is painted");
+        assert!(!r.encode_png().is_empty());
+    }
+
+    /// Every screen has to render without panicking, including the empty states,
+    /// because an empty list is what a fresh install shows.
+    #[test]
+    fn every_route_and_tab_renders() {
+        for tab in [SidebarTab::Download, SidebarTab::Convert, SidebarTab::InProgress] {
+            for jobs in [vec![], vec![download_job("A", JobState::Running)]] {
+                let (mut app, mut painter) = fixture();
+                app.tab = tab;
+                app.jobs = jobs;
+                let mut r = render(&mut app, &mut painter);
+                assert!(!r.read_rgba().is_empty(), "{tab:?} rendered nothing");
+            }
+        }
+        let (mut app, mut painter) = fixture();
+        app.route = Route::Settings;
+        let mut r = render(&mut app, &mut painter);
+        assert!(!r.read_rgba().is_empty(), "settings rendered nothing");
+    }
+
+    /// A selected job opens the detail pane, which is the densest screen: title,
+    /// metadata, the action row and the poster.
+    #[test]
+    fn the_detail_pane_renders_for_a_selected_job() {
+        let (mut app, mut painter) = fixture();
+        let job = download_job("Some Video", JobState::Done);
+        app.selected = Some(job.id.clone());
+        app.jobs = vec![job];
+        let mut r = render(&mut app, &mut painter);
+        assert_eq!(r.pixel(700, 300).3, 0xff);
+    }
+
+    /// Both overlays cover the window, and the one on top is the one that draws.
+    #[test]
+    fn the_modals_render_over_the_window() {
+        let (mut app, mut painter) = fixture();
+        app.modal = true;
+        let mut r = render(&mut app, &mut painter);
+        // The backdrop dims the whole window, including over the sidebar.
+        assert_eq!(r.pixel(10, 400).3, 0xff);
+
+        let (mut app, mut painter) = fixture();
+        app.convert_picker = Some("C:/dl/a.mkv".into());
+        let mut r = render(&mut app, &mut painter);
+        assert_eq!(r.pixel(590, 380).3, 0xff);
+    }
+
+    /// This is a yt-dlp client, so titles are not ASCII. Non-Latin and emoji have
+    /// to shape and truncate rather than render tofu or panic -- the case that
+    /// drove the cosmic-text choice.
+    #[test]
+    fn non_latin_and_emoji_titles_render() {
+        for title in [
+            "日本語のタイトルです",
+            "Видео на русском",
+            "العربية",
+            "emoji 🎬🔥 in a title",
+            "a very long title that will certainly have to be truncated in the sidebar column",
+        ] {
+            let (mut app, mut painter) = fixture();
+            app.jobs = vec![download_job(title, JobState::Done)];
+            let mut r = render(&mut app, &mut painter);
+            assert!(!r.read_rgba().is_empty(), "{title} rendered nothing");
+        }
+    }
 
     fn job_in(state: JobState) -> Job {
         let mut j = Job::new("https://x/y", "default");

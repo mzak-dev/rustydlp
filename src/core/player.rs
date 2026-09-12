@@ -10,7 +10,7 @@
 //! playback, drive frame presentation off the audio clock instead.
 
 use anyhow::{Context, Result, anyhow};
-use futures::channel::{mpsc, oneshot};
+use futures_channel::{mpsc, oneshot};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::io::Read;

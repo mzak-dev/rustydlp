@@ -3,10 +3,9 @@ name = "rustydlp"
 version = "0.0.5"
 edition = "2024"
 
-# Everything except the thin binary entry point lives in the library, so the
-# new interface can be compiled and golden-tested on its own:
-#   cargo test --no-default-features --features skia --lib
-# builds core/ + ui/ + render/ without pulling in gpui at all.
+# Everything except the window entry point lives in the library, so the interface
+# can be compiled and golden-tested without one: `cargo test --lib` renders whole
+# screens to a CPU Skia surface, with no GPU and no display server.
 [lib]
 name = "rustydlp"
 path = "src/lib.rs"
@@ -15,97 +14,58 @@ path = "src/lib.rs"
 name = "rustydlp"
 path = "src/main.rs"
 
-[features]
-# The gpui interface. Default while it is still the one that ships, so a plain
-# `cargo build` keeps producing today's app.
-default = ["legacy"]
-legacy = [
-    "dep:gpui",
-    "dep:gpui_platform",
-    "dep:gpui-component",
-    "dep:gpui-component-assets",
-    "dep:image",
-    "dep:smallvec",
-]
-# The replacement: skia-safe paints, taffy lays out, cosmic-text shapes.
-skia = [
-    "dep:skia-safe",
-    "dep:cosmic-text",
-    "dep:taffy",
-    "dep:resvg",
-    "dep:rfd",
-    "dep:pollster",
-    "dep:winit",
-    "dep:softbuffer",
-]
-
 [dependencies]
-# -- the interface being replaced (feature `legacy`) ------------------------
-# Pinned to an exact rev on purpose: gpui-component floats on zed's main branch,
-# so an unpinned build is not reproducible.
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e", optional = true }
-
-# Deliberately NOT pinned with `rev`, even though that looks wrong.
-# gpui-component references zed unpinned; cargo keys git deps by source spec, so
-# adding `rev = ...` here creates a SECOND source id for the same commit and
-# compiles gpui twice -> "expected Window, found Window" type errors.
-# The actual pin lives in Cargo.lock (commit it). Verify with `cargo tree -d`.
-gpui = { git = "https://github.com/zed-industries/zed", optional = true }
-# gpui_platform provides `application()` — the actual entry point. gpui-component
-# does not depend on it, so it must be declared here or bootstrapping is impossible.
-gpui_platform = { git = "https://github.com/zed-industries/zed", optional = true }
-# Ships the built-in Lucide icon set as an AssetSource.
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "181cf147d1d68ff33bae60abb58a24917658142e", optional = true }
-
-# Only `app.rs` needs these, and only to build the `gpui::RenderImage` that
-# gpui's `img()` takes: they must be the exact versions gpui itself compiles
-# against (see Cargo.lock) or the types don't unify. `core/` is free of them,
-# and they go when gpui goes.
-image = { version = "=0.25.10", default-features = false, optional = true }
-smallvec = { version = "=1.15.2", optional = true }
-
-# -- the replacement interface (feature `skia`) -----------------------------
-# default-features matters: `binary-cache` is what downloads the prebuilt
-# static libs. Turning defaults off yields a 404 on the binaries release and a
-# fall back to a full source build, which needs a skia checkout this crate
-# does not ship. That also means `embed-icudtl` comes along whether or not we
-# shape with ICU -- prebuilts are keyed on the feature combo.
-skia-safe = { version = "0.87", optional = true }
+# -- the interface ----------------------------------------------------------
+# default features matter: `binary-cache` is what downloads the prebuilt static
+# libs. Turning them off 404s on the binaries release and falls back to a full
+# source build, which needs a skia checkout this crate does not ship. That also
+# means `embed-icudtl` comes along whether or not we shape with ICU — prebuilt
+# archives are keyed on the feature combo, so a leaner combo costs more, not less.
+skia-safe = "0.87"
 # Shaping only: glyph ids + positions go to Skia's TextBlob, so Skia's own GPU
 # atlas does the rasterizing. No ICU, no SwashCache bitmap bridge.
-cosmic-text = { version = "0.14", optional = true }
-# The same layout engine gpui uses, so flex behaviour matches by construction
+cosmic-text = "0.14"
+# The same layout engine gpui used, so flex behaviour matches by construction
 # rather than by eye.
-taffy = { version = "0.9", optional = true }
-# Renders the icon SVGs to an alpha mask, which is then tinted with the box's
-# text colour -- what gpui's `svg().text_color(..)` did. Deliberately NOT
-# skia-safe's `svg` feature: prebuilt binaries are keyed on the feature combo,
-# and no published archive covers a combo that includes it, so enabling it
-# forces a full Skia source build. resvg is pure Rust and brings its own
-# tiny-skia.
-resvg = { version = "0.45", optional = true }
+taffy = "0.9"
+# Renders the icon SVGs to an alpha mask, tinted with the box's text colour —
+# what gpui's `svg().text_color(..)` did. Deliberately NOT skia-safe's `svg`
+# feature: no published prebuilt covers a combo including it, so enabling it
+# forces a full Skia source build. resvg is pure Rust.
+#
+# default-features off drops `text` (and with it a second fontdb and rustybuzz,
+# which cosmic-text already brings), `system-fonts`, `memmap-fonts` and
+# `raster-images`. The icons are plain paths: no <text>, no embedded bitmaps.
+resvg = { version = "0.45", default-features = false }
 # The window and its event loop. 0.30's ApplicationHandler, not the old
 # run-closure: resumed creates the surface, window_event handles input,
 # user_event drains the update queue, about_to_wait asks for the next frame.
-winit = { version = "0.30", optional = true }
-# Presents the CPU-rasterized frame to the window. This is the fallback path:
-# render/d3d.rs is the intended backend, and slots in behind the same
-# render::Backend trait without touching anything above it.
-softbuffer = { version = "0.4", optional = true }
+winit = "0.30"
+# Presents the CPU-rasterized frame. render/d3d.rs is the intended backend and
+# slots in behind the same render::Backend trait; see docs/adr/0003.
+softbuffer = "0.4"
 
-# -- always on: core/ and assets -------------------------------------------
-# `include-exclude` is needed for the #[include] attribute. It used to arrive
-# transitively from gpui-component-assets, which meant the legacy build only
-# compiled because another crate turned it on; declared explicitly now.
-rust-embed = { version = "8", features = ["include-exclude"] }
+# -- core/ ------------------------------------------------------------------
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# default-features off keeps the `sync` feature (and with it tokio + hyper + rustls)
-# out of the build. Local embedded use only.
-turso = { version = "0.8.0-pre.3", default-features = false }
+# SQLite via rusqlite, synchronous. `bundled` compiles SQLite itself, so the
+# .exe carries no system sqlite3 dependency.
+#
+# Replaced turso, which cost 158 crates against rusqlite's 10 — more than half
+# the whole dependency tree for the one component that needed none of it. Being
+# synchronous also suits this crate: the store is only ever touched from a worker
+# thread, so the async API bought nothing and cost a block_on at every call.
+rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
-# Only for its channels: a reader thread hands events to a background task.
-futures = "0.3"
+# Only the channels: threads in core/ hand events to the interface over these.
+# The `futures` facade would also pull its executor, io and sink crates, none of
+# which are used — nothing here runs on an executor.
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Blocks on the one-shots and streams core/ hands back. Runtime-free by design:
+# these futures complete under a bare block_on, which is what lets this crate
+# avoid an executor entirely.
+pollster = "0.4"
 # Resolves the real Videos/Downloads folders via the Windows known-folder API
 # rather than assuming %USERPROFILE%\... — correct when they've been relocated.
 dirs = "6"
@@ -113,24 +73,15 @@ dirs = "6"
 # ffmpeg already decodes to raw samples before they reach cpal.
 cpal = "0.15"
 
-# Drives turso's futures on a worker thread. This is what the old dev-dependency
-# comment was protecting: because those futures complete under a bare block_on,
-# they are runtime-agnostic and need no executor.
-pollster = { version = "0.4", optional = true }
-
-# The native file picker. gpui supplied one through `cx.prompt_for_paths`; the
-# Convert tab needs it so conversion works on any local file.
-#
-# Windows-only on purpose: rfd's Linux default backend is xdg-portal, which pulls
-# tokio -- the runtime this crate deliberately keeps out (see `turso` above). The
-# app targets Windows; on anything else the picker is stubbed and says so.
+# The native file picker and the clipboard, both Windows-only on purpose: rfd's
+# Linux backend is xdg-portal, which pulls tokio. The app ships for Windows;
+# elsewhere the interface still builds and renders, and both are stubbed.
 [target.'cfg(windows)'.dependencies]
-rfd = { version = "0.15", optional = true, default-features = false }
+rfd = { version = "0.15", default-features = false }
+clipboard-win = "5"
 
-[dev-dependencies]
-pollster = "0.4"
-
-# ponytail: gpui's dependency tree is huge. opt-level 2 on deps only — our own
-# crate stays at 0 so incremental rebuilds during UI work stay fast.
+# opt-level 2 on dependencies only — our own crate stays at 0 so incremental
+# rebuilds during UI work stay fast. Skia arrives prebuilt, so this is mostly
+# cosmic-text and resvg, which are slow to run unoptimised.
 [profile.dev.package."*"]
 opt-level = 2

@@ -8,7 +8,7 @@
 
 use crate::core::ytdlp::{Event, YtdlpOptions, download_args, parse_line, probe_args};
 use anyhow::{Context, Result, anyhow};
-use futures::channel::{mpsc, oneshot};
+use futures_channel::{mpsc, oneshot};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -614,7 +614,7 @@ mod tests {
     #[ignore = "requires network; downloads ~28 MB"]
     fn download_a_real_video_end_to_end() {
         use crate::core::ytdlp::FormatMode;
-        use futures::StreamExt as _;
+        use futures_util::StreamExt as _;
 
         let exe = ytdlp_path(None).expect("bundled yt-dlp");
         let dir = std::env::temp_dir().join(crate::core::model::new_id("rustydlp-dl"));

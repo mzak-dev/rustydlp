@@ -23,6 +23,13 @@ diff that is not is a regression.
 - **Nothing has been run.** The interface is verified by compilation and by
   rendering screens to a CPU surface. A human has to open the window.
 
+## Behaviour changes from the dependency cleanup
+
+| Change | Why |
+|---|---|
+| `save_job`/`delete_job` are transactional | rusqlite is real SQLite; the children rewrite is exactly a transaction's job. See ADR-0004. |
+| Existing turso-written libraries open with rusqlite | **Unverified** — no such database was available to test. Check against a real one before release. |
+
 ## Deferred, deliberately out of scope for the port
 
 - Scrollbars for the six scroll regions (the gpui build had none).

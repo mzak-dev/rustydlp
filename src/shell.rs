@@ -22,7 +22,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::app_skia::{RustyDlp, SliderKind, Update, Updates};
+use crate::app::{RustyDlp, SliderKind, Update, Updates};
 use crate::render::Backend;
 use crate::render::raster::RasterBackend;
 use crate::ui::event::{dispatch_click, scroll_target, wants_pointer_cursor};
@@ -46,7 +46,7 @@ pub struct Shell {
     backend: RasterBackend,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    updates: futures::channel::mpsc::UnboundedReceiver<Update>,
+    updates: futures_channel::mpsc::UnboundedReceiver<Update>,
     fonts: Rc<RefCell<FontSystem>>,
     pointer: Option<(f32, f32)>,
     modifiers: ModifiersState,

@@ -34,7 +34,7 @@ impl SvgRenderer {
     fn tree(&mut self, path: &str) -> Option<&usvg::Tree> {
         if !self.trees.contains_key(path) {
             let parsed = crate::assets::load(path)
-                .and_then(|bytes| usvg::Tree::from_data(&bytes, &usvg::Options::default()).ok());
+                .and_then(|bytes| usvg::Tree::from_data(bytes, &usvg::Options::default()).ok());
             self.trees.insert(path.to_string(), parsed);
         }
         self.trees.get(path).and_then(|t| t.as_ref())

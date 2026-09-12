@@ -32,6 +32,18 @@ impl IconName {
     }
 }
 
+/// Every path `IconName` can resolve to. Used by the asset table's test.
+pub const ALL_ICON_PATHS: &[&str] = &[
+    "icons/chevron-left.svg",
+    "icons/chevron-right.svg",
+    "icons/folder.svg",
+    "icons/pause.svg",
+    "icons/play.svg",
+    "icons/plus.svg",
+    "icons/replace.svg",
+    "icons/settings.svg",
+];
+
 /// gpui-component's default icon box.
 pub const DEFAULT_ICON_SIZE: Pixels = px(16.);
 
