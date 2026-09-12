@@ -80,6 +80,12 @@ cpal = "0.15"
 rfd = { version = "0.15", default-features = false }
 clipboard-win = "5"
 
+# Embeds the .exe's icon (build.rs). Windows-only for the same reason as the
+# two above: there is no icon resource to embed on a platform this app
+# doesn't ship a binary for.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 # opt-level 2 on dependencies only — our own crate stays at 0 so incremental
 # rebuilds during UI work stay fast. Skia arrives prebuilt, so this is mostly
 # cosmic-text and resvg, which are slow to run unoptimised.

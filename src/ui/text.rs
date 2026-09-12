@@ -169,6 +169,55 @@ impl Shaper {
 
         ShapedLine { runs: blobs, width, baseline }
     }
+
+    /// Shapes `text` to fit within `max_width`, eliding an overflowing tail
+    /// with an ellipsis -- `.truncate()`'s actual job, which until now it never
+    /// did (see `ui::style::Styled::truncate`'s doc): paint drew the plain
+    /// `shape()` output regardless of the box's width, so a long title just
+    /// ran past its column instead of stopping at it.
+    ///
+    /// Reshapes candidates from scratch rather than clipping the drawn glyphs,
+    /// so the cut lands on a character boundary with an ellipsis to show it
+    /// was cut, instead of a glyph sliced in half at the box edge.
+    pub fn shape_truncated(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        line_height: f32,
+        bold: bool,
+        max_width: Option<f32>,
+    ) -> ShapedLine {
+        let full = self.shape(text, font_size, line_height, bold, None);
+        let Some(max_width) = max_width else { return full };
+        if full.width <= max_width {
+            return full;
+        }
+
+        const ELLIPSIS: &str = "\u{2026}";
+        let ellipsis_only = self.shape(ELLIPSIS, font_size, line_height, bold, None);
+        if ellipsis_only.width > max_width {
+            // Not even the ellipsis alone fits; it's the least-wrong thing to draw.
+            return ellipsis_only;
+        }
+
+        // Longest prefix (by char count, so a multi-byte glyph is never split
+        // mid-codepoint) that still fits alongside the ellipsis. Width is
+        // monotonic in prefix length, so a binary search finds it in O(log n)
+        // reshapes instead of shrinking the string one character at a time.
+        let chars: Vec<char> = text.chars().collect();
+        let (mut lo, mut hi) = (0usize, chars.len());
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            let candidate: String = chars[..mid].iter().collect::<String>() + ELLIPSIS;
+            if self.shape(&candidate, font_size, line_height, bold, None).width <= max_width {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let candidate: String = chars[..lo].iter().collect::<String>() + ELLIPSIS;
+        self.shape(&candidate, font_size, line_height, bold, None)
+    }
 }
 
 impl Default for Shaper {
@@ -218,5 +267,32 @@ mod tests {
         let line = shaper.shape("video 日本語", 16.0, 20.0, false, None);
         assert!(!line.runs.is_empty());
         assert!(line.width > 0.0);
+    }
+
+    /// Regression guard for `.truncate()` doing nothing: `paint.rs` used to
+    /// shape with `max_width: None` unconditionally, so a box's own width was
+    /// never consulted and a long title just ran past its column instead of
+    /// stopping at it. The truncated line has to actually fit, and be
+    /// shorter than shaping the same text unconstrained.
+    #[test]
+    fn shape_truncated_fits_the_max_width() {
+        let mut shaper = Shaper::new();
+        let text = "a very long title that will certainly overflow a narrow sidebar column";
+        let full = shaper.shape(text, 16.0, 20.0, false, None);
+        let capped = shaper.shape_truncated(text, 16.0, 20.0, false, Some(120.0));
+
+        assert!(capped.width <= 120.0, "must fit inside the box: {}", capped.width);
+        assert!(capped.width < full.width, "must actually be shorter than the untruncated line");
+        assert!(!capped.runs.is_empty(), "still has something to draw, including the ellipsis");
+    }
+
+    /// Text that already fits must come back unchanged -- no ellipsis tacked
+    /// onto a title that was never going to overflow in the first place.
+    #[test]
+    fn shape_truncated_leaves_text_that_already_fits_alone() {
+        let mut shaper = Shaper::new();
+        let unconstrained = shaper.shape("hi", 16.0, 20.0, false, None).width;
+        let truncated = shaper.shape_truncated("hi", 16.0, 20.0, false, Some(500.0)).width;
+        assert_eq!(truncated, unconstrained);
     }
 }

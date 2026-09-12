@@ -171,6 +171,12 @@ pub trait Styled: Sized {
         self.style().flex_shrink = Some(0.0);
         self
     }
+    /// An arbitrary grow factor, for splitting a row into ratio-sized parts —
+    /// e.g. a slider's filled/unfilled track either side of its thumb.
+    fn flex_grow(mut self, v: f32) -> Self {
+        self.style().flex_grow = Some(v);
+        self
+    }
     fn flex_wrap(mut self) -> Self {
         self.style().flex_wrap = Some(true);
         self
@@ -428,6 +434,14 @@ pub trait Styled: Sized {
     }
     fn top(mut self, v: Pixels) -> Self {
         self.style().inset.top = Some(v.0);
+        self
+    }
+    fn right(mut self, v: Pixels) -> Self {
+        self.style().inset.right = Some(v.0);
+        self
+    }
+    fn bottom(mut self, v: Pixels) -> Self {
+        self.style().inset.bottom = Some(v.0);
         self
     }
 

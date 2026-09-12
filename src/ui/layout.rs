@@ -62,6 +62,12 @@ pub struct Inherited {
     pub line_height: f32,
     pub color: Rgba,
     pub bold: bool,
+    /// Whether the nearest styled ancestor asked for `.truncate()`. A text
+    /// leaf carries no `StyleRefinement` of its own (see `Box_::style`'s
+    /// doc), so this is the only way the wrapping div's request reaches the
+    /// text it actually applies to — the same route `font_size`/`color`/
+    /// `bold` already take to get from a styled div down to its bare string.
+    pub truncate: bool,
 }
 
 impl Default for Inherited {
@@ -71,6 +77,7 @@ impl Default for Inherited {
             line_height: BASE_FONT_SIZE.0 * BASE_LINE_HEIGHT,
             color: theme().foreground,
             bold: false,
+            truncate: false,
         }
     }
 }
@@ -90,6 +97,9 @@ impl Inherited {
         }
         if let Some(b) = style.font_bold {
             self.bold = b;
+        }
+        if let Some(t) = style.truncate {
+            self.truncate = t;
         }
         self
     }

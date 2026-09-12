@@ -361,14 +361,27 @@ fn spawn_player(
                     height,
                     rgba: std::mem::replace(&mut buf, vec![0u8; frame_len]),
                 };
-                let pts = start_at_secs + n as f64 / info.fps;
+                // Actual elapsed time, not `n / fps`. Those agree as long as
+                // decode keeps up with real time, but the moment
+                // `read_exact_or_eof` above (blocking on ffmpeg actually
+                // producing the frame) takes longer than one frame's budget,
+                // `n / fps` silently falls behind and never catches up --
+                // every subsequent frame inherits the same debt on top of its
+                // own, and video drifts further behind audio (which keeps its
+                // own real-time clock on the sound device) the longer
+                // playback runs. Presentation time tracking the clock it was
+                // actually delivered at is what lets a momentary stall show
+                // as a brief stutter instead of a permanent, compounding one.
+                let pts = start_at_secs + start.elapsed().as_secs_f64();
                 if tx.unbounded_send(PlayerEvent::Frame(frame, pts)).is_err() {
                     break; // receiver dropped
                 }
                 n += 1;
-                // Pace to real time so decode speed (which can outrun
-                // playback speed by a lot) doesn't burn through the whole
-                // video in a fraction of a second.
+                // Still throttle when decode is running *ahead* of real time
+                // (typical for most content on modern hardware) so it
+                // doesn't burn through the whole video in a fraction of a
+                // second. Irrelevant to the case above: this only ever
+                // sleeps when `target` is still in the future.
                 let target = start + frame_interval * n;
                 let now = Instant::now();
                 if target > now {
