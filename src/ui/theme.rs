@@ -28,6 +28,22 @@ pub struct Theme {
     pub list_hover: Rgba,
     pub progress_bar: Rgba,
     pub radius: Pixels,
+
+    // -- widget tokens -----------------------------------------------------
+    pub primary: Rgba,
+    pub primary_foreground: Rgba,
+    pub primary_hover: Rgba,
+    pub secondary: Rgba,
+    pub secondary_foreground: Rgba,
+    pub secondary_hover: Rgba,
+    pub accent: Rgba,
+    pub accent_foreground: Rgba,
+    pub ring: Rgba,
+    pub input_border: Rgba,
+    pub tab_foreground: Rgba,
+    pub tab_active: Rgba,
+    pub tab_active_foreground: Rgba,
+    pub switch_track: Rgba,
 }
 
 /// The palette entries the theme resolves to, kept named so the mapping back to
@@ -40,6 +56,9 @@ mod palette {
     pub const NEUTRAL_50: Rgba = rgb(0xfafafa);
     pub const RED_400: Rgba = rgb(0xf87171);
     pub const RED_600: Rgba = rgb(0xdc2626);
+    pub const NEUTRAL_900: Rgba = rgb(0x171717);
+    pub const NEUTRAL_300: Rgba = rgb(0xd4d4d4);
+    pub const NEUTRAL_100: Rgba = rgb(0xf5f5f5);
 }
 
 pub const DARK: Theme = Theme {
@@ -62,6 +81,22 @@ pub const DARK: Theme = Theme {
     progress_bar: rgb(0xf5f5f5),
     // UNCONFIRMED, as above. gpui-component's default radius.
     radius: px(4.),
+
+    // From the same default-theme.json dark variant.
+    primary: palette::NEUTRAL_50,
+    primary_foreground: palette::NEUTRAL_900,
+    primary_hover: palette::NEUTRAL_100,
+    secondary: palette::NEUTRAL_800,
+    secondary_foreground: palette::NEUTRAL_50,
+    secondary_hover: rgb(0x292929),
+    accent: palette::NEUTRAL_800,
+    accent_foreground: palette::NEUTRAL_50,
+    ring: palette::NEUTRAL_300,
+    input_border: rgb(0x2f2f2f),
+    tab_foreground: palette::NEUTRAL_300,
+    tab_active: rgb(0x0a0a0a),
+    tab_active_foreground: rgb(0xfafafa),
+    switch_track: rgb(0x404040),
 };
 
 /// The active theme. A function rather than a constant so that the call sites

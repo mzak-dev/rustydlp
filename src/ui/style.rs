@@ -292,6 +292,34 @@ pub trait Styled: Sized {
     fn py_2(self) -> Self {
         self.py(step(2.0))
     }
+    fn pl(mut self, v: f32) -> Self {
+        self.style().padding.left = Some(v);
+        self
+    }
+    fn pr(mut self, v: f32) -> Self {
+        self.style().padding.right = Some(v);
+        self
+    }
+    fn pt(mut self, v: f32) -> Self {
+        self.style().padding.top = Some(v);
+        self
+    }
+    fn pb(mut self, v: f32) -> Self {
+        self.style().padding.bottom = Some(v);
+        self
+    }
+    fn ml(mut self, v: f32) -> Self {
+        self.style().margin.left = Some(v);
+        self
+    }
+    fn mr(mut self, v: f32) -> Self {
+        self.style().margin.right = Some(v);
+        self
+    }
+    fn mb(mut self, v: f32) -> Self {
+        self.style().margin.bottom = Some(v);
+        self
+    }
     fn pt_3(mut self) -> Self {
         self.style().padding.top = Some(step(3.0));
         self

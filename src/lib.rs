@@ -25,6 +25,8 @@ pub mod app;
 pub mod render;
 #[cfg(feature = "skia")]
 pub mod ui;
+#[cfg(feature = "skia")]
+pub mod widget;
 
 /// Opens the gpui window and runs until it closes.
 #[cfg(feature = "legacy")]

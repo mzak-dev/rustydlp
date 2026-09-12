@@ -83,6 +83,15 @@ impl Shaper {
         built
     }
 
+    /// The font database everything is shaped against.
+    ///
+    /// Text inputs keep their own cosmic-text buffers and must be shaped against
+    /// this same `FontSystem`, or an input's caret would be measured with
+    /// different metrics than the text paint uses.
+    pub fn fonts_mut(&mut self) -> &mut FontSystem {
+        &mut self.fonts
+    }
+
     /// Shapes a single line. `max_width` wraps when set; the app's text is
     /// single-line, so callers generally pass `None` and clip instead.
     pub fn shape(
