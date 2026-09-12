@@ -22,7 +22,11 @@ pub mod app;
 
 // -- the replacement (feature `skia`) ---------------------------------------
 #[cfg(feature = "skia")]
+pub mod app_skia;
+#[cfg(feature = "skia")]
 pub mod render;
+#[cfg(feature = "skia")]
+pub mod shell;
 #[cfg(feature = "skia")]
 pub mod ui;
 #[cfg(feature = "skia")]

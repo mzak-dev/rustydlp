@@ -223,6 +223,10 @@ pub trait Styled: Sized {
     fn min_w_0(self) -> Self {
         self.min_w(px(0.))
     }
+    fn min_h(mut self, l: impl Into<Length>) -> Self {
+        self.style().min_height = Some(l.into());
+        self
+    }
     fn min_h_0(mut self) -> Self {
         self.style().min_height = Some(Length::Px(0.0));
         self
@@ -327,6 +331,13 @@ pub trait Styled: Sized {
     fn mt_1(mut self) -> Self {
         self.style().margin.top = Some(step(1.0));
         self
+    }
+    fn mt_2(mut self) -> Self {
+        self.style().margin.top = Some(step(2.0));
+        self
+    }
+    fn px_1p5(self) -> Self {
+        self.px(step(1.5))
     }
 
     // -- paint -------------------------------------------------------------
@@ -462,7 +473,11 @@ pub trait FluentBuilder: Sized {
     }
 }
 
-impl<T: Sized> FluentBuilder for T {}
+// Scoped to things that carry a style, NOT a blanket impl over every Sized type:
+// a blanket one puts `map` on Option and every iterator, making `.map(..)`
+// ambiguous at call sites that have nothing to do with the interface. gpui scopes
+// it the same way.
+impl<T: Styled> FluentBuilder for T {}
 
 #[cfg(test)]
 mod tests {

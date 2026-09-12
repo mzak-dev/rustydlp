@@ -209,6 +209,18 @@ pub trait IntoElement<S> {
     fn into_element(self) -> Element<S>;
 }
 
+/// `.into_any_element()` under gpui's name, so ported call sites keep it.
+pub trait IntoAnyElement<S>: IntoElement<S> {
+    fn into_any_element(self) -> Element<S>
+    where
+        Self: Sized,
+    {
+        self.into_element()
+    }
+}
+
+impl<S, T: IntoElement<S>> IntoAnyElement<S> for T {}
+
 impl<S> IntoElement<S> for Element<S> {
     fn into_element(self) -> Element<S> {
         self

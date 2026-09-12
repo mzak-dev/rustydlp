@@ -10,7 +10,9 @@
 //! already has. It also avoids Skia's `textlayout` module, and with it Harfbuzz
 //! and ICU -- cosmic-text's rustybuzz does the shaping instead.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight};
 use skia_safe::{Font, FontMgr, TextBlob, TextBlobBuilder, Typeface};
@@ -35,7 +37,7 @@ pub struct ShapedLine {
 
 /// Owns the font database and the Skia typefaces built from it.
 pub struct Shaper {
-    fonts: FontSystem,
+    fonts: Rc<RefCell<FontSystem>>,
     font_mgr: FontMgr,
     /// cosmic-text's face id -> the Skia typeface over the same bytes.
     typefaces: HashMap<cosmic_text::fontdb::ID, Option<Typeface>>,
@@ -52,12 +54,7 @@ impl Shaper {
     /// text metrics here may differ from the interface being replaced. Pin the
     /// family with `with_family` once it is known.
     pub fn new() -> Self {
-        Shaper {
-            fonts: FontSystem::new(),
-            font_mgr: FontMgr::new(),
-            typefaces: HashMap::new(),
-            family: None,
-        }
+        Shaper::with_shared_fonts(Rc::new(RefCell::new(FontSystem::new())))
     }
 
     /// Shapes against an explicit family, and against only that family — used
@@ -76,6 +73,7 @@ impl Shaper {
         let mgr = self.font_mgr.clone();
         let built = self
             .fonts
+            .borrow()
             .db()
             .with_face_data(id, |data, index| mgr.new_from_data(data, index as usize))
             .flatten();
@@ -83,13 +81,24 @@ impl Shaper {
         built
     }
 
-    /// The font database everything is shaped against.
+    /// Shapes against an existing font database.
     ///
     /// Text inputs keep their own cosmic-text buffers and must be shaped against
-    /// this same `FontSystem`, or an input's caret would be measured with
-    /// different metrics than the text paint uses.
-    pub fn fonts_mut(&mut self) -> &mut FontSystem {
-        &mut self.fonts
+    /// the *same* `FontSystem` the painting uses, or a caret would be measured
+    /// with different metrics than the glyphs beside it. Sharing it is how that
+    /// is guaranteed rather than hoped for.
+    pub fn with_shared_fonts(fonts: Rc<RefCell<FontSystem>>) -> Self {
+        Shaper {
+            fonts,
+            font_mgr: FontMgr::new(),
+            typefaces: HashMap::new(),
+            family: None,
+        }
+    }
+
+    /// The shared font database, for whoever else needs to shape against it.
+    pub fn fonts(&self) -> Rc<RefCell<FontSystem>> {
+        self.fonts.clone()
     }
 
     /// Shapes a single line. `max_width` wraps when set; the app's text is
@@ -102,35 +111,39 @@ impl Shaper {
         bold: bool,
         max_width: Option<f32>,
     ) -> ShapedLine {
-        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(font_size, line_height));
-        buffer.set_size(&mut self.fonts, max_width, None);
         // Cloned to a local first: `Family::Name` borrows the string, and that
-        // immutable borrow of `self` would collide with `&mut self.fonts`.
+        // immutable borrow of `self` would collide with borrowing the fonts.
         let family = self.family.clone();
-        let mut attrs = Attrs::new();
-        attrs = match &family {
-            Some(f) => attrs.family(Family::Name(f)),
-            None => attrs.family(Family::SansSerif),
-        };
-        if bold {
-            attrs = attrs.weight(Weight::BOLD);
-        }
-        buffer.set_text(&mut self.fonts, text, &attrs, Shaping::Advanced);
-        buffer.shape_until_scroll(&mut self.fonts, false);
-
         let mut width = 0.0f32;
         let mut baseline = line_height;
-        // Collect first: building blobs needs &mut self for the typeface cache,
-        // which would conflict with borrowing the buffer.
+        // Shaping is collected inside this block so the font borrow is released
+        // before the typeface cache below, which needs its own.
         let mut runs: Vec<GlyphRun> = Vec::new();
-        for run in buffer.layout_runs() {
-            baseline = run.line_y;
-            width = width.max(run.line_w);
-            for g in run.glyphs {
-                let entry = (g.glyph_id, g.x, g.y);
-                match runs.last_mut() {
-                    Some((id, glyphs)) if *id == g.font_id => glyphs.push(entry),
-                    _ => runs.push((g.font_id, vec![entry])),
+        {
+            let shared = self.fonts.clone();
+            let mut fonts = shared.borrow_mut();
+            let mut buffer = Buffer::new(&mut fonts, Metrics::new(font_size, line_height));
+            buffer.set_size(&mut fonts, max_width, None);
+            let mut attrs = Attrs::new();
+            attrs = match &family {
+                Some(f) => attrs.family(Family::Name(f)),
+                None => attrs.family(Family::SansSerif),
+            };
+            if bold {
+                attrs = attrs.weight(Weight::BOLD);
+            }
+            buffer.set_text(&mut fonts, text, &attrs, Shaping::Advanced);
+            buffer.shape_until_scroll(&mut fonts, false);
+
+            for run in buffer.layout_runs() {
+                baseline = run.line_y;
+                width = width.max(run.line_w);
+                for g in run.glyphs {
+                    let entry = (g.glyph_id, g.x, g.y);
+                    match runs.last_mut() {
+                        Some((id, glyphs)) if *id == g.font_id => glyphs.push(entry),
+                        _ => runs.push((g.font_id, vec![entry])),
+                    }
                 }
             }
         }

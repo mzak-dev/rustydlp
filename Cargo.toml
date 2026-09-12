@@ -28,7 +28,16 @@ legacy = [
     "dep:smallvec",
 ]
 # The replacement: skia-safe paints, taffy lays out, cosmic-text shapes.
-skia = ["dep:skia-safe", "dep:cosmic-text", "dep:taffy", "dep:resvg"]
+skia = [
+    "dep:skia-safe",
+    "dep:cosmic-text",
+    "dep:taffy",
+    "dep:resvg",
+    "dep:rfd",
+    "dep:pollster",
+    "dep:winit",
+    "dep:softbuffer",
+]
 
 [dependencies]
 # -- the interface being replaced (feature `legacy`) ------------------------
@@ -75,6 +84,14 @@ taffy = { version = "0.9", optional = true }
 # forces a full Skia source build. resvg is pure Rust and brings its own
 # tiny-skia.
 resvg = { version = "0.45", optional = true }
+# The window and its event loop. 0.30's ApplicationHandler, not the old
+# run-closure: resumed creates the surface, window_event handles input,
+# user_event drains the update queue, about_to_wait asks for the next frame.
+winit = { version = "0.30", optional = true }
+# Presents the CPU-rasterized frame to the window. This is the fallback path:
+# render/d3d.rs is the intended backend, and slots in behind the same
+# render::Backend trait without touching anything above it.
+softbuffer = { version = "0.4", optional = true }
 
 # -- always on: core/ and assets -------------------------------------------
 # `include-exclude` is needed for the #[include] attribute. It used to arrive
@@ -96,9 +113,21 @@ dirs = "6"
 # ffmpeg already decodes to raw samples before they reach cpal.
 cpal = "0.15"
 
+# Drives turso's futures on a worker thread. This is what the old dev-dependency
+# comment was protecting: because those futures complete under a bare block_on,
+# they are runtime-agnostic and need no executor.
+pollster = { version = "0.4", optional = true }
+
+# The native file picker. gpui supplied one through `cx.prompt_for_paths`; the
+# Convert tab needs it so conversion works on any local file.
+#
+# Windows-only on purpose: rfd's Linux default backend is xdg-portal, which pulls
+# tokio -- the runtime this crate deliberately keeps out (see `turso` above). The
+# app targets Windows; on anything else the picker is stubbed and says so.
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", optional = true, default-features = false }
+
 [dev-dependencies]
-# Deliberately NOT tokio: if turso's futures complete under pollster's bare
-# block_on, they are runtime-agnostic and can be driven from any thread.
 pollster = "0.4"
 
 # ponytail: gpui's dependency tree is huge. opt-level 2 on deps only — our own
