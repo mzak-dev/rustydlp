@@ -16,7 +16,7 @@ use taffy::style::{
 };
 
 use super::color::Rgba;
-use super::element::{Content, Element};
+use super::element::{Content, Div, Element};
 use super::style::{AlignItems, FlexDirection, JustifyContent, StyleRefinement};
 use super::theme::{BASE_FONT_SIZE, BASE_LINE_HEIGHT, theme};
 use super::units::{Bounds, Length};
@@ -95,18 +95,69 @@ impl Inherited {
     }
 }
 
+/// Per-scroll-region offsets, keyed by the element id. `overflow_y_scroll`
+/// needs an `.id()` for exactly this reason: the offset is retained state and
+/// has to survive across frames.
+#[derive(Debug, Default)]
+pub struct ScrollState {
+    offsets: HashMap<String, f32>,
+}
+
+impl ScrollState {
+    pub fn offset(&self, id: &str) -> f32 {
+        self.offsets.get(id).copied().unwrap_or(0.0)
+    }
+
+    /// Scrolls by `dy`, clamped to `0..=max`. Returns whether anything moved,
+    /// so a caller can decide whether a redraw is needed.
+    pub fn scroll_by(&mut self, id: &str, dy: f32, max: f32) -> bool {
+        let slot = self.offsets.entry(id.to_string()).or_insert(0.0);
+        let next = (*slot + dy).clamp(0.0, max.max(0.0));
+        let moved = next != *slot;
+        *slot = next;
+        moved
+    }
+}
+
+/// The clip a box inherits: the intersection of every clipping ancestor.
+///
+/// Walked per box rather than tracked with a save-stack, because layout hands
+/// back a flat list. `None` means unclipped; an empty `Bounds` means the box is
+/// entirely outside its clip — scrolled out of view — and can be skipped.
+pub fn inherited_clip<S>(boxes: &[Box_<'_, S>], mut index: usize) -> Option<Bounds> {
+    let mut clip: Option<Bounds> = None;
+    while let Some(parent) = boxes[index].parent {
+        let p = &boxes[parent];
+        if p.clips {
+            clip = match clip {
+                None => Some(p.bounds),
+                Some(c) => match c.intersect(&p.bounds) {
+                    Some(next) => Some(next),
+                    None => return Some(Bounds::default()),
+                },
+            };
+        }
+        index = parent;
+    }
+    clip
+}
+
 /// One box, positioned absolutely in the window, in paint order.
 pub struct Box_<'a, S> {
     pub bounds: Bounds,
     pub style: StyleRefinement,
     pub inherited: Inherited,
-    pub content: Option<&'a Content<S>>,
+    /// The box's source element, when it is a `div` rather than a text leaf.
+    /// Carries the click handler, the hover overrides and the scroll identity.
+    pub node: Option<&'a Div<S>>,
     /// Set for text leaves.
     pub text: Option<&'a str>,
     /// Index of this box's parent in the flattened list, for hit-test
     /// ancestry and for clipping.
     pub parent: Option<usize>,
     pub clips: bool,
+    /// For a scroll region: how far it can scroll before its content ends.
+    pub scroll_max: f32,
 }
 
 fn dim(l: Option<Length>) -> Dimension {
@@ -213,6 +264,7 @@ pub fn layout<'a, S>(
     root: &'a Element<S>,
     viewport: (f32, f32),
     measurer: &mut dyn MeasureText,
+    scroll: &ScrollState,
 ) -> Vec<Box_<'a, S>> {
     let mut tree: TaffyTree<TextCtx> = TaffyTree::new();
     // What each taffy node came from. Keyed by NodeId rather than indexed by
@@ -295,6 +347,7 @@ pub fn layout<'a, S>(
         origin: (f32, f32),
         parent: Option<usize>,
         out: &mut Vec<Box_<'a, S>>,
+        scroll: &ScrollState,
     ) {
         let l = tree.layout(node).expect("laid out");
         let bounds = Bounds {
@@ -306,18 +359,44 @@ pub fn layout<'a, S>(
         let (el, inherited) = sources[&node];
         let style = el.style().clone();
         let clips = style.overflow_hidden == Some(true) || style.overflow_y_scroll == Some(true);
-        let (content, text) = match el {
-            Element::Node(d) => (Some(&d.content), None),
+        // Named `src` rather than `node`: `node` here is the taffy NodeId.
+        let (src, text) = match el {
+            Element::Node(d) => (Some(&**d), None),
             Element::Text(t) => (None, Some(&*t.text)),
         };
+        // A scroll region shifts its children up by its offset; how far it may
+        // shift is the overflow of its content past its own box.
+        let scroll_max = (l.content_size.height - l.size.height).max(0.0);
+        let offset = match (style.overflow_y_scroll, src.and_then(|d| d.element_id())) {
+            (Some(true), Some(id)) => scroll.offset(id).min(scroll_max),
+            _ => 0.0,
+        };
+
         let me = out.len();
-        out.push(Box_ { bounds, style, inherited, content, text, parent, clips });
+        out.push(Box_ {
+            bounds,
+            style,
+            inherited,
+            node: src,
+            text,
+            parent,
+            clips,
+            scroll_max,
+        });
 
         for child in tree.children(node).expect("children") {
-            flatten(tree, sources, child, (bounds.x, bounds.y), Some(me), out);
+            flatten(
+                tree,
+                sources,
+                child,
+                (bounds.x, bounds.y - offset),
+                Some(me),
+                out,
+                scroll,
+            );
         }
     }
-    flatten(&tree, &sources, root_node, (0.0, 0.0), None, &mut out);
+    flatten(&tree, &sources, root_node, (0.0, 0.0), None, &mut out, scroll);
     out
 }
 
@@ -332,7 +411,7 @@ mod tests {
     type E = Element<()>;
 
     fn lay(root: &E, viewport: (f32, f32)) -> Vec<Box_<'_, ()>> {
-        layout(root, viewport, &mut FixedMetrics::default())
+        layout(root, viewport, &mut FixedMetrics::default(), &ScrollState::default())
     }
 
     /// The shape the whole window uses: a fixed-width sidebar beside a pane

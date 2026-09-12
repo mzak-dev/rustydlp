@@ -85,6 +85,20 @@ pub struct Bounds {
 }
 
 impl Bounds {
+    /// The overlapping region, or `None` when they do not overlap at all.
+    pub fn intersect(&self, other: &Bounds) -> Option<Bounds> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        (right > x && bottom > y).then_some(Bounds {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        })
+    }
+
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
     }

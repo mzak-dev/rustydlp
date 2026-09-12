@@ -4,10 +4,14 @@ use skia_safe::{Canvas, Color4f, Paint, RRect, Rect};
 
 use super::color::Rgba;
 use super::element::Content;
-use super::layout::Box_;
+use super::layout::{Box_, inherited_clip};
 use super::style::{Edges, StyleRefinement};
 use super::text::Shaper;
 use super::units::Bounds;
+
+fn to_rect(b: &Bounds) -> Rect {
+    Rect::from_xywh(b.x, b.y, b.width, b.height)
+}
 
 fn to_color(c: Rgba) -> Color4f {
     Color4f::new(c.r, c.g, c.b, c.a)
@@ -29,34 +33,6 @@ fn radius_of(style: &StyleRefinement, b: &Bounds) -> f32 {
 
 fn rrect_of(b: &Bounds, radius: f32) -> RRect {
     RRect::new_rect_xy(rect_of(b), radius, radius)
-}
-
-/// The clip a box inherits: the intersection of every clipping ancestor. Walked
-/// per box rather than tracked with a canvas save-stack, because layout hands
-/// back a flat list and a stack would have to be rebuilt from it anyway.
-fn inherited_clip<S>(boxes: &[Box_<'_, S>], mut index: usize) -> Option<Rect> {
-    let mut clip: Option<Rect> = None;
-    while let Some(parent) = boxes[index].parent {
-        let p = &boxes[parent];
-        if p.clips {
-            let r = rect_of(&p.bounds);
-            clip = match clip {
-                None => Some(r),
-                // Intersection: an ancestor can only shrink the visible area.
-                // An empty result means the box is entirely scrolled out of
-                // view, and the caller skips it.
-                Some(mut c) => {
-                    if c.intersect(r) {
-                        Some(c)
-                    } else {
-                        return Some(Rect::new_empty());
-                    }
-                }
-            };
-        }
-        index = parent;
-    }
-    clip
 }
 
 fn draw_borders(canvas: &Canvas, b: &Bounds, widths: Edges<f32>, color: Rgba, radius: f32) {
@@ -109,22 +85,39 @@ fn draw_borders(canvas: &Canvas, b: &Bounds, widths: Edges<f32>, color: Rgba, ra
 
 /// Paints every box in order. `boxes` must be the list `layout` returned, in
 /// that order: it is already parent-before-child, which is the paint order.
-pub fn paint<S>(canvas: &Canvas, boxes: &[Box_<'_, S>], shaper: &mut Shaper) {
+pub fn paint<S>(
+    canvas: &Canvas,
+    boxes: &[Box_<'_, S>],
+    shaper: &mut Shaper,
+    pointer: Option<(f32, f32)>,
+) {
     for (i, b) in boxes.iter().enumerate() {
         if b.bounds.width <= 0.0 || b.bounds.height <= 0.0 {
             continue;
         }
         let clip = inherited_clip(boxes, i);
         if let Some(c) = clip
-            && c.is_empty()
+            && c.width <= 0.0
         {
             continue;
         }
 
         let restore_to = canvas.save();
         if let Some(c) = clip {
-            canvas.clip_rect(c, None, Some(true));
+            canvas.clip_rect(to_rect(&c), None, Some(true));
         }
+
+        // Hover is bounds containment, as in gpui: a parent counts as hovered
+        // while the pointer is over one of its children.
+        let mut style = b.style.clone();
+        if let Some(hover) = b.node.and_then(|n| n.hover_style())
+            && let Some((px_, py_)) = pointer
+            && b.bounds.contains(px_, py_)
+            && clip.is_none_or(|c| c.contains(px_, py_))
+        {
+            style.layer(hover);
+        }
+        let b = &Box_ { style, ..*b };
         // Subtree opacity would need its own layer; every `.opacity()` in the
         // app is on a colour rather than an element, so this applies to the box
         // itself and is flagged if an element-level one ever appears.
@@ -159,7 +152,7 @@ pub fn paint<S>(canvas: &Canvas, boxes: &[Box_<'_, S>], shaper: &mut Shaper) {
             }
         }
 
-        if let Some(Content::Image(src)) = b.content {
+        if let Some(Content::Image(src)) = b.node.map(|n| n.content()) {
             draw_image(canvas, &b.bounds, src, b.style.object_fit, alpha);
         }
         // Content::Svg is not drawn yet: gpui painted it as an alpha mask tinted
@@ -239,7 +232,7 @@ mod tests {
     use crate::render::Backend;
     use crate::ui::color::rgb;
     use crate::ui::element::{Element, div, h_flex};
-    use crate::ui::layout::{FixedMetrics, layout};
+    use crate::ui::layout::{FixedMetrics, ScrollState, layout};
     use crate::ui::style::Styled;
     use crate::ui::theme::theme;
     use crate::ui::units::px;
@@ -255,11 +248,11 @@ mod tests {
     fn render_on(tree: &E, w: u32, h: u32, clear: crate::ui::Rgba) -> RasterBackend {
         let mut backend = RasterBackend::new(w, h);
         backend.begin_frame(w, h, clear);
-        let boxes = layout(tree, (w as f32, h as f32), &mut FixedMetrics::default());
+        let boxes = layout(tree, (w as f32, h as f32), &mut FixedMetrics::default(), &ScrollState::default());
         // Shaping is irrelevant here: the tree is boxes only, so no system font
         // can make this assertion host-dependent.
         let mut shaper = Shaper::new();
-        paint(backend.canvas(), &boxes, &mut shaper);
+        paint(backend.canvas(), &boxes, &mut shaper, None);
         backend
     }
 

@@ -3,6 +3,7 @@
 pub mod color;
 pub mod element;
 pub mod layout;
+pub mod event;
 pub mod paint;
 pub mod style;
 pub mod text;

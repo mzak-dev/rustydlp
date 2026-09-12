@@ -154,6 +154,22 @@ impl<S> Div<S> {
         self
     }
 
+    pub fn content(&self) -> &Content<S> {
+        &self.content
+    }
+
+    pub fn hover_style(&self) -> Option<&StyleRefinement> {
+        self.hover_style.as_ref()
+    }
+
+    pub fn click_handler(&self) -> Option<&ClickHandler<S>> {
+        self.on_click.as_ref()
+    }
+
+    pub fn element_id(&self) -> Option<&SharedString> {
+        self.id.as_ref()
+    }
+
     pub fn into_any_element(self) -> Element<S> {
         Element::Node(Box::new(self))
     }
