@@ -10,20 +10,15 @@ use serde::{Deserialize, Serialize};
 // Options -> argv
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FormatMode {
     /// Best video + best audio, merged.
+    #[default]
     BestVideoAudio,
     /// Strip to audio and transcode to `codec` (mp3, m4a, opus, ...).
     AudioOnly { codec: String },
     /// Raw `-f` selector, for people who know yt-dlp's format language.
     Custom(String),
-}
-
-impl Default for FormatMode {
-    fn default() -> Self {
-        Self::BestVideoAudio
-    }
 }
 
 /// The curated slice of yt-dlp's surface that gets real widgets, plus

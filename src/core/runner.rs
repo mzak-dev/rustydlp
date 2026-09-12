@@ -54,15 +54,15 @@ pub fn exe_relative_bin_dir() -> Option<PathBuf> {
 pub fn resolve(stem: &str, override_path: Option<&Path>) -> Option<PathBuf> {
     let name = exe_name(stem);
 
-    if let Some(p) = override_path {
-        if p.is_file() {
-            return Some(p.to_path_buf());
-        }
+    if let Some(p) = override_path
+        && p.is_file()
+    {
+        return Some(p.to_path_buf());
     }
-    if let Some(portable) = exe_relative_bin_dir().map(|d| d.join(&name)) {
-        if portable.is_file() {
-            return Some(portable);
-        }
+    if let Some(portable) = exe_relative_bin_dir().map(|d| d.join(&name))
+        && portable.is_file()
+    {
+        return Some(portable);
     }
     let bundled = bin_dir().join(&name);
     if bundled.is_file() {
@@ -253,10 +253,10 @@ impl CancelHandle {
     /// Kills the child. Partial `.part` files survive, so a retry resumes from
     /// where it stopped rather than starting over.
     pub fn cancel(&self) {
-        if let Ok(mut guard) = self.0.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
-            }
+        if let Ok(mut guard) = self.0.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
         }
     }
 }
@@ -283,8 +283,7 @@ pub fn update_ytdlp(exe: PathBuf) -> oneshot::Receiver<Result<String>> {
             let combined = format!("{text}{err}");
             let last = combined
                 .lines()
-                .filter(|l| !l.trim().is_empty())
-                .next_back()
+                .rfind(|l| !l.trim().is_empty())
                 .unwrap_or("yt-dlp reported nothing")
                 .to_string();
             if out.status.success() {

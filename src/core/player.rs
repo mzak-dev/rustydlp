@@ -202,10 +202,10 @@ impl PlayerControl {
         // Unblock a paused run so its threads reach the stop check instead of
         // sleeping on the pause flag.
         self.paused.store(false, Ordering::Relaxed);
-        if let Ok(mut guard) = self.video_child.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
-            }
+        if let Ok(mut guard) = self.video_child.lock()
+            && let Some(child) = guard.as_mut()
+        {
+            let _ = child.kill();
         }
     }
 }

@@ -1738,20 +1738,6 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn centered_message(&self, msg: &str, cx: &mut Context<Self>) -> AnyElement {
-        v_flex()
-            .flex_1()
-            .h_full()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(msg.to_string()),
-            )
-            .into_any_element()
-    }
-
     fn grid(&self, job: &Job, cx: &mut Context<Self>) -> AnyElement {
         let cards: Vec<AnyElement> = job
             .items
@@ -2966,6 +2952,71 @@ fn classify(path: &str) -> FileKind {
     }
 }
 
+impl Render for RustyDlp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let navbar = self.navbar(cx);
+        let sidebar = self.sidebar(cx);
+        let main = self.main_pane(window, cx);
+        let modal = if self.modal { Some(self.modal(cx)) } else { None };
+        let convert_modal = self
+            .convert_picker
+            .is_some()
+            .then(|| self.convert_format_picker(cx));
+        let banner = self.startup_error.clone();
+
+        div()
+            .relative()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                v_flex()
+                    .size_full()
+                    .when_some(banner, |this, msg| {
+                        this.child(
+                            h_flex()
+                                .w_full()
+                                .px_4()
+                                .py_2()
+                                .gap_3()
+                                .items_center()
+                                .bg(cx.theme().danger.opacity(0.15))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(cx.theme().danger)
+                                        .child(msg),
+                                )
+                                .child(
+                                    Button::new("open-bin-dir")
+                                        .small()
+                                        .flex_shrink_0()
+                                        .icon(IconName::Folder)
+                                        .label("Open folder")
+                                        .on_click(|_, _, _| open_bin_dir()),
+                                )
+                                .child(
+                                    Button::new("banner-recheck")
+                                        .small()
+                                        .flex_shrink_0()
+                                        .label("Re-check")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.refresh_ytdlp();
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    })
+                    .child(navbar)
+                    .child(h_flex().flex_1().min_h_0().child(sidebar).child(main)),
+            )
+            .children(modal)
+            .children(convert_modal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // NOT `use super::*`: that re-globs gpui's own `test` attribute macro over
@@ -3100,70 +3151,5 @@ mod tests {
         assert_eq!(SidebarTab::Download.empty_message(), "No recent downloads");
         assert_eq!(SidebarTab::Convert.empty_message(), "No recent conversions");
         assert_eq!(SidebarTab::InProgress.empty_message(), "Nothing in progress");
-    }
-}
-
-impl Render for RustyDlp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let navbar = self.navbar(cx);
-        let sidebar = self.sidebar(cx);
-        let main = self.main_pane(window, cx);
-        let modal = if self.modal { Some(self.modal(cx)) } else { None };
-        let convert_modal = self
-            .convert_picker
-            .is_some()
-            .then(|| self.convert_format_picker(cx));
-        let banner = self.startup_error.clone();
-
-        div()
-            .relative()
-            .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(
-                v_flex()
-                    .size_full()
-                    .when_some(banner, |this, msg| {
-                        this.child(
-                            h_flex()
-                                .w_full()
-                                .px_4()
-                                .py_2()
-                                .gap_3()
-                                .items_center()
-                                .bg(cx.theme().danger.opacity(0.15))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_xs()
-                                        .text_color(cx.theme().danger)
-                                        .child(msg),
-                                )
-                                .child(
-                                    Button::new("open-bin-dir")
-                                        .small()
-                                        .flex_shrink_0()
-                                        .icon(IconName::Folder)
-                                        .label("Open folder")
-                                        .on_click(|_, _, _| open_bin_dir()),
-                                )
-                                .child(
-                                    Button::new("banner-recheck")
-                                        .small()
-                                        .flex_shrink_0()
-                                        .label("Re-check")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.refresh_ytdlp();
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
-                    })
-                    .child(navbar)
-                    .child(h_flex().flex_1().min_h_0().child(sidebar).child(main)),
-            )
-            .children(modal)
-            .children(convert_modal)
     }
 }
