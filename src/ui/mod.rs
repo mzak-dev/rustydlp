@@ -1,5 +1,6 @@
 //! The interface layer: element tree, layout, paint.
 
+pub mod anim;
 pub mod color;
 pub mod element;
 pub mod layout;
@@ -11,6 +12,7 @@ pub mod text;
 pub mod theme;
 pub mod units;
 
+pub use anim::Animator;
 pub use color::{Rgba, black, rgb, transparent};
 pub use element::{
     AnyElement, Content, Div, Element, ImageSource, IntoElement, SharedString, TextNode, div,

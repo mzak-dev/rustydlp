@@ -5,7 +5,8 @@ on:
     branches: [main]
   pull_request:
 
-# Only the release job writes anything; everything else is read-only.
+# Only release-please and the jobs that publish a release write anything;
+# everything else is read-only.
 permissions:
   contents: read
 
@@ -26,36 +27,73 @@ jobs:
       # deliberately steps over WARP.
       - run: cargo test --workspace
 
-  build:
+  # Reads Conventional Commits on `main` since the last release and keeps a
+  # standing "chore(main): release X.Y.Z" PR up to date with the version bump
+  # (Cargo.toml + Cargo.lock) and changelog that warrants. A plain push just
+  # updates that PR (`release_created` stays false, below stays skipped);
+  # pushing the merge of that PR itself is what release-please recognizes as
+  # the release, and is what makes `release_created` true and cuts the tag +
+  # GitHub release on this same run.
+  #
+  # Uses the default GITHUB_TOKEN, which can't trigger *new* workflow runs
+  # from its own commits — so opening/updating the release PR won't itself
+  # trigger `test` on that PR. That's only a missing CI checkmark on the PR
+  # while it sits open, not a problem for the release: a human merging it is
+  # a normal push, which runs this whole workflow including `test`. Swap in a
+  # PAT via `with: token:` if the standing PR needs its own CI run.
+  release-please:
+    if: github.event_name == 'push'
     needs: test
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Manifest mode (config-file + manifest-file) rather than the simpler
+      # `release-type` input, because this repo has no prior release tag for
+      # release-please to anchor to on its own — .release-please-manifest.json
+      # is what tells it 0.0.5 (Cargo.toml's current version) is the baseline
+      # to bump from, instead of guessing a starting point.
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
       - uses: Swatinem/rust-cache@v2
-      # Cargo.toml is the single source of truth for the version, so read it back.
-      - id: version
-        shell: bash
-        run: echo "version=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)" >> "$GITHUB_OUTPUT"
       - run: cargo build --release -p rustydlp
       - uses: actions/upload-artifact@v4
         with:
-          name: rustydlp-${{ steps.version.outputs.version }}
+          name: rustydlp-${{ needs.release-please.outputs.tag_name }}
           path: target/release/rustydlp.exe
 
-  release:
-    if: github.event_name == 'push'
-    needs: build
+  # release-please already created the tag and the GitHub release (empty of
+  # binaries) when its PR was merged; this only attaches the Windows build to
+  # it as a downloadable asset.
+  attach-binary:
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # creates the tag and the release
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: rustydlp-${{ needs.build.outputs.version }}
+          name: rustydlp-${{ needs.release-please.outputs.tag_name }}
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.build.outputs.version }}
-        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --generate-notes rustydlp.exe
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" rustydlp.exe

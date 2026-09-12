@@ -365,13 +365,24 @@ impl ApplicationHandler for Shell {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_updates();
+        // A tween has no worker posting new frames to mark things dirty --
+        // its whole state is "time has passed since render() last looked" --
+        // so unlike video playback (dirty from each arriving `Update`) it has
+        // to force its own next redraw here, or the animation registered
+        // during the render that triggered it would just sit at whatever
+        // in-between value that first frame left it at.
+        if self.app.is_animating() {
+            self.dirty = true;
+        }
         if self.dirty && let Some(window) = &self.window {
             window.request_redraw();
         }
-        // While the player is running new frames keep arriving, so the loop
-        // wakes on a timer. Otherwise it sleeps until the next event -- the app
-        // is a static picture between them, exactly as it was under gpui.
-        if self.app.is_playing() {
+        // While the player is running new frames keep arriving, and while a
+        // tween (sidebar collapse, row hover/selection, a pane entrance)
+        // hasn't settled it needs the same steady wake-up to keep advancing.
+        // Otherwise the loop sleeps until the next event -- the app is a
+        // static picture between them, exactly as it was under gpui.
+        if self.app.is_playing() || self.app.is_animating() {
             event_loop.set_control_flow(ControlFlow::wait_duration(PLAYBACK_FRAME_INTERVAL));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
