@@ -6,6 +6,7 @@ pub mod layout;
 pub mod event;
 pub mod paint;
 pub mod style;
+pub mod svg;
 pub mod text;
 pub mod theme;
 pub mod units;

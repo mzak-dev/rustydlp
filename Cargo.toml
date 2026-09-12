@@ -28,7 +28,7 @@ legacy = [
     "dep:smallvec",
 ]
 # The replacement: skia-safe paints, taffy lays out, cosmic-text shapes.
-skia = ["dep:skia-safe", "dep:cosmic-text", "dep:taffy"]
+skia = ["dep:skia-safe", "dep:cosmic-text", "dep:taffy", "dep:resvg"]
 
 [dependencies]
 # -- the interface being replaced (feature `legacy`) ------------------------
@@ -68,9 +68,19 @@ cosmic-text = { version = "0.14", optional = true }
 # The same layout engine gpui uses, so flex behaviour matches by construction
 # rather than by eye.
 taffy = { version = "0.9", optional = true }
+# Renders the icon SVGs to an alpha mask, which is then tinted with the box's
+# text colour -- what gpui's `svg().text_color(..)` did. Deliberately NOT
+# skia-safe's `svg` feature: prebuilt binaries are keyed on the feature combo,
+# and no published archive covers a combo that includes it, so enabling it
+# forces a full Skia source build. resvg is pure Rust and brings its own
+# tiny-skia.
+resvg = { version = "0.45", optional = true }
 
 # -- always on: core/ and assets -------------------------------------------
-rust-embed = "8"
+# `include-exclude` is needed for the #[include] attribute. It used to arrive
+# transitively from gpui-component-assets, which meant the legacy build only
+# compiled because another crate turned it on; declared explicitly now.
+rust-embed = { version = "8", features = ["include-exclude"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # default-features off keeps the `sync` feature (and with it tokio + hyper + rustls)

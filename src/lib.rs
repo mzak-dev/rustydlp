@@ -13,11 +13,12 @@
 /// Everything that is not the user interface. Depends on no GUI crate.
 pub mod core;
 
+/// Embedded icons. Both interfaces draw the same art.
+pub mod assets;
+
 // -- the gpui interface (feature `legacy`) -----------------------------------
 #[cfg(feature = "legacy")]
 pub mod app;
-#[cfg(feature = "legacy")]
-pub mod assets;
 
 // -- the replacement (feature `skia`) ---------------------------------------
 #[cfg(feature = "skia")]

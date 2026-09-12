@@ -6299,6 +6299,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "pollster 0.4.0",
+ "resvg 0.45.1",
  "rust-embed",
  "serde",
  "serde_json",

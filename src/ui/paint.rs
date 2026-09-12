@@ -6,6 +6,7 @@ use super::color::Rgba;
 use super::element::Content;
 use super::layout::{Box_, inherited_clip};
 use super::style::{Edges, StyleRefinement};
+use super::svg::SvgRenderer;
 use super::text::Shaper;
 use super::units::Bounds;
 
@@ -83,12 +84,26 @@ fn draw_borders(canvas: &Canvas, b: &Bounds, widths: Edges<f32>, color: Rgba, ra
     }
 }
 
+/// The caches painting needs across frames: shaped text and rasterized icons.
+/// Held by the application and passed in, so neither is rebuilt per frame.
+#[derive(Default)]
+pub struct Painter {
+    pub shaper: Shaper,
+    pub svg: SvgRenderer,
+}
+
+impl Painter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Paints every box in order. `boxes` must be the list `layout` returned, in
 /// that order: it is already parent-before-child, which is the paint order.
 pub fn paint<S>(
     canvas: &Canvas,
     boxes: &[Box_<'_, S>],
-    shaper: &mut Shaper,
+    painter: &mut Painter,
     pointer: Option<(f32, f32)>,
 ) {
     for (i, b) in boxes.iter().enumerate() {
@@ -138,7 +153,7 @@ pub fn paint<S>(
         }
 
         if let Some(text) = b.text {
-            let line = shaper.shape(
+            let line = painter.shaper.shape(
                 text,
                 b.inherited.font_size,
                 b.inherited.line_height,
@@ -152,16 +167,42 @@ pub fn paint<S>(
             }
         }
 
-        if let Some(Content::Image(src)) = b.node.map(|n| n.content()) {
-            draw_image(canvas, &b.bounds, src, b.style.object_fit, alpha);
+        match b.node.map(|n| n.content()) {
+            Some(Content::Image(src)) => {
+                draw_image(canvas, &b.bounds, src, b.style.object_fit, alpha);
+            }
+            // An alpha mask filled with the box's text colour, as gpui did.
+            Some(Content::Svg(path)) if !path.is_empty() => {
+                let w = b.bounds.width.round().max(1.0) as u32;
+                let h = b.bounds.height.round().max(1.0) as u32;
+                let tint = b.inherited.color.opacity(alpha);
+                if let Some(rgba) = painter.svg.tinted_rgba(path, w, h, tint) {
+                    draw_rgba(canvas, &b.bounds, w, h, &rgba);
+                }
+            }
+            _ => {}
         }
-        // Content::Svg is not drawn yet: gpui painted it as an alpha mask tinted
-        // with the box's text colour, and reproducing that needs skia-safe's
-        // `svg` feature, which is not in the feature combo that has prebuilts.
-        // Tracked as an open item rather than silently approximated.
 
         canvas.restore_to_count(restore_to);
     }
+}
+
+/// Blits straight RGBA at the box's origin, already at the box's pixel size.
+fn draw_rgba(canvas: &Canvas, b: &Bounds, width: u32, height: u32, rgba: &[u8]) {
+    let info = skia_safe::ImageInfo::new(
+        (width as i32, height as i32),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Unpremul,
+        None,
+    );
+    let Some(image) = skia_safe::images::raster_from_data(
+        &info,
+        skia_safe::Data::new_copy(rgba),
+        width as usize * 4,
+    ) else {
+        return;
+    };
+    canvas.draw_image(&image, (b.x, b.y), None);
 }
 
 fn draw_image(
@@ -231,7 +272,7 @@ mod tests {
     use crate::render::raster::RasterBackend;
     use crate::render::Backend;
     use crate::ui::color::rgb;
-    use crate::ui::element::{Element, div, h_flex};
+    use crate::ui::element::{Element, div, h_flex, svg};
     use crate::ui::layout::{FixedMetrics, ScrollState, layout};
     use crate::ui::style::Styled;
     use crate::ui::theme::theme;
@@ -249,10 +290,10 @@ mod tests {
         let mut backend = RasterBackend::new(w, h);
         backend.begin_frame(w, h, clear);
         let boxes = layout(tree, (w as f32, h as f32), &mut FixedMetrics::default(), &ScrollState::default());
-        // Shaping is irrelevant here: the tree is boxes only, so no system font
-        // can make this assertion host-dependent.
-        let mut shaper = Shaper::new();
-        paint(backend.canvas(), &boxes, &mut shaper, None);
+        // Shaping is irrelevant for box-only trees, so no system font can make
+        // these assertions host-dependent.
+        let mut painter = Painter::new();
+        paint(backend.canvas(), &boxes, &mut painter, None);
         backend
     }
 
@@ -315,5 +356,26 @@ mod tests {
         let mut r = render_on(&tree, 100, 100, crate::ui::transparent());
         assert_eq!(r.pixel(50, 10), (0xff, 0xff, 0xff, 0xff), "inside the clip");
         assert_eq!(r.pixel(50, 50).3, 0x00, "below the clip, nothing drawn");
+    }
+
+    /// An icon paints as its own shape tinted by the inherited text colour --
+    /// the behaviour both `svg()` call sites in the old app depended on.
+    #[test]
+    fn an_icon_paints_tinted_by_the_inherited_text_colour() {
+        let tree: E = div()
+            .text_color(rgb(0xff0000))
+            .child(svg().path("icons/play.svg").w(px(24.)).h(px(24.)))
+            .into_any_element();
+
+        let mut r = render_on(&tree, 24, 24, crate::ui::transparent());
+        let pixels = r.read_rgba();
+        let covered: Vec<&[u8]> = pixels.chunks_exact(4).filter(|p| p[3] > 0).collect();
+        assert!(!covered.is_empty(), "the icon drew nothing");
+        // Partially covered edge pixels blend towards the transparent clear, so
+        // the assertion is on hue: red only, no green or blue.
+        for p in covered {
+            assert!(p[0] > 0, "covered pixels carry the red tint");
+            assert_eq!((p[1], p[2]), (0, 0), "and nothing else");
+        }
     }
 }
