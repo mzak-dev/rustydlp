@@ -10,16 +10,22 @@ use gpui_component::{
     tab::{Tab, TabBar},
     *,
 };
+// Only to turn a core `VideoFrame` into the `RenderImage` gpui's `img` wants.
+// Both go away with gpui; nothing under `core/` touches them.
+use image::{Frame as ImageFrame, RgbaImage};
+use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::model::{File as MFile, FileKind, Item, Job, JobKind, JobState, Preset, new_id};
-use crate::player;
-use crate::runner::{self, ConvertEvent, ConvertFormat, Probe};
-use crate::store::Store;
-use crate::ytdlp::{Event, FormatMode, YtdlpOptions};
+use crate::core::model::{
+    File as MFile, FileKind, Item, Job, JobKind, JobState, Preset, new_id, sibling_thumbnail,
+};
+use crate::core::player;
+use crate::core::runner::{self, ConvertEvent, ConvertFormat, Probe};
+use crate::core::store::Store;
+use crate::core::ytdlp::{Event, FormatMode, YtdlpOptions};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Route {
@@ -710,9 +716,9 @@ impl RustyDlp {
                 }
             }
             Event::Log(line) => {
-                if line == crate::runner::EXIT_OK {
+                if line == crate::core::runner::EXIT_OK {
                     ended = true;
-                } else if let Some(code) = line.strip_prefix(crate::runner::EXIT_FAIL_PREFIX) {
+                } else if let Some(code) = line.strip_prefix(crate::core::runner::EXIT_FAIL_PREFIX) {
                     let tail = self
                         .live
                         .get(job_id)
@@ -1932,7 +1938,16 @@ impl RustyDlp {
                         match event {
                             player::PlayerEvent::Frame(frame, pts) => {
                                 if let Some(p) = this.player.as_mut() {
-                                    p.frame = Some(frame);
+                                    // The decode threads hand over plain RGBA so
+                                    // that `core/` owns no renderer types; wrapping
+                                    // it for gpui is the UI layer's job.
+                                    if let Some(image) =
+                                        RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+                                    {
+                                        p.frame = Some(Arc::new(gpui::RenderImage::new(
+                                            SmallVec::from_elem(ImageFrame::new(image), 1),
+                                        )));
+                                    }
                                     // While the thumb is being dragged the
                                     // readout belongs to it, not to the run
                                     // still playing behind it.
@@ -2751,9 +2766,9 @@ impl RustyDlp {
                 live.speed = p.speed;
             }
             ConvertEvent::Log(line) => {
-                if line == crate::runner::EXIT_OK {
+                if line == crate::core::runner::EXIT_OK {
                     ended = true;
-                } else if let Some(code) = line.strip_prefix(crate::runner::EXIT_FAIL_PREFIX) {
+                } else if let Some(code) = line.strip_prefix(crate::core::runner::EXIT_FAIL_PREFIX) {
                     self.fail_job(job_id, format!("ffmpeg exited {code}"), cx);
                     ended = true;
                 }
@@ -2895,22 +2910,6 @@ fn cover(
     }
 }
 
-/// Finds the cover written by `--write-thumbnail` next to a media file.
-/// webp first: that is yt-dlp's native output and zed enables webp decoding,
-/// so no conversion is needed.
-pub fn sibling_thumbnail(media_path: &str) -> Option<String> {
-    let path = std::path::Path::new(media_path);
-    let stem = path.file_stem()?;
-    let dir = path.parent()?;
-    for ext in ["webp", "jpg", "png", "jpeg"] {
-        let candidate = dir.join(stem).with_extension(ext);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-    }
-    None
-}
-
 /// Single definition of "still working". The sidebar filter and the detail
 /// pane's Cancel button previously each had their own copy and had already
 /// drifted — one counted Probing, the other didn't.
@@ -2974,7 +2973,7 @@ mod tests {
     // recursion limit. Import explicitly.
     use super::{
         Job, JobKind, JobState, SidebarTab, filter_jobs, is_active, is_retryable,
-        sibling_thumbnail, state_after_failure,
+        state_after_failure,
     };
 
     fn job_in(state: JobState) -> Job {
@@ -3041,41 +3040,6 @@ mod tests {
         // TabBar could in principle hand back an out-of-range index.
         assert_eq!(SidebarTab::from_index(99), SidebarTab::Download);
         assert_eq!(SidebarTab::from_index(SidebarTab::InProgress.index()), SidebarTab::InProgress);
-    }
-
-    /// `after_move` reports only the video file, so the cover has to be located
-    /// by stem. webp must win: it is yt-dlp's native output.
-    #[test]
-    fn sibling_thumbnail_finds_the_cover_by_stem() {
-        let dir = std::env::temp_dir().join(crate::model::new_id("thumb-test"));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let video = dir.join("Some Video [abc123].mp4");
-        std::fs::write(&video, b"x").unwrap();
-        let video_s = video.to_string_lossy().to_string();
-
-        // No cover on disk yet.
-        assert_eq!(sibling_thumbnail(&video_s), None);
-
-        // A .jpg alone is found.
-        let jpg = dir.join("Some Video [abc123].jpg");
-        std::fs::write(&jpg, b"x").unwrap();
-        assert_eq!(sibling_thumbnail(&video_s), Some(jpg.to_string_lossy().to_string()));
-
-        // With both present, webp wins.
-        let webp = dir.join("Some Video [abc123].webp");
-        std::fs::write(&webp, b"x").unwrap();
-        assert_eq!(
-            sibling_thumbnail(&video_s),
-            Some(webp.to_string_lossy().to_string())
-        );
-
-        // A different video in the same folder must not borrow this cover.
-        let other = dir.join("Other.mp4");
-        std::fs::write(&other, b"x").unwrap();
-        assert_eq!(sibling_thumbnail(&other.to_string_lossy()), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cancelling kills the child, which makes yt-dlp exit non-zero, which the

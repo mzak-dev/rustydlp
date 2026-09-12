@@ -6,7 +6,7 @@
 //! cross to the UI thread over a futures channel, which a gpui background task
 //! awaits and forwards via cx.update().
 
-use crate::ytdlp::{Event, YtdlpOptions, download_args, parse_line, probe_args};
+use crate::core::ytdlp::{Event, YtdlpOptions, download_args, parse_line, probe_args};
 use anyhow::{Context, Result, anyhow};
 use futures::channel::{mpsc, oneshot};
 use serde::Deserialize;
@@ -614,11 +614,11 @@ mod tests {
     #[test]
     #[ignore = "requires network; downloads ~28 MB"]
     fn download_a_real_video_end_to_end() {
-        use crate::ytdlp::FormatMode;
+        use crate::core::ytdlp::FormatMode;
         use futures::StreamExt as _;
 
         let exe = ytdlp_path(None).expect("bundled yt-dlp");
-        let dir = std::env::temp_dir().join(crate::model::new_id("rustydlp-dl"));
+        let dir = std::env::temp_dir().join(crate::core::model::new_id("rustydlp-dl"));
         std::fs::create_dir_all(&dir).unwrap();
 
         let opts = YtdlpOptions {
@@ -662,7 +662,7 @@ mod tests {
         // --write-thumbnail must leave a cover the grid can find by stem.
         // after_move never reports it, so this is the only thing that proves
         // the flag is doing its job.
-        let cover = crate::app::sibling_thumbnail(&files[0]);
+        let cover = crate::core::model::sibling_thumbnail(&files[0]);
         assert!(
             cover.is_some(),
             "no sibling thumbnail beside {}; dir held: {:?}",

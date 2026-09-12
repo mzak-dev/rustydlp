@@ -1,4 +1,4 @@
-use crate::model::{File, FileKind, Item, Job, JobKind, JobState, Preset};
+use crate::core::model::{File, FileKind, Item, Job, JobKind, JobState, Preset};
 use anyhow::Result;
 use turso::{Builder, Connection, Value, params::params_from_iter};
 
@@ -402,7 +402,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::new_id;
+    use crate::core::model::new_id;
 
     fn sample_job() -> Job {
         let mut job = Job::new("https://example.com/playlist?list=abc", "1080p archive");

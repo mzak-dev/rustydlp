@@ -4,11 +4,7 @@
 
 mod app;
 mod assets;
-mod model;
-mod player;
-mod runner;
-mod store;
-mod ytdlp;
+mod core;
 
 use gpui::*;
 use gpui_component::{Root, Theme, ThemeMode};
