@@ -1,0 +1,251 @@
+name: Manual release
+
+# The normal path to a release is release-please: land Conventional Commits on
+# `main`, merge the standing "chore(main): release X.Y.Z" PR, and CI (rust.yml)
+# tags and publishes. This workflow is the escape hatch for when that path
+# doesn't fit — cutting a version out of band (a hotfix, a first `0.1.0`, an
+# `-rc` build), or re-running the build and upload after a release job failed.
+#
+# It does by hand exactly what release-please would have done: bump the version
+# in Cargo.toml *and* Cargo.lock, move `.release-please-manifest.json` to match
+# so the next automated release still bumps from the right baseline, commit,
+# tag, publish, and attach the Windows binary.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Exact version, without a leading "v" (e.g. 0.1.0, 1.2.3-rc.1). Leave empty to use the bump below.'
+        required: false
+        type: string
+      bump:
+        description: 'Used only when version is empty: bump the current Cargo.toml version by this much.'
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      prerelease:
+        description: 'Mark the GitHub release as a prerelease.'
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: 'Create the GitHub release as a draft (the tag and the version bump are still pushed).'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Resolve the version and print the plan. Pushes nothing, tags nothing, publishes nothing.'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Two manual releases at once would race on the same branch and tag namespace.
+concurrency:
+  group: manual-release
+  cancel-in-progress: false
+
+jobs:
+  # Resolves the version, writes the bump, and pushes the commit + tag. Nothing
+  # after this job runs unless the tag actually exists.
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      # Releases are cut from whatever branch the run was dispatched against —
+      # `main` from the Actions UI's default, a release branch if you pick one.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re, sys, tomllib
+
+          requested = os.environ["INPUT_VERSION"].strip()
+          # Semver, minus build metadata: a `+` is legal semver but Cargo tags
+          # and git tags both handle it badly, so it is rejected rather than
+          # half-supported.
+          semver = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$"
+          )
+
+          with open("Cargo.toml", "rb") as f:
+              current = tomllib.load(f)["package"]["version"]
+
+          if requested:
+              if requested.startswith("v"):
+                  sys.exit(f"::error::version must not start with 'v': {requested}")
+              if not semver.match(requested):
+                  sys.exit(f"::error::not a semver version: {requested}")
+              version = requested
+          else:
+              # Bumping off a prerelease drops the prerelease part, the same way
+              # `cargo set-version --bump` does: 1.2.3-rc.1 + patch is 1.2.4.
+              core = current.split("-", 1)[0].split("+", 1)[0]
+              major, minor, patch = (int(p) for p in core.split("."))
+              bump = os.environ["INPUT_BUMP"]
+              if bump == "major":
+                  major, minor, patch = major + 1, 0, 0
+              elif bump == "minor":
+                  minor, patch = minor + 1, 0
+              else:
+                  patch += 1
+              version = f"{major}.{minor}.{patch}"
+
+          print(f"version={version}")
+          print(f"tag=v{version}")
+          print(f"current={current}")
+          PY
+
+      - name: Refuse to reuse a tag
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG already exists — pick a different version"
+            exit 1
+          fi
+
+      # Cargo.toml, Cargo.lock and the release-please manifest are edited
+      # textually rather than via `cargo set-version`: the runner has no warm
+      # registry cache, so anything that makes cargo re-resolve costs a network
+      # round trip to change three strings. Keeping the manifest in step is the
+      # part that matters — it is what release-please reads as "the last
+      # release", so skipping it would make the next automated release bump from
+      # a stale baseline and try to cut a version that already exists.
+      - name: Write the version
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+
+          version = os.environ["VERSION"]
+
+          # Only the [package] version: the first `version = ` at the top level
+          # of Cargo.toml, before any dependency stanza sets one of its own.
+          toml = open("Cargo.toml", encoding="utf-8").read()
+          toml, n = re.subn(
+              r'(?m)\A(.*?^version = )"[^"]*"',
+              rf'\g<1>"{version}"',
+              toml,
+              count=1,
+              flags=re.S,
+          )
+          assert n == 1, "no [package] version found in Cargo.toml"
+          open("Cargo.toml", "w", encoding="utf-8").write(toml)
+
+          # The lockfile carries the workspace member's own version too, and a
+          # stale one makes every later `--locked` build fail.
+          lock = open("Cargo.lock", encoding="utf-8").read()
+          lock, n = re.subn(
+              r'(?m)^(\[\[package\]\]\nname = "rustydlp"\nversion = )"[^"]*"',
+              rf'\g<1>"{version}"',
+              lock,
+              count=1,
+          )
+          assert n == 1, "no rustydlp package entry found in Cargo.lock"
+          open("Cargo.lock", "w", encoding="utf-8").write(lock)
+
+          manifest_path = ".release-please-manifest.json"
+          manifest = json.load(open(manifest_path, encoding="utf-8"))
+          manifest["."] = version
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          PY
+          git --no-pager diff --stat
+
+      - name: Summarize the plan
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          CURRENT: ${{ steps.resolve.outputs.current }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| from | \`$CURRENT\` |"
+            echo "| to | \`$VERSION\` |"
+            echo "| tag | \`$TAG\` |"
+            echo "| branch | \`${{ github.ref_name }}\` |"
+            echo "| prerelease | \`${{ inputs.prerelease }}\` |"
+            echo "| draft | \`${{ inputs.draft }}\` |"
+            echo "| dry run | \`${{ inputs.dry_run }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Pushed with the default GITHUB_TOKEN, which cannot trigger new workflow
+      # runs from its own commits — so this bump does not kick off rust.yml's
+      # push job, and release-please will not race this release. It picks the
+      # new baseline up from the manifest on the next human push.
+      - name: Commit, tag and push
+        if: ${{ !inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Same subject shape release-please uses, and a `chore` so it cannot
+          # itself count towards the next version bump.
+          git commit -am "chore(main): release $VERSION"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "$TAG"
+
+  build:
+    needs: prepare
+    if: ${{ !inputs.dry_run }}
+    # Windows because that is what ships — same reasoning as CI's build job.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p rustydlp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustydlp-${{ needs.prepare.outputs.tag }}
+          path: target/release/rustydlp.exe
+
+  # Unlike the automated path, nothing has created a release for this tag yet,
+  # so this creates it and attaches the binary in one step.
+  publish:
+    needs: [prepare, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustydlp-${{ needs.prepare.outputs.tag }}
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release create "$TAG" rustydlp.exe \
+            --title "$TAG" \
+            --generate-notes \
+            ${{ inputs.prerelease && '--prerelease' || '' }} \
+            ${{ inputs.draft && '--draft' || '' }}
+          echo "Released $TAG: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
