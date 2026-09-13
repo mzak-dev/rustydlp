@@ -387,7 +387,7 @@ mod tests {
     fn a_new_frame_id_is_never_served_the_previous_frames_cached_pixels() {
         use crate::ui::element::{ImageSource, img};
 
-        let solid = |r: u8, g: u8, b: u8| Arc::new(vec![r, g, b, 255].repeat(4));
+        let solid = |r: u8, g: u8, b: u8| Arc::new([r, g, b, 255].repeat(4));
         let tree_for = |data: Arc<Vec<u8>>, id: u64| -> E {
             img(ImageSource::Rgba { width: 2, height: 2, data, id })
                 .w(px(20.))
