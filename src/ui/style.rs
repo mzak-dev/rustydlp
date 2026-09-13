@@ -436,6 +436,10 @@ pub trait Styled: Sized {
         self.style().inset.top = Some(v.0);
         self
     }
+    fn left(mut self, v: Pixels) -> Self {
+        self.style().inset.left = Some(v.0);
+        self
+    }
     fn right(mut self, v: Pixels) -> Self {
         self.style().inset.right = Some(v.0);
         self
