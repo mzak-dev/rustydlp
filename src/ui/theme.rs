@@ -28,6 +28,10 @@ pub struct Theme {
     pub list_hover: Rgba,
     pub progress_bar: Rgba,
     pub radius: Pixels,
+    /// A step above `background`/`sidebar` for panels that need to read as
+    /// raised (settings cards): the JSON has no such key, so this borrows
+    /// `NEUTRAL_900` from the same Tailwind scale rather than inventing a hex.
+    pub surface: Rgba,
 
     // -- widget tokens -----------------------------------------------------
     pub primary: Rgba,
@@ -79,6 +83,7 @@ pub const DARK: Theme = Theme {
     // legacy build before signing off parity.
     list_hover: rgb(0x1f1f1f),
     progress_bar: rgb(0xf5f5f5),
+    surface: palette::NEUTRAL_900,
     // UNCONFIRMED, as above. gpui-component's default radius.
     radius: px(4.),
 
