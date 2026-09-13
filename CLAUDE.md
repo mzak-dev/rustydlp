@@ -13,3 +13,7 @@ The five canonical triage roles, used verbatim as label strings. See `docs/agent
 ### Domain docs
 
 Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Commit messages
+
+Conventional Commits (Angular convention) — required, since `release-please` reads them to version and changelog releases. See `docs/agents/commit-conventions.md`.
