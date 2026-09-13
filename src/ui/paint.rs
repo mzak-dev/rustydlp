@@ -287,10 +287,14 @@ fn draw_image(
     canvas.clip_rect(rect_of(b), None, Some(true));
     let mut paint = Paint::default();
     paint.set_alpha_f(alpha);
-    canvas.draw_image_rect(
+    // The default sampling is nearest-neighbour, which turns a 1080p frame
+    // shrunk into the stage into jagged pixels. Linear + mipmaps filters the
+    // downscale properly; on D3D12 the mip chain is built on the GPU.
+    canvas.draw_image_rect_with_sampling_options(
         &image,
         None,
         dst,
+        skia_safe::SamplingOptions::new(skia_safe::FilterMode::Linear, skia_safe::MipmapMode::Linear),
         &paint,
     );
     canvas.restore_to_count(restore);

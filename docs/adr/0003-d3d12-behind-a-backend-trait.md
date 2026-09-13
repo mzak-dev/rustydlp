@@ -34,16 +34,13 @@ softbuffer presents the raster frame until D3D12 lands.
 - `render/raster.rs` needs no GPU, adapter or window, which is what makes the
   interface golden-testable on a plain CI runner. The existing workflow skips
   its only GPU test because *"it needs a real D3D12 adapter"*.
-- **`render/d3d.rs` is not implemented.** It is the one module that cannot be
-  compiled off Windows, so it has to be written there; its module docs carry the
-  full sequence (adapter walk stepping over WARP, device and queue, Skia's
-  `BackendContext`, swapchain) rather than leaving it to be rediscovered.
-- Until then the frame is rasterized on the CPU and presented with softbuffer.
-  That is correct but will not keep up with the player, which pushes 249 MB/s at
-  1080p30 — so D3D12 is a prerequisite for shipping, not a nice-to-have.
-- **Check before starting:** that a published skia-safe prebuilt covers
-  `x86_64-pc-windows-msvc` *with* the `d3d` feature. Archives are keyed on the
-  feature combo and a combo without one forces a full Skia source build.
+- **Update 2026-09-13:** `render/d3d.rs` is implemented (`cfg(windows)`) and
+  is what the shell uses. When no hardware adapter exists (WARP-only VMs,
+  remote sessions) it falls back to `render/soft.rs`: the CPU raster frame
+  presented with softbuffer, which is correct but will not keep up with the
+  player at 1080p.
+- A published skia-safe prebuilt does cover `x86_64-pc-windows-msvc` with the
+  `d3d` feature, so enabling it costs no Skia source build.
 - The workflow's comment that *"the crate is `cfg(windows)` top to bottom"* is
   false today — the only Windows-specific code is `CREATE_NO_WINDOW` — and the
   D3D12 backend is what will make it true.

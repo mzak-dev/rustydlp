@@ -6,8 +6,10 @@
 //! runner. `d3d` (the D3D12 backend the CI workflow already names) is the
 //! shipping one and can only be compiled on Windows.
 
+#[cfg(windows)]
 pub mod d3d;
 pub mod raster;
+pub mod soft;
 
 /// A surface to draw a frame into.
 pub trait Backend {
