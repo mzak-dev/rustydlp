@@ -668,8 +668,12 @@ impl RustyDlp {
         else {
             return;
         };
-        let state = if seek { &self.seek_slider } else { &self.volume_slider };
+        let state = if seek { &mut self.seek_slider } else { &mut self.volume_slider };
         let value = state.value_at(&track, x);
+        // The thumb follows the pointer for the whole drag. Nothing else sets
+        // it mid-drag: `sync_seek_slider` deliberately stands aside while
+        // scrubbing, and the volume slider has no sync at all.
+        state.set_value(value);
         if seek {
             if released {
                 self.seek_to_fraction(value);
