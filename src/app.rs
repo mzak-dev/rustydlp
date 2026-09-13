@@ -91,40 +91,34 @@ pub enum WindowAction {
     Close,
 }
 
-/// Which top-navbar mode is active, and therefore which jobs the sidebar
-/// list shows.
+/// Which top-navbar mode is active, and therefore what the main pane shows.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SidebarTab {
-    /// Download jobs, newest first.
-    Download,
-    /// Convert jobs, newest first.
-    Convert,
-    /// Jobs of either kind that are still working. Shown in the main pane,
-    /// not the sidebar — see `main_pane`.
+    /// Every finished download or conversion, newest first, as one flat
+    /// grid — see `library`.
+    Home,
+    /// Jobs of either kind that are still working.
     InProgress,
 }
 
 impl SidebarTab {
     fn index(self) -> usize {
         match self {
-            Self::Download => 0,
-            Self::Convert => 1,
-            Self::InProgress => 2,
+            Self::Home => 0,
+            Self::InProgress => 1,
         }
     }
 
     fn from_index(ix: usize) -> Self {
         match ix {
-            1 => Self::Convert,
-            2 => Self::InProgress,
-            _ => Self::Download,
+            1 => Self::InProgress,
+            _ => Self::Home,
         }
     }
 
     fn empty_message(self) -> &'static str {
         match self {
-            Self::Download => "No recent downloads",
-            Self::Convert => "No recent conversions",
+            Self::Home => "No downloads or conversions yet",
             Self::InProgress => "Nothing in progress",
         }
     }
@@ -183,9 +177,6 @@ pub struct RustyDlp {
     /// Preset currently open in the Settings editor.
     editing: Option<Preset>,
     form: PresetForm,
-    /// Manually toggled. Also forced true whenever `tab == InProgress`, since
-    /// that list moves into the main pane and the sidebar has nothing to show.
-    sidebar_collapsed: bool,
     player: Option<PlayerState>,
     /// Path currently being probed/spawned, if a load is in flight — set the
     /// instant `ensure_player` decides a (re)load is needed, cleared once
@@ -240,6 +231,22 @@ pub struct RustyDlp {
     /// on every redraw: `render()` has no window handle of its own to ask, and
     /// the maximize button's icon needs to know which state it would toggle to.
     window_maximized: bool,
+    /// Expands the library popover (see `library_popover`) to near-fullscreen.
+    /// Reset whenever the popover closes, so reopening a different item always
+    /// starts at the compact size.
+    detail_fullscreen: bool,
+    /// Muted, autoplay-looped preview for whichever grid tile the pointer has
+    /// rested on — a separate pipeline from `player`/`PlayerState` (the
+    /// detail popover's own, full-controls player) rather than a shared one,
+    /// since the two can be live at once (hovering a tile behind an already
+    /// open popover) and want different lifecycles.
+    hover_preview: Option<PreviewState>,
+    /// Item id a preview is debounced to start for, cleared once it lands in
+    /// `hover_preview` or the pointer leaves before it fires.
+    preview_pending: Option<String>,
+    /// Bumped on every hover change so a stale debounce timer or in-flight
+    /// load from a tile the pointer has already left can't install itself.
+    preview_gen: Arc<AtomicU64>,
 }
 
 /// Live native-playback state for whichever item is currently open in
@@ -261,6 +268,17 @@ struct PlayerState {
     /// True while the seek bar is being dragged, so arriving frame positions
     /// don't fight the thumb for the slider's value.
     scrubbing: bool,
+}
+
+/// Live native-playback state for a grid tile's hover preview: the same
+/// decode pipeline `PlayerState` wraps, but without the transport (position,
+/// duration, play/pause, scrubbing) a preview has no use for.
+struct PreviewState {
+    control: player::PlayerControl,
+    /// Which item this is previewing, so the tile whose hover it belongs to
+    /// (and only that one) paints it instead of its static thumbnail.
+    item_id: String,
+    frame: Option<Frame>,
 }
 
 /// Which text field has the keyboard.
@@ -485,7 +503,7 @@ impl RustyDlp {
             selected: None,
             open_item: None,
             route: Route::Library,
-            tab: SidebarTab::Download,
+            tab: SidebarTab::Home,
             modal: false,
             url_input,
             override_input,
@@ -500,7 +518,6 @@ impl RustyDlp {
             chosen_preset: None,
             editing: None,
             form,
-            sidebar_collapsed: false,
             player: None,
             player_pending: None,
             player_gen: Arc::new(AtomicU64::new(0)),
@@ -516,6 +533,10 @@ impl RustyDlp {
             anim: crate::ui::Animator::default(),
             pending_window_action: None,
             window_maximized: false,
+            detail_fullscreen: false,
+            hover_preview: None,
+            preview_pending: None,
+            preview_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1333,139 +1354,20 @@ impl RustyDlp {
 
     // -- rendering ---------------------------------------------------------
 
-    /// Jobs the current tab should list.
-    fn visible_jobs(&self) -> Vec<&Job> {
-        filter_jobs(&self.jobs, self.tab)
-    }
-
-    /// Whether the sidebar shows a job list right now, or just the icon
-    /// rail. In progress has nothing for the sidebar to show (its list lives
-    /// in the main pane, see `main_pane`), so it always collapses.
-    fn sidebar_is_collapsed(&self) -> bool {
-        self.sidebar_collapsed || self.tab == SidebarTab::InProgress
-    }
-
-    fn sidebar(&self) -> AnyElement {
-        let collapsed = self.sidebar_is_collapsed();
-
-        let content: AnyElement = if collapsed {
-            v_flex()
-                .w(px(56.))
-                .h_full()
-                .flex_shrink_0()
-                .items_center()
-                .bg(theme().sidebar)
-                .border_r_1()
-                .border_color(theme().sidebar_border)
-                .child(v_flex().flex_1())
-                .child(self.sidebar_actions(true))
-                .into_any_element()
-        } else {
-            let visible = self.visible_jobs();
-            let rows: Vec<AnyElement> = visible.iter().map(|job| self.job_row(job)).collect();
-            let is_empty = rows.is_empty();
-
-            v_flex()
-                .w(px(260.))
-                .h_full()
-                .flex_shrink_0()
-                .bg(theme().sidebar)
-                .border_r_1()
-                .border_color(theme().sidebar_border)
-                .child(
-                    v_flex()
-                        // .id() is required before .overflow_y_scroll(): the scroll
-                        // offset is retained state and needs identity across frames.
-                        .id("job-list")
-                        .flex_1()
-                        .min_h_0()
-                        .p_3()
-                        .gap_1()
-                        .overflow_y_scroll()
-                        .when(is_empty, |this| {
-                            this.child(
-                                div()
-                                    .px_2()
-                                    .text_sm()
-                                    .text_color(theme().sidebar_foreground.opacity(0.55))
-                                    .child(self.tab.empty_message()),
-                            )
-                        })
-                        .children(rows),
-                )
-                .child(self.sidebar_actions(false))
-                .into_any_element()
-        };
-
-        // Content is always laid out at its natural resting width (56 or
-        // 260) either way; only the clipping box around it is tweened, so
-        // the width change reads as sliding a peephole over fixed content
-        // rather than reflowing the content itself mid-transition.
-        let target = if collapsed { 56.0 } else { 260.0 };
-        let width = self.anim.tween_f32("sidebar-width", target);
-
-        div()
-            .h_full()
-            .flex_shrink_0()
-            .overflow_hidden()
-            .w(px(width))
-            .child(content)
-            .into_any_element()
-    }
-
-    /// The bottom action row, shared between the full sidebar and its
-    /// collapsed icon rail — `icon_only` drops the labels and shrinks the
-    /// buttons to fit the narrow rail. New download and Settings now live in
-    /// the navbar instead, so there's nothing to show here on the In Progress
-    /// tab (which has no Collapse button either).
-    fn sidebar_actions(&self, icon_only: bool) -> AnyElement {
-        if self.tab == SidebarTab::InProgress {
-            return div().into_any_element();
-        }
-        v_flex()
-            .p_3()
-            .gap_2()
-            .border_t_1()
-            .border_color(theme().sidebar_border)
-            .child(
-                Button::new("collapse-sidebar")
-                    .ghost()
-                    .when(!icon_only, |b| b.w_full())
-                    .icon(if icon_only { IconName::ChevronRight } else { IconName::ChevronLeft })
-                    .when(!icon_only, |b| b.label("Collapse"))
-                    .on_click(|this: &mut Self| {
-                        this.sidebar_collapsed = !this.sidebar_collapsed;
-                    }),
-            )
-            .into_any_element()
-    }
-
-    /// Full-width row above the sidebar+main split: wordmark pinned left,
-    /// Download/Convert/In progress tabs true-centered regardless of the
-    /// wordmark's width.
+    /// Full-width row above the main pane: wordmark pinned left, Home/In
+    /// Progress tabs true-centered regardless of the wordmark's width.
     fn navbar(&self) -> AnyElement {
         let tabs = TabBar::new("navbar-tabs")
             .segmented()
             .selected_index(self.tab.index())
-            .children([
-                Tab::new().label("Download"),
-                Tab::new().label("Convert"),
-                Tab::new().label("In Progress"),
-            ])
+            .children([Tab::new().label("Home"), Tab::new().label("In Progress")])
             // The handler gets `&mut Self` directly, so the entity round-trip
             // the gpui build needed here is gone.
             .on_click(|this: &mut Self, ix: usize| {
-                let tab = SidebarTab::from_index(ix);
-                // In progress has nothing to show in the (now narrow)
-                // sidebar — collapse it automatically so the main pane's
-                // in-progress list gets the room instead. Manually
-                // re-expanding is still available on the other tabs.
-                if tab == SidebarTab::InProgress {
-                    this.sidebar_collapsed = true;
-                }
-                this.tab = tab;
-                this.selected = None;
-                this.open_item = None;
+                this.tab = SidebarTab::from_index(ix);
+                // Switching tabs behind an open library popover would leave
+                // it pointing at a screen you've navigated away from.
+                this.close_popover();
             });
 
         h_flex()
@@ -1525,6 +1427,17 @@ impl RustyDlp {
                             }),
                     )
                     .child(
+                        // The Convert tab folded into Home, but converting a
+                        // local file that was never downloaded through this
+                        // app still needs an entry point somewhere.
+                        Button::new("convert-file")
+                            .ghost()
+                            .icon(IconName::Replace)
+                            .on_click(|this: &mut Self| {
+                                this.pick_file_to_convert();
+                            }),
+                    )
+                    .child(
                         Button::new("settings")
                             .ghost()
                             .selected(self.route == Route::Settings)
@@ -1535,6 +1448,7 @@ impl RustyDlp {
                                 } else {
                                     Route::Settings
                                 };
+                                this.close_popover();
                             }),
                     )
                     .child(self.window_controls()),
@@ -1715,64 +1629,26 @@ impl RustyDlp {
     }
 
     fn main_pane(&mut self) -> AnyElement {
-        // `key` buckets *which screen* is showing, not which job: switching
-        // sidebar tabs or entering/leaving detail view replays the entrance
-        // below, but clicking between jobs while already in detail view
-        // doesn't re-trigger it on every row click.
+        // `key` buckets *which screen* is showing: switching tabs replays the
+        // entrance below. Opening the library popover does not change it —
+        // the popover is a separate overlay (see `library_popover`), not a
+        // swap of what the main pane itself shows.
         let (key, content): (u64, AnyElement) = if self.route == Route::Settings {
-            self.ensure_player(None, None);
             (0, self.settings())
         } else {
-            // Cloned rather than borrowed: `detail` needs `&mut self` (to
-            // manage the player), which would conflict with holding a `&Job`
-            // borrowed out of `self.jobs` for the same call.
-            let job = self.selected.as_ref().and_then(|id| self.jobs.iter().find(|j| &j.id == id)).cloned();
-
-            match job {
-                None => {
-                    self.ensure_player(None, None);
-                    let content = match self.tab {
-                        SidebarTab::InProgress => self.in_progress_pane(),
-                        SidebarTab::Convert => self.convert_page(),
-                        SidebarTab::Download => self.empty_state(),
-                    };
-                    (1 + self.tab.index() as u64, content)
-                }
-                // A selected job always wins over the tab's own landing view
-                // — this is how clicking a row in the in-progress list
-                // (which lives here in the main pane, not the sidebar)
-                // drills into that job's detail/player view.
-                Some(job) => {
-                    // Job -> Item -> File: one item goes straight to detail, many show a grid.
-                    let content = match job.items.len() {
-                        0 => self.detail(&job, None),
-                        1 => {
-                            let item = job.items.first().cloned();
-                            self.detail(&job, item.as_ref())
-                        }
-                        _ => match self.open_item.clone() {
-                            Some(item_id) => {
-                                let item = job.items.iter().find(|i| i.id == item_id).cloned();
-                                self.detail(&job, item.as_ref())
-                            }
-                            None => {
-                                self.ensure_player(None, None);
-                                self.grid(&job)
-                            }
-                        },
-                    };
-                    (10, content)
-                }
+            match self.tab {
+                SidebarTab::Home => (1, self.library()),
+                SidebarTab::InProgress => (2, self.in_progress_pane()),
             }
         };
 
         // One-shot fade + bounce-slide entrance, replayed whenever `key`
         // changes. The inner box is absolutely positioned within the outer
         // one (which stays normally flexed, unanimated, so it keeps its slot
-        // in the sidebar+main row) rather than sliding the pane itself,
-        // because this layout engine only resolves an inset offset for an
-        // absolutely positioned box — the same trick `stage()` uses to
-        // overlay the player frame without disturbing its container's size.
+        // in the main row) rather than sliding the pane itself, because this
+        // layout engine only resolves an inset offset for an absolutely
+        // positioned box — the same trick `stage()` uses to overlay the
+        // player frame without disturbing its container's size.
         let progress = self.anim.entrance_progress("main-pane", key);
         let opacity = progress.clamp(0.0, 1.0);
         let eased = crate::ui::Animator::ease(progress);
@@ -1782,6 +1658,174 @@ impl RustyDlp {
             .flex_1()
             .min_h_0()
             .child(div().absolute().inset_0().opacity(opacity).top(px(offset)).child(content))
+            .into_any_element()
+    }
+
+    /// Every finished download or conversion, newest first, as one flat grid
+    /// — replaces the old sidebar job list, the Convert tab's own list, and
+    /// the per-job "Videos" grid a multi-item playlist used to drill into,
+    /// all three of which are now just tiles in the same library. Clicking a
+    /// tile opens `library_popover`, not a swap of this pane's own content.
+    fn library(&mut self) -> AnyElement {
+        let mut jobs = filter_jobs(&self.jobs, SidebarTab::Home);
+        jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
+
+        let mut tiles: Vec<AnyElement> = Vec::new();
+        for job in &jobs {
+            if job.items.is_empty() {
+                tiles.push(self.library_tile(job, None));
+            } else {
+                for item in &job.items {
+                    tiles.push(self.library_tile(job, Some(item)));
+                }
+            }
+        }
+        let is_empty = tiles.is_empty();
+
+        v_flex()
+            .id("library-scroll")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .p_5()
+            .gap_4()
+            .overflow_y_scroll()
+            .child(div().font_bold().child("Library"))
+            .when(is_empty, |this| {
+                this.child(
+                    v_flex()
+                        .flex_1()
+                        .min_h(px(280.))
+                        .items_center()
+                        .justify_center()
+                        .gap_5()
+                        .child(
+                            svg()
+                                .path("icons/empty-downloads.svg")
+                                .w(px(128.))
+                                .h(px(96.))
+                                .text_color(theme().muted_foreground.opacity(0.5)),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme().muted_foreground)
+                                .child(SidebarTab::Home.empty_message()),
+                        ),
+                )
+            })
+            .child(div().flex().flex_wrap().gap_3().children(tiles))
+            .into_any_element()
+    }
+
+    /// One library tile. `item` is `None` for a job that finished with
+    /// nothing to show per-item (a failed/cancelled download before any item
+    /// landed) — a convert job always has exactly one, per `finish_convert`.
+    fn library_tile(&self, job: &Job, item: Option<&Item>) -> AnyElement {
+        let key = item.map(|i| i.id.clone()).unwrap_or_else(|| job.id.clone());
+        let title = item
+            .map(|i| i.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| job.title.clone());
+        let thumb = item.and_then(|i| i.thumb_path.as_deref());
+        let duration = item.and_then(|i| i.duration);
+        let bytes: i64 = item.map(|i| i.files.iter().filter_map(|f| f.bytes).sum()).unwrap_or(0);
+        let playable = item.and_then(|i| {
+            i.files
+                .iter()
+                .find(|f| {
+                    matches!(f.kind, FileKind::Video | FileKind::Audio)
+                        && std::path::Path::new(&f.path).is_file()
+                })
+                .map(|f| f.path.clone())
+        });
+
+        let subtitle = match (duration, bytes > 0) {
+            (Some(d), true) => format!("{} \u{b7} {}", human_duration(d), human_bytes(bytes as f64)),
+            (Some(d), false) => human_duration(d),
+            (None, true) => human_bytes(bytes as f64),
+            (None, false) => String::new(),
+        };
+
+        let (chip_label, chip_danger) = job_status_chip(job);
+        let preview = self
+            .hover_preview
+            .as_ref()
+            .filter(|p| p.item_id == key)
+            .and_then(|p| p.frame.clone());
+
+        let job_id = job.id.clone();
+        let item_id = item.map(|i| i.id.clone());
+        let hover_key = key.clone();
+
+        v_flex()
+            .id(SharedString::from(format!("tile-{key}")))
+            .w(px(220.))
+            .gap_2()
+            .p_2()
+            .rounded(theme().radius)
+            .border_1()
+            .border_color(theme().border)
+            .hover(|this| this.bg(theme().list_hover))
+            .cursor_pointer()
+            .on_click(move |this: &mut Self| {
+                this.stop_hover_preview();
+                this.selected = Some(job_id.clone());
+                this.open_item = item_id.clone();
+                this.route = Route::Library;
+            })
+            .when_some(playable, |t, path| {
+                let enter_key = hover_key.clone();
+                let leave_key = hover_key.clone();
+                t.on_hover(move |this: &mut Self, entered| {
+                    if entered {
+                        this.schedule_hover_preview(enter_key.clone(), path.clone());
+                    } else {
+                        this.stop_hover_preview_for(&leave_key);
+                    }
+                })
+            })
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .child(match preview {
+                        Some(frame) => img(crate::ui::element::ImageSource::Rgba {
+                            width: frame.width,
+                            height: frame.height,
+                            data: frame.data,
+                            id: frame.pts.to_bits(),
+                        })
+                        .w_full()
+                        .h(px(112.))
+                        .rounded(theme().radius)
+                        .overflow_hidden()
+                        .object_fit(ObjectFit::Cover)
+                        .into_any_element(),
+                        None => cover(thumb, px(112.), px(48.)),
+                    })
+                    .when(!chip_label.is_empty(), |t| {
+                        t.child(
+                            div()
+                                .absolute()
+                                .top(px(6.))
+                                .left(px(6.))
+                                .text_xs()
+                                .px_1p5()
+                                .rounded(theme().radius)
+                                .bg(if chip_danger { theme().danger } else { black().opacity(0.6) })
+                                .text_color(if chip_danger {
+                                    theme().danger_foreground
+                                } else {
+                                    theme().foreground
+                                })
+                                .child(chip_label),
+                        )
+                    }),
+            )
+            .child(div().w_full().min_w_0().text_sm().truncate().child(title))
+            .when(!subtitle.is_empty(), |t| {
+                t.child(div().text_xs().text_color(theme().muted_foreground).child(subtitle))
+            })
             .into_any_element()
     }
 
@@ -1811,74 +1855,6 @@ impl RustyDlp {
                 )
             })
             .children(rows)
-            .into_any_element()
-    }
-
-    /// The Convert tab's landing view when nothing is selected: recent
-    /// conversions plus the "Convert File" action that makes conversion work
-    /// on any local file, not just something this app downloaded.
-    fn convert_page(&self) -> AnyElement {
-        let jobs = filter_jobs(&self.jobs, SidebarTab::Convert);
-        let is_empty = jobs.is_empty();
-        let rows: Vec<AnyElement> = jobs.iter().map(|job| self.job_row(job)).collect();
-
-        v_flex()
-            .id("convert-scroll")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .p_5()
-            .gap_3()
-            .overflow_y_scroll()
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
-                    .child(div().font_bold().child("Convert"))
-                    .child(
-                        Button::new("convert-file")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label("Convert File")
-                            .on_click(|this: &mut Self| {
-                                this.pick_file_to_convert();
-                            }),
-                    ),
-            )
-            .child(div().font_bold().text_sm().mt_2().child("Recent conversions"))
-            .when(is_empty, |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme().muted_foreground)
-                        .child(SidebarTab::Convert.empty_message()),
-                )
-            })
-            .children(rows)
-            .into_any_element()
-    }
-
-    fn empty_state(&self) -> AnyElement {
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .items_center()
-            .justify_center()
-            .gap_5()
-            .child(
-                svg()
-                    .path("icons/empty-downloads.svg")
-                    .w(px(128.))
-                    .h(px(96.))
-                    .text_color(theme().muted_foreground.opacity(0.5)),
-            )
-            .child(
-                div()
-                    .text_color(theme().muted_foreground)
-                    .child("No selected download, select or download new video"),
-            )
             .into_any_element()
     }
 
@@ -2337,59 +2313,6 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn grid(&self, job: &Job) -> AnyElement {
-        let cards: Vec<AnyElement> = job
-            .items
-            .iter()
-            .map(|item| {
-                let item_id = item.id.clone();
-                v_flex()
-                    .id(SharedString::from(item.id.clone()))
-                    .w(px(220.))
-                    .gap_2()
-                    .p_2()
-                    .rounded(theme().radius)
-                    .border_1()
-                    .border_color(theme().border)
-                    .hover(|this| this.bg(theme().list_hover))
-                    .cursor_pointer()
-                    .on_click(move |this: &mut Self| {
-                        this.open_item = Some(item_id.clone());
-                    })
-                    .child(cover(item.thumb_path.as_deref(), px(112.), px(48.)))
-                    .child(div().w_full().min_w_0().text_sm().truncate().child(item.title.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme().muted_foreground)
-                            .child(match item.duration {
-                                Some(d) => human_duration(d),
-                                None => format!("{} files", item.files.len()),
-                            }),
-                    )
-                    .into_any_element()
-            })
-            .collect();
-
-        v_flex()
-            .id("grid-scroll")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .p_5()
-            .gap_4()
-            .overflow_y_scroll()
-            .child(div().font_bold().child(job.title.clone()))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_3()
-                    .children(cards),
-            )
-            .into_any_element()
-    }
-
     // -- player --------------------------------------------------------------
 
     /// Starts/stops native playback so it always matches whatever file
@@ -2573,6 +2496,120 @@ impl RustyDlp {
                 }
             }
         });
+    }
+
+    // -- hover preview ---------------------------------------------------
+
+    /// Debounced so sweeping the pointer across a row of tiles doesn't spawn
+    /// an ffmpeg per tile passed over — only the one the pointer actually
+    /// settles on, after it's stayed there a moment.
+    fn schedule_hover_preview(&mut self, item_id: String, path: String) {
+        let generation = self.preview_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let counter = self.preview_gen.clone();
+        self.preview_pending = Some(item_id.clone());
+
+        self.updates.spawn(move |updates| {
+            std::thread::sleep(Duration::from_millis(350));
+            if counter.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            updates.send(move |this| {
+                if this.preview_gen.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                this.start_hover_preview(item_id, path);
+            });
+        });
+    }
+
+    /// A separate, minimal decode pipeline from `load_player`'s — a preview
+    /// has no transport (position, duration, play/pause), plays muted, and
+    /// never seeks — rather than reusing `PlayerState`/`ensure_player` and
+    /// parameterizing away all of that.
+    fn start_hover_preview(&mut self, item_id: String, path: String) {
+        let generation = self.preview_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        // Muted: this is ambient motion behind a thumbnail, not something the
+        // pointer resting there for a moment should make audible.
+        let rx = player::load(PathBuf::from(&path), 0.0, 0.0);
+
+        self.updates.spawn(move |updates| {
+            let loaded = pollster::block_on(rx);
+            let Ok(Ok((_info, control, mut events))) = loaded else {
+                return;
+            };
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let install_id = item_id.clone();
+            updates.send(move |this| {
+                if this.preview_gen.load(Ordering::SeqCst) != generation {
+                    control.stop();
+                    let _ = tx.send(false);
+                    return;
+                }
+                this.hover_preview =
+                    Some(PreviewState { control, item_id: install_id, frame: None });
+                this.preview_pending = None;
+                let _ = tx.send(true);
+            });
+            if !rx.recv().unwrap_or(false) {
+                return;
+            }
+
+            while let Some(mut event) = pollster::block_on(events.next()) {
+                // Same backlog-coalescing as `load_player`: only the newest
+                // queued frame matters for a preview.
+                while let player::PlayerEvent::Frame(..) = event {
+                    match events.try_recv() {
+                        Ok(newer) => event = newer,
+                        Err(_) => break,
+                    }
+                }
+                let (tx, rx) = std::sync::mpsc::channel();
+                updates.send(move |this| {
+                    if this.preview_gen.load(Ordering::SeqCst) != generation {
+                        let _ = tx.send(false);
+                        return;
+                    }
+                    if let player::PlayerEvent::Frame(frame, pts) = event
+                        && let Some(p) = this.hover_preview.as_mut()
+                    {
+                        p.frame = Some(Frame {
+                            width: frame.width,
+                            height: frame.height,
+                            data: Arc::new(frame.rgba),
+                            pts,
+                        });
+                    }
+                    // A preview that reaches the end just holds its last
+                    // frame — no loop, no controls to restart it, and a tile
+                    // isn't asking for more attention than a first glance.
+                    let _ = tx.send(true);
+                });
+                if !rx.recv().unwrap_or(false) {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn stop_hover_preview(&mut self) {
+        self.preview_pending = None;
+        self.preview_gen.fetch_add(1, Ordering::SeqCst);
+        if let Some(p) = self.hover_preview.take() {
+            p.control.stop();
+        }
+    }
+
+    /// Only stops the preview if it's still the one `key` started — a leave
+    /// event for a tile that's no longer the active preview (superseded by a
+    /// faster enter elsewhere before this one's debounce even fired) should
+    /// be a no-op, not a wrong stop.
+    fn stop_hover_preview_for(&mut self, key: &str) {
+        let is_pending = self.preview_pending.as_deref() == Some(key);
+        let is_active = self.hover_preview.as_ref().is_some_and(|p| p.item_id == key);
+        if is_pending || is_active {
+            self.stop_hover_preview();
+        }
     }
 
     fn toggle_play(&mut self) {
@@ -2834,7 +2871,6 @@ impl RustyDlp {
             .map(|i| i.title.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| job.title.clone());
-        let multi = job.items.len() > 1;
 
         let files: Vec<AnyElement> = item
             .map(|i| {
@@ -2916,17 +2952,6 @@ impl RustyDlp {
                     .h_full()
                     .p_5()
                     .gap_4()
-                    .when(multi, |this| {
-                        this.child(
-                            Button::new("back-to-grid")
-                                .ghost()
-                                .small()
-                                .label("← All videos")
-                                .on_click(|this: &mut Self| {
-                                    this.open_item = None;
-                                }),
-                        )
-                    })
                     .child(player_view)
                     .child(div().font_bold().child(title))
                     .child(
@@ -3075,6 +3100,116 @@ impl RustyDlp {
             )
             .child(div().w_full().min_w_0().text_xs().truncate().child(value.to_string()))
             .into_any_element()
+    }
+
+    /// Closes the library popover (if one is open) and stops whatever it was
+    /// playing. Called on an explicit close, and from anywhere navigation
+    /// makes the popover's target stale (switching tabs, opening Settings).
+    fn close_popover(&mut self) {
+        if self.selected.is_none() {
+            return;
+        }
+        self.selected = None;
+        self.open_item = None;
+        self.detail_fullscreen = false;
+        self.ensure_player(None, None);
+    }
+
+    /// The overlay a library tile or an In Progress row opens into: `detail`'s
+    /// content, framed as a card over a dimmed backdrop instead of replacing
+    /// the whole main pane, with its own close and fullscreen controls.
+    ///
+    /// The "morph" is a fade + grow-from-slightly-smaller on open (driven by
+    /// `entrance_progress`, replayed only when the open job/item actually
+    /// changes) plus a smooth resize on the fullscreen toggle (a retargetable
+    /// `tween_f32`, so toggling mid-animation reverses from wherever it
+    /// currently is rather than jumping) — not a literal position-to-position
+    /// FLIP transform, which this renderer's `StyleRefinement` has no scale
+    /// or transform field for.
+    fn library_popover(&mut self) -> Option<AnyElement> {
+        let job_id = self.selected.clone()?;
+        let job = self.jobs.iter().find(|j| j.id == job_id)?.clone();
+        let item = match &self.open_item {
+            Some(id) => job.items.iter().find(|i| &i.id == id).cloned(),
+            None => job.items.first().cloned(),
+        };
+
+        // Changes only when a *different* job/item opens, not on every
+        // re-render of the one already showing — that identity change is
+        // what tells `entrance_progress` to replay from zero.
+        let identity = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            job.id.hash(&mut h);
+            item.as_ref().map(|i| &i.id).hash(&mut h);
+            h.finish()
+        };
+        let progress = self.anim.entrance_progress("popover", identity);
+        let opacity = progress.clamp(0.0, 1.0);
+        let offset = 16.0 - 16.0 * crate::ui::Animator::ease(progress);
+
+        let fullscreen = self.detail_fullscreen;
+        let w = self.anim.tween_f32("popover-w", if fullscreen { 0.97 } else { 0.72 });
+        let h = self.anim.tween_f32("popover-h", if fullscreen { 0.95 } else { 0.8 });
+
+        let content = self.detail(&job, item.as_ref());
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(black().opacity(0.55))
+                .on_click(|this: &mut Self| this.close_popover())
+                .child(
+                    div()
+                        .relative()
+                        .w(relative(w))
+                        .h(relative(h))
+                        .top(px(offset))
+                        .opacity(opacity)
+                        .rounded(theme().radius)
+                        .border_1()
+                        .border_color(theme().border)
+                        .bg(theme().background)
+                        .overflow_hidden()
+                        // Swallows the click here instead of letting it fall
+                        // through to the backdrop's close handler — see
+                        // `dispatch_click`'s ancestor walk.
+                        .on_click(|_: &mut Self| {})
+                        .child(div().absolute().inset_0().child(content))
+                        .child(
+                            h_flex()
+                                .absolute()
+                                .top(px(8.))
+                                .right(px(8.))
+                                .gap_1()
+                                .child(
+                                    Button::new("popover-fullscreen")
+                                        .ghost()
+                                        .small()
+                                        .icon(if fullscreen {
+                                            IconName::Restore
+                                        } else {
+                                            IconName::Maximize
+                                        })
+                                        .on_click(|this: &mut Self| {
+                                            this.detail_fullscreen = !this.detail_fullscreen;
+                                        }),
+                                )
+                                .child(
+                                    Button::new("popover-close")
+                                        .ghost()
+                                        .small()
+                                        .icon(IconName::Close)
+                                        .on_click(|this: &mut Self| this.close_popover()),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn modal(&self) -> AnyElement {
@@ -3630,19 +3765,29 @@ fn state_after_failure(current: JobState) -> JobState {
     }
 }
 
-/// Download/Convert list jobs of their own kind, newest first. In progress
-/// lists jobs of either kind that are still doing work — it's the only tab
-/// that mixes kinds, which is why it renders in the main pane instead of a
-/// per-kind sidebar list. Free function so it is testable without
-/// constructing a Window.
+/// Home lists every job (either kind) that has finished one way or another;
+/// In Progress lists whatever is still doing work. Free function so it is
+/// testable without constructing a Window.
 fn filter_jobs(jobs: &[Job], tab: SidebarTab) -> Vec<&Job> {
     jobs.iter()
         .filter(|j| match tab {
-            SidebarTab::Download => j.kind == JobKind::Download,
-            SidebarTab::Convert => j.kind == JobKind::Convert,
+            SidebarTab::Home => !is_active(j.state),
             SidebarTab::InProgress => is_active(j.state),
         })
         .collect()
+}
+
+/// The small badge a library tile shows over its thumbnail: what happened to
+/// this job, in the one word there's room for.
+fn job_status_chip(job: &Job) -> (&'static str, bool) {
+    match job.state {
+        JobState::Failed => ("Failed", true),
+        JobState::Cancelled => ("Cancelled", true),
+        _ => match job.kind {
+            JobKind::Convert => ("Converted", false),
+            JobKind::Download => ("Downloaded", false),
+        },
+    }
 }
 
 fn file_name(path: &str) -> String {
@@ -3668,8 +3813,16 @@ impl RustyDlp {
     /// and the caller is the event loop, which lays the tree out and paints it.
     pub fn render(&mut self) -> AnyElement {
         let navbar = self.navbar();
-        let sidebar = self.sidebar();
         let main = self.main_pane();
+        // `library_popover` calls `detail`, which starts/stops playback to
+        // match whatever's open; with no popover open there's nothing to
+        // drive that, so this is the one place that has to say "stop"
+        // explicitly, covering every path that closes it (the close button,
+        // switching tabs, opening Settings) in one spot.
+        let popover = self.library_popover();
+        if popover.is_none() {
+            self.ensure_player(None, None);
+        }
         let modal = if self.modal { Some(self.modal()) } else { None };
         let convert_modal = self
             .convert_picker
@@ -3682,12 +3835,8 @@ impl RustyDlp {
             .size_full()
             .bg(theme().background)
             .text_color(theme().foreground)
-            .child(
-                v_flex()
-                    .size_full()
-                    .child(navbar)
-                    .child(h_flex().flex_1().min_h_0().child(sidebar).child(main)),
-            )
+            .child(v_flex().size_full().child(navbar).child(main))
+            .children(popover)
             .children(modal)
             .children(convert_modal)
             .children(toast)
@@ -3865,7 +4014,7 @@ mod tests {
     /// because an empty list is what a fresh install shows.
     #[test]
     fn every_route_and_tab_renders() {
-        for tab in [SidebarTab::Download, SidebarTab::Convert, SidebarTab::InProgress] {
+        for tab in [SidebarTab::Home, SidebarTab::InProgress] {
             for jobs in [vec![], vec![download_job("A", JobState::Running)]] {
                 let (mut app, mut painter) = fixture();
                 app.tab = tab;
@@ -3939,21 +4088,20 @@ mod tests {
     }
 
     #[test]
-    fn download_and_convert_tabs_list_only_their_own_kind() {
+    fn home_lists_finished_jobs_of_either_kind() {
         let jobs = vec![
             job_in(JobState::Done),
             job_in(JobState::Running),
             convert_job_in(JobState::Done),
             convert_job_in(JobState::Running),
+            job_in(JobState::Failed),
         ];
 
-        let downloads = filter_jobs(&jobs, SidebarTab::Download);
-        assert_eq!(downloads.len(), 2);
-        assert!(downloads.iter().all(|j| j.kind == JobKind::Download));
-
-        let converts = filter_jobs(&jobs, SidebarTab::Convert);
-        assert_eq!(converts.len(), 2);
-        assert!(converts.iter().all(|j| j.kind == JobKind::Convert));
+        let home = filter_jobs(&jobs, SidebarTab::Home);
+        assert_eq!(home.len(), 3, "both kinds, but only what's no longer active");
+        assert!(home.iter().any(|j| j.kind == JobKind::Download));
+        assert!(home.iter().any(|j| j.kind == JobKind::Convert));
+        assert!(!home.iter().any(|j| is_active(j.state)));
     }
 
     #[test]
@@ -3983,12 +4131,11 @@ mod tests {
     }
 
     #[test]
-    fn tab_index_round_trips_and_defaults_to_download() {
-        assert_eq!(SidebarTab::from_index(0), SidebarTab::Download);
-        assert_eq!(SidebarTab::from_index(1), SidebarTab::Convert);
-        assert_eq!(SidebarTab::from_index(2), SidebarTab::InProgress);
+    fn tab_index_round_trips_and_defaults_to_home() {
+        assert_eq!(SidebarTab::from_index(0), SidebarTab::Home);
+        assert_eq!(SidebarTab::from_index(1), SidebarTab::InProgress);
         // TabBar could in principle hand back an out-of-range index.
-        assert_eq!(SidebarTab::from_index(99), SidebarTab::Download);
+        assert_eq!(SidebarTab::from_index(99), SidebarTab::Home);
         assert_eq!(SidebarTab::from_index(SidebarTab::InProgress.index()), SidebarTab::InProgress);
     }
 
@@ -4047,8 +4194,7 @@ mod tests {
 
     #[test]
     fn empty_message_differs_per_tab() {
-        assert_eq!(SidebarTab::Download.empty_message(), "No recent downloads");
-        assert_eq!(SidebarTab::Convert.empty_message(), "No recent conversions");
+        assert_eq!(SidebarTab::Home.empty_message(), "No downloads or conversions yet");
         assert_eq!(SidebarTab::InProgress.empty_message(), "Nothing in progress");
     }
 

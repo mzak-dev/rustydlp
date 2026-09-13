@@ -24,7 +24,8 @@ use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 use crate::app::{RustyDlp, SliderKind, Update, Updates, WindowAction};
 use crate::render::Backend;
 use crate::render::soft::SoftBackend;
-use crate::ui::event::{dispatch_click, scroll_target, wants_pointer_cursor};
+use crate::ui::element::SharedString;
+use crate::ui::event::{dispatch_click, dispatch_hover, hovered_id, scroll_target, wants_pointer_cursor};
 use crate::ui::layout::{ScrollState, layout};
 use crate::ui::paint::{Painter, paint};
 use crate::ui::text::Shaper;
@@ -94,6 +95,9 @@ pub struct Shell {
     /// When the last frame started, so the playback timer counts from there
     /// rather than from after a vsync-blocked present.
     last_redraw: std::time::Instant,
+    /// The id of the box a hover handler last fired "entered" for, so a move
+    /// that leaves it can fire "left" — see `crate::ui::event::dispatch_hover`.
+    hovered: Option<SharedString>,
 }
 
 impl Shell {
@@ -120,8 +124,10 @@ impl Shell {
             dirty: true,
             size: (w, h),
             last_redraw: std::time::Instant::now(),
+            hovered: None,
         }
     }
+
 
     /// Applies everything workers have posted since the last frame.
     fn drain_updates(&mut self) {
@@ -155,6 +161,22 @@ impl Shell {
             &mut self.painter.shaper,
             &self.scroll,
         );
+
+        // Resolved against this frame's own box list rather than a bespoke
+        // extra render+layout pass on every pointer move — an earlier version
+        // of this did exactly that (in `CursorMoved`/`CursorLeft`), which
+        // meant every mouse move cost a full second tree build and text-shape
+        // pass on top of the one below, on a CPU-only raster pipeline that
+        // was already the bottleneck. A transition picked up here instead
+        // lands in `self.app` one frame late (this frame still paints the old
+        // state), which is imperceptible — it's the same lag `drain_updates`
+        // already has relative to whatever a worker just posted.
+        let current = self.pointer.and_then(|(x, y)| hovered_id(&boxes, x, y));
+        if current != self.hovered {
+            self.hovered = dispatch_hover(&boxes, &self.hovered, current, &mut self.app);
+            self.dirty = true;
+        }
+
         paint(backend.canvas(), &boxes, &mut self.painter, self.pointer);
         window.pre_present_notify();
         backend.present();
@@ -387,8 +409,10 @@ impl ApplicationHandler for Shell {
                     };
                     window.set_cursor(cursor);
                 }
-                // Hover styling is resolved at paint time from the pointer, so a
-                // move always needs a frame.
+                // Hover *styling* is resolved at paint time from the pointer
+                // and always needs a frame regardless; hover *handlers* (see
+                // `redraw`) are resolved there too now, off the same box list,
+                // rather than a second render+layout pass here on every move.
                 self.dirty = true;
             }
             WindowEvent::CursorLeft { .. } => {

@@ -44,6 +44,12 @@ impl std::fmt::Display for SharedString {
 /// shape `cx.listener(|this, ..| ..)` gave it.
 pub type ClickHandler<S> = Box<dyn Fn(&mut S)>;
 
+/// A hover-enter/leave handler: `true` when the pointer enters the box,
+/// `false` when it leaves. Requires `.id()` (see `Div::on_hover`), since the
+/// shell tracks *which* box is hovered by that id across frames — the tree is
+/// rebuilt every frame, so there is no stable box index to compare against.
+pub type HoverHandler<S> = Box<dyn Fn(&mut S, bool)>;
+
 /// What a box paints inside itself, beyond its own background and border.
 pub enum Content<S> {
     Children(Vec<Element<S>>),
@@ -88,6 +94,7 @@ pub struct Div<S> {
     pub(crate) id: Option<SharedString>,
     pub(crate) content: Content<S>,
     pub(crate) on_click: Option<ClickHandler<S>>,
+    pub(crate) on_hover: Option<HoverHandler<S>>,
 }
 
 pub fn div<S>() -> Div<S> {
@@ -97,6 +104,7 @@ pub fn div<S>() -> Div<S> {
         id: None,
         content: Content::Children(Vec::new()),
         on_click: None,
+        on_hover: None,
     }
 }
 
@@ -182,6 +190,15 @@ impl<S> Div<S> {
         self
     }
 
+    /// Runs `handler(state, true)` the frame the pointer enters this box (or
+    /// the nearest ancestor of the hit box that has one, same ancestor-walk
+    /// `on_click` gets), and `handler(state, false)` the frame it leaves.
+    /// Needs `.id()` — see `HoverHandler`.
+    pub fn on_hover(mut self, handler: impl Fn(&mut S, bool) + 'static) -> Self {
+        self.on_hover = Some(Box::new(handler));
+        self
+    }
+
     pub fn content(&self) -> &Content<S> {
         &self.content
     }
@@ -192,6 +209,10 @@ impl<S> Div<S> {
 
     pub fn click_handler(&self) -> Option<&ClickHandler<S>> {
         self.on_click.as_ref()
+    }
+
+    pub fn hover_handler(&self) -> Option<&HoverHandler<S>> {
+        self.on_hover.as_ref()
     }
 
     pub fn element_id(&self) -> Option<&SharedString> {
