@@ -41,8 +41,8 @@ resvg = { version = "0.45", default-features = false }
 # run-closure: resumed creates the surface, window_event handles input,
 # user_event drains the update queue, about_to_wait asks for the next frame.
 winit = "0.30"
-# Presents the CPU-rasterized frame. render/d3d.rs is the intended backend and
-# slots in behind the same render::Backend trait; see docs/adr/0003.
+# Fallback presenter for the CPU-rasterized frame (render/soft.rs), used only
+# when render/d3d.rs finds no hardware adapter; see docs/adr/0003.
 softbuffer = "0.4"
 
 # -- core/ ------------------------------------------------------------------
@@ -79,6 +79,16 @@ cpal = "0.15"
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
 clipboard-win = "5"
+# The D3D12 backend (render/d3d.rs). `windows` pinned to the version skia-safe's
+# `d3d` feature uses, so the COM interfaces we hand it are the same types.
+skia-safe = { version = "0.87", features = ["d3d"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 # Embeds the .exe's icon (build.rs). Windows-only for the same reason as the
 # two above: there is no icon resource to embed on a platform this app

@@ -207,7 +207,7 @@ impl Shaper {
         let chars: Vec<char> = text.chars().collect();
         let (mut lo, mut hi) = (0usize, chars.len());
         while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
+            let mid = lo + (hi - lo).div_ceil(2);
             let candidate: String = chars[..mid].iter().collect::<String>() + ELLIPSIS;
             if self.shape(&candidate, font_size, line_height, bold, None).width <= max_width {
                 lo = mid;

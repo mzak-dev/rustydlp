@@ -26,6 +26,10 @@ impl RasterBackend {
         }
     }
 
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// RGBA8 unpremultiplied, row-major — byte order stated explicitly rather
     /// than relying on what N32 happens to be on this platform.
     pub fn read_rgba(&mut self) -> Vec<u8> {

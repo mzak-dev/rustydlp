@@ -10,7 +10,6 @@
 //! from a worker, or live playback has actually changed something.
 
 use std::cell::RefCell;
-use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -24,7 +23,7 @@ use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::app::{RustyDlp, SliderKind, Update, Updates, WindowAction};
 use crate::render::Backend;
-use crate::render::raster::RasterBackend;
+use crate::render::soft::SoftBackend;
 use crate::ui::element::SharedString;
 use crate::ui::event::{dispatch_click, dispatch_hover, hovered_id, scroll_target, wants_pointer_cursor};
 use crate::ui::layout::{ScrollState, layout};
@@ -80,9 +79,10 @@ pub struct Shell {
     app: RustyDlp,
     painter: Painter,
     scroll: ScrollState,
-    backend: RasterBackend,
+    /// D3D12 when a hardware adapter is available, CPU + softbuffer otherwise.
+    /// Created with the window in `resumed`.
+    backend: Option<Box<dyn Backend>>,
     window: Option<Arc<Window>>,
-    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     updates: futures_channel::mpsc::UnboundedReceiver<Update>,
     fonts: Rc<RefCell<FontSystem>>,
     pointer: Option<(f32, f32)>,
@@ -92,6 +92,9 @@ pub struct Shell {
     dragging: Option<SliderKind>,
     dirty: bool,
     size: (u32, u32),
+    /// When the last frame started, so the playback timer counts from there
+    /// rather than from after a vsync-blocked present.
+    last_redraw: std::time::Instant,
     /// The id of the box a hover handler last fired "entered" for, so a move
     /// that leaves it can fire "left" — see `crate::ui::event::dispatch_hover`.
     hovered: Option<SharedString>,
@@ -111,9 +114,8 @@ impl Shell {
             app: RustyDlp::new(fonts.clone(), updates),
             painter,
             scroll: ScrollState::default(),
-            backend: RasterBackend::new(w, h),
+            backend: None,
             window: None,
-            surface: None,
             updates: rx,
             fonts,
             pointer: None,
@@ -121,6 +123,7 @@ impl Shell {
             dragging: None,
             dirty: true,
             size: (w, h),
+            last_redraw: std::time::Instant::now(),
             hovered: None,
         }
     }
@@ -141,14 +144,16 @@ impl Shell {
         if w == 0 || h == 0 {
             return;
         }
+        self.last_redraw = std::time::Instant::now();
         // The window can be un/maximized by a title-bar double-click, a
         // Windows snap shortcut, or our own restore button -- polling it here
         // rather than reacting to a specific request is what catches all
         // three with one code path.
-        if let Some(window) = &self.window {
-            self.app.set_window_maximized(window.is_maximized());
-        }
-        self.backend.begin_frame(w, h, theme().background);
+        let (Some(window), Some(backend)) = (self.window.as_ref(), self.backend.as_mut()) else {
+            return;
+        };
+        self.app.set_window_maximized(window.is_maximized());
+        backend.begin_frame(w, h, theme().background);
         let tree = self.app.render();
         let boxes = layout(
             &tree,
@@ -172,27 +177,9 @@ impl Shell {
             self.dirty = true;
         }
 
-        paint(
-            self.backend.canvas(),
-            &boxes,
-            &mut self.painter,
-            self.pointer,
-        );
-
-        if let (Some(surface), Some(window)) = (self.surface.as_mut(), self.window.as_ref()) {
-            let rgba = self.backend.read_rgba();
-            if let (Some(nw), Some(nh)) = (NonZeroU32::new(w), NonZeroU32::new(h))
-                && surface.resize(nw, nh).is_ok()
-                && let Ok(mut buffer) = surface.buffer_mut()
-            {
-                // softbuffer wants 0RGB in a u32 per pixel.
-                for (dst, px) in buffer.iter_mut().zip(rgba.chunks_exact(4)) {
-                    *dst = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
-                }
-                let _ = buffer.present();
-            }
-            window.pre_present_notify();
-        }
+        paint(backend.canvas(), &boxes, &mut self.painter, self.pointer);
+        window.pre_present_notify();
+        backend.present();
         self.dirty = false;
     }
 
@@ -312,6 +299,22 @@ impl Shell {
     }
 }
 
+/// D3D12 first; the CPU path when there is no hardware adapter (or off Windows).
+fn make_backend(window: &Arc<Window>) -> Option<Box<dyn Backend>> {
+    #[cfg(windows)]
+    match crate::render::d3d::D3dBackend::new(window) {
+        Ok(backend) => return Some(Box::new(backend)),
+        Err(e) => eprintln!("rustydlp: D3D12 unavailable, rendering on the CPU: {e:#}"),
+    }
+    match SoftBackend::new(window.clone()) {
+        Ok(backend) => Some(Box::new(backend)),
+        Err(e) => {
+            eprintln!("rustydlp: no way to present frames: {e:#}");
+            None
+        }
+    }
+}
+
 /// The seek bar reports continuously but only *acts* on release: each seek
 /// re-spawns two ffmpeg processes, so doing that per mouse-move would thrash.
 fn drag_is_seek(drag: SliderKind) -> bool {
@@ -364,11 +367,7 @@ impl ApplicationHandler for Shell {
             return;
         };
         let window = Arc::new(window);
-        if let Ok(context) = softbuffer::Context::new(window.clone())
-            && let Ok(surface) = softbuffer::Surface::new(&context, window.clone())
-        {
-            self.surface = Some(surface);
-        }
+        self.backend = make_backend(&window);
         let size = window.inner_size();
         self.size = (size.width.max(1), size.height.max(1));
         self.window = Some(window);
@@ -502,7 +501,12 @@ impl ApplicationHandler for Shell {
         // Otherwise the loop sleeps until the next event -- the app is a
         // static picture between them, exactly as it was under gpui.
         if self.app.is_playing() || self.app.is_animating() {
-            event_loop.set_control_flow(ControlFlow::wait_duration(PLAYBACK_FRAME_INTERVAL));
+            // WaitUntil, not wait_duration: D3D12's present already blocked
+            // for vsync, and waiting a further 16ms on top of that halved the
+            // refresh rate and beat against the video's own frame rate.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                self.last_redraw + PLAYBACK_FRAME_INTERVAL,
+            ));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }

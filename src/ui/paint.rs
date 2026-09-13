@@ -287,10 +287,14 @@ fn draw_image(
     canvas.clip_rect(rect_of(b), None, Some(true));
     let mut paint = Paint::default();
     paint.set_alpha_f(alpha);
-    canvas.draw_image_rect(
+    // The default sampling is nearest-neighbour, which turns a 1080p frame
+    // shrunk into the stage into jagged pixels. Linear + mipmaps filters the
+    // downscale properly; on D3D12 the mip chain is built on the GPU.
+    canvas.draw_image_rect_with_sampling_options(
         &image,
         None,
         dst,
+        skia_safe::SamplingOptions::new(skia_safe::FilterMode::Linear, skia_safe::MipmapMode::Linear),
         &paint,
     );
     canvas.restore_to_count(restore);
@@ -383,7 +387,7 @@ mod tests {
     fn a_new_frame_id_is_never_served_the_previous_frames_cached_pixels() {
         use crate::ui::element::{ImageSource, img};
 
-        let solid = |r: u8, g: u8, b: u8| Arc::new(vec![r, g, b, 255].repeat(4));
+        let solid = |r: u8, g: u8, b: u8| Arc::new([r, g, b, 255].repeat(4));
         let tree_for = |data: Arc<Vec<u8>>, id: u64| -> E {
             img(ImageSource::Rgba { width: 2, height: 2, data, id })
                 .w(px(20.))
