@@ -45,3 +45,17 @@ since release-please reads the commit log, not PR titles. A branch's
 intermediate commits matter less if the PR is squash-merged, but write them
 as Conventional Commits anyway so `git log` stays readable and so nothing is
 lost if the PR is merged with "Create a merge commit" instead.
+
+## When the automated release doesn't fit
+
+`.github/workflows/release.yml` ("Manual release") is the escape hatch: run it
+from the Actions tab with an exact `version` (or a `patch`/`minor`/`major`
+bump), optionally as a prerelease, a draft, or a `dry_run` that only prints the
+plan. It bumps `Cargo.toml`, `Cargo.lock` and `.release-please-manifest.json`
+together — the manifest is what release-please reads as "the last release", so a
+manual release leaves the automated path bumping from the right baseline rather
+than trying to re-cut a version that already exists.
+
+Reach for it for a hotfix, a first `0.1.0`, an `-rc` build, or to redo a release
+whose build or upload failed. Everything else should still go through
+Conventional Commits on `main`.
