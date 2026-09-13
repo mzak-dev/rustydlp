@@ -247,6 +247,55 @@ pub fn load(
 /// stream, or the machine has no working output device.
 const AUDIO_START_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// Caps how large a frame ffmpeg decodes and pipes over, independent of the
+/// source's native resolution. An uncapped `-pix_fmt rgba` pipe at 1080p
+/// moves ~250MB/s at 30fps through ffmpeg's own scaler, the OS pipe, and this
+/// process's copies of it — and almost none of those pixels are still
+/// visible once `ObjectFit::Contain`/`Cover` fits the frame into the
+/// player's on-screen box, which is rarely anywhere near 1920px wide. 1280
+/// is generous enough that upscaling it to fill a normal window still looks
+/// sharp, while cutting the pixel count (and so the pipe/memory traffic) for
+/// anything shot at 1080p or above to a third or less. This is the actual
+/// cost this app was paying — not the choice of RGBA over YUV as the pipe's
+/// pixel format, which only changes how many bytes each of those pixels
+/// takes, not how many of them there are.
+const MAX_DECODE_WIDTH: u32 = 1280;
+
+/// The dimensions to ask ffmpeg to scale to before piping, keeping aspect
+/// ratio. Computed here rather than left to ffmpeg's own `scale` expression
+/// language so this thread's frame-buffer size can never disagree with what
+/// ffmpeg actually writes to the pipe.
+fn scaled_dims(width: u32, height: u32) -> (u32, u32) {
+    if width == 0 || width <= MAX_DECODE_WIDTH {
+        return (width, height);
+    }
+    let out_h = ((height as u64 * MAX_DECODE_WIDTH as u64) / width as u64) as u32;
+    // Rounded down to even: some pixel formats reject an odd dimension, and
+    // matching that here (rather than only in the filter string) keeps the
+    // number this thread sizes its buffer with identical to ffmpeg's actual
+    // output regardless of pixel format.
+    (MAX_DECODE_WIDTH, out_h - (out_h % 2))
+}
+
+/// An `len`-byte buffer whose contents are unspecified until the next
+/// `read_exact_or_eof` fills it — skips the zero-fill `vec![0u8; len]` would
+/// do, which is 8MB of wasted memory bandwidth per 1080p-class frame for
+/// bytes that are about to be overwritten anyway.
+///
+/// SAFETY: `u8` has no invalid bit pattern, so leaving the buffer
+/// uninitialized is sound as long as nothing reads it before it's written —
+/// true here: `read_exact_or_eof`'s only callers either get a fully
+/// overwritten buffer back (every byte read before use) or discard it
+/// unread on a short read.
+fn uninit_buf(len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(len);
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        buf.set_len(len);
+    }
+    buf
+}
+
 fn spawn_player(
     ffmpeg: &Path,
     source: &Path,
@@ -258,6 +307,7 @@ fn spawn_player(
     let paused = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
     let volume = Volume::new(volume);
+    let (out_width, out_height) = scaled_dims(info.width, info.height);
 
     // Audio goes first so its start gate exists before the video thread that
     // waits on it. Both ffmpegs get the same -ss, so they decode the same
@@ -297,7 +347,7 @@ fn spawn_player(
             "-pix_fmt",
             "rgba",
             "-vf",
-            &format!("fps={}", info.fps),
+            &format!("scale={out_width}:{out_height},fps={}", info.fps),
             "pipe:1",
         ])
         .stdin(Stdio::null())
@@ -318,12 +368,12 @@ fn spawn_player(
         let video_child = Arc::clone(&video_child);
         let paused = Arc::clone(&paused);
         let frame_interval = Duration::from_secs_f64(1.0 / info.fps.max(1.0));
-        let width = info.width;
-        let height = info.height;
+        let width = out_width;
+        let height = out_height;
         std::thread::spawn(move || {
             let mut reader = stdout;
             let frame_len = (width as usize) * (height as usize) * 4;
-            let mut buf = vec![0u8; frame_len];
+            let mut buf = uninit_buf(frame_len);
             // Don't start the presentation clock until sound is actually
             // coming out, otherwise the video runs ahead by however long
             // ffmpeg + the audio device took to spin up.
@@ -353,13 +403,13 @@ fn spawn_player(
                     break;
                 }
                 // Hand the filled buffer over and take a fresh one. Cloning
-                // it instead would copy width*height*4 bytes per frame — 8MB
-                // at 1080p, 249MB/s at 30fps — for no benefit, since the
-                // reader overwrites every byte on the next pass anyway.
+                // it instead would copy width*height*4 bytes per frame, and
+                // the reader overwrites every byte of the replacement on the
+                // next pass anyway (see `uninit_buf`).
                 let frame = VideoFrame {
                     width,
                     height,
-                    rgba: std::mem::replace(&mut buf, vec![0u8; frame_len]),
+                    rgba: std::mem::replace(&mut buf, uninit_buf(frame_len)),
                 };
                 // Actual elapsed time, not `n / fps`. Those agree as long as
                 // decode keeps up with real time, but the moment
@@ -640,7 +690,7 @@ mod tests {
     // (This module used to import gpui, whose re-exported `test` attribute
     // macro shadowed the built-in one and made a glob unsafe; it no longer
     // does -- see the note in app.rs, which still has that problem.)
-    use super::{parse_fraction, parse_probe};
+    use super::{parse_fraction, parse_probe, scaled_dims};
 
     /// ffprobe reports frame rate as a fraction, and NTSC rates are the whole
     /// reason: 30000/1001 is not 30.
@@ -665,6 +715,26 @@ mod tests {
         .unwrap();
         assert_eq!((info.width, info.height), (1920, 1080));
         assert_eq!(info.fps, 30.0);
+    }
+
+    /// A source at or under the cap decodes at its native size — the whole
+    /// point is only ever to shrink, never to upscale.
+    #[test]
+    fn scaled_dims_leaves_a_small_source_alone() {
+        assert_eq!(scaled_dims(640, 360), (640, 360));
+        assert_eq!(scaled_dims(1280, 720), (1280, 720));
+    }
+
+    /// A source over the cap is scaled down to it, keeping aspect ratio, with
+    /// the height rounded to even — this thread's own buffer size has to
+    /// match whatever ffmpeg's `scale` filter actually produces exactly, or
+    /// the raw-frame pipe desyncs.
+    #[test]
+    fn scaled_dims_caps_width_and_keeps_aspect_ratio() {
+        let (w, h) = scaled_dims(1920, 1080);
+        assert_eq!(w, 1280);
+        assert_eq!(h % 2, 0, "height must be even");
+        assert!((h as f64 - 720.0).abs() < 2.0, "16:9 stays 16:9: got {h}");
     }
 
     /// The seek bar is drawn against this, so which duration wins matters:
