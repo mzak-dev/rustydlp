@@ -1411,63 +1411,28 @@ impl RustyDlp {
 
     /// The bottom action row, shared between the full sidebar and its
     /// collapsed icon rail — `icon_only` drops the labels and shrinks the
-    /// buttons to fit the narrow rail.
+    /// buttons to fit the narrow rail. New download and Settings now live in
+    /// the navbar instead, so there's nothing to show here on the In Progress
+    /// tab (which has no Collapse button either).
     fn sidebar_actions(&self, icon_only: bool) -> AnyElement {
+        if self.tab == SidebarTab::InProgress {
+            return div().into_any_element();
+        }
         v_flex()
             .p_3()
             .gap_2()
             .border_t_1()
             .border_color(theme().sidebar_border)
             .child(
-                Button::new("new-download")
-                    .primary()
-                    .when(!icon_only, |b| b.w_full())
-                    .icon(IconName::Plus)
-                    .when(!icon_only, |b| b.label("New download"))
-                    .on_click(|this: &mut Self| {
-                        this.modal = true;
-                        this.probe = ProbeState::Idle;
-                        // Re-probe here so installing yt-dlp while the app is
-                        // open takes effect without a restart.
-                        this.refresh_ytdlp();
-                        // Overrides are per-download; never carry one
-                        // silently into the next job.
-                        let fonts = this.fonts.clone();
-                        let mut fonts = fonts.borrow_mut();
-                        this.override_input.set_value(&mut fonts, "");
-                        this.url_input.set_focused(true);
-                    }),
-            )
-            .child(
-                Button::new("settings")
+                Button::new("collapse-sidebar")
                     .ghost()
                     .when(!icon_only, |b| b.w_full())
-                    .icon(IconName::Settings)
-                    .when(!icon_only, |b| b.label("Settings"))
+                    .icon(if icon_only { IconName::ChevronRight } else { IconName::ChevronLeft })
+                    .when(!icon_only, |b| b.label("Collapse"))
                     .on_click(|this: &mut Self| {
-                        this.route = if this.route == Route::Settings {
-                            Route::Library
-                        } else {
-                            Route::Settings
-                        };
+                        this.sidebar_collapsed = !this.sidebar_collapsed;
                     }),
             )
-            .when(self.tab != SidebarTab::InProgress, |this| {
-                this.child(
-                    Button::new("collapse-sidebar")
-                        .ghost()
-                        .when(!icon_only, |b| b.w_full())
-                        .icon(if icon_only {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronLeft
-                        })
-                        .when(!icon_only, |b| b.label("Collapse"))
-                        .on_click(|this: &mut Self| {
-                            this.sidebar_collapsed = !this.sidebar_collapsed;
-                        }),
-                )
-            })
             .into_any_element()
     }
 
@@ -1536,6 +1501,38 @@ impl RustyDlp {
                     .flex()
                     .items_center()
                     .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("new-download")
+                            .primary()
+                            .icon(IconName::Plus)
+                            .on_click(|this: &mut Self| {
+                                this.modal = true;
+                                this.probe = ProbeState::Idle;
+                                // Re-probe here so installing yt-dlp while the
+                                // app is open takes effect without a restart.
+                                this.refresh_ytdlp();
+                                // Overrides are per-download; never carry one
+                                // silently into the next job.
+                                let fonts = this.fonts.clone();
+                                let mut fonts = fonts.borrow_mut();
+                                this.override_input.set_value(&mut fonts, "");
+                                this.url_input.set_focused(true);
+                            }),
+                    )
+                    .child(
+                        Button::new("settings")
+                            .ghost()
+                            .selected(self.route == Route::Settings)
+                            .icon(IconName::Settings)
+                            .on_click(|this: &mut Self| {
+                                this.route = if this.route == Route::Settings {
+                                    Route::Library
+                                } else {
+                                    Route::Settings
+                                };
+                            }),
+                    )
                     .child(self.window_controls()),
             )
             .into_any_element()
@@ -1904,10 +1901,11 @@ impl RustyDlp {
                 h_flex()
                     .id(SharedString::from(format!("preset-{}", p.name)))
                     .w_full()
-                    .justify_between()
                     .items_center()
-                    .px_2()
-                    .py_1p5()
+                    .gap_2()
+                    .pl(4.0)
+                    .pr(8.0)
+                    .py_2()
                     .rounded(theme().radius)
                     .when(active, |t| t.bg(theme().sidebar_accent))
                     .hover(|t| t.bg(theme().list_hover))
@@ -1915,27 +1913,85 @@ impl RustyDlp {
                     .on_click(move |this: &mut Self| {
                         this.edit_preset(preset.clone());
                     })
-                    .child(div().flex_1().min_w_0().text_sm().truncate().child(p.name.clone()))
-                    .when(p.is_default, |t| {
-                        t.child(
-                            div()
-                                .text_xs()
-                                .px_1p5()
-                                .rounded(theme().radius)
-                                .bg(theme().muted)
-                                .text_color(theme().muted_foreground)
-                                .child("Default"),
-                        )
-                    })
+                    // Selection rail rather than a full-row highlight alone, so the
+                    // active preset stays legible even against the hover state.
+                    .child(
+                        div()
+                            .w(px(3.))
+                            .h(px(28.))
+                            .rounded_full()
+                            .when(active, |t| t.bg(theme().primary)),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .truncate()
+                                            .child(p.name.clone()),
+                                    )
+                                    .when(p.is_default, |t| {
+                                        t.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .px_1p5()
+                                                .rounded_full()
+                                                .bg(theme().accent)
+                                                .text_color(theme().accent_foreground)
+                                                .child("Default"),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(theme().muted_foreground)
+                                    .child(preset_summary(&p.options)),
+                            ),
+                    )
                     .into_any_element()
             })
             .collect();
 
         let editor: AnyElement = match &self.editing {
-            None => div()
-                .text_sm()
-                .text_color(theme().muted_foreground)
-                .child("Select a preset to edit, or create a new one.")
+            None => v_flex()
+                .flex_1()
+                .min_w_0()
+                .min_h(px(280.))
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(
+                    svg()
+                        .path(IconName::Settings.path())
+                        .w(px(40.))
+                        .h(px(40.))
+                        .text_color(theme().muted_foreground.opacity(0.4)),
+                )
+                .child(
+                    v_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().text_sm().child("No preset selected")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme().muted_foreground)
+                        .child("Choose a preset on the left, or create a new one."),
+                )
                 .into_any_element(),
             Some(editing) => {
                 let o = &editing.options;
@@ -1944,105 +2000,170 @@ impl RustyDlp {
                 let is_best = matches!(o.format, FormatMode::BestVideoAudio);
                 let is_default = editing.is_default;
 
-                v_flex()
-                    .gap_3()
-                    .child(self.field("Name", Focus::Name, &self.form.name))
+                // Source selector: a recessed track (page-level `background`,
+                // darker than this card's own `surface`) reads as a single
+                // control with one active segment, instead of three competing
+                // buttons — the segmented-control shape that "pick one of
+                // these formats" actually calls for.
+                let source_control = v_flex()
+                    .gap_1()
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme().muted_foreground)
-                                    .child("Format"),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("fmt-best")
-                                            .small()
-                                            .selected(is_best)
-                                            .label("Video + audio")
-                                            .on_click(|this: &mut Self| {
-                                                if let Some(e) = this.editing.as_mut() {
-                                                    e.options.format = FormatMode::BestVideoAudio;
-                                                }
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("fmt-audio")
-                                            .small()
-                                            .selected(is_audio)
-                                            .label("Audio only")
-                                            .on_click(|this: &mut Self| {
-                                                if let Some(e) = this.editing.as_mut() {
-                                                    e.options.format = FormatMode::AudioOnly {
-                                                        codec: "mp3".into(),
-                                                    };
-                                                }
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("fmt-custom")
-                                            .small()
-                                            .selected(is_custom)
-                                            .label("Custom -f")
-                                            .on_click(|this: &mut Self| {
-                                                if let Some(e) = this.editing.as_mut() {
-                                                    e.options.format =
-                                                        FormatMode::Custom("bv*+ba/b".into());
-                                                }
-                                            }),
-                                    ),
-                            ),
-                    )
-                    .when(is_audio, |t| {
-                        t.child(self.field("Audio codec", Focus::Codec, &self.form.codec))
-                    })
-                    .when(is_custom, |t| {
-                        t.child(self.field("Format selector", Focus::CustomFmt, &self.form.custom_fmt))
-                    })
-                    .when(is_best, |t| {
-                        t.child(self.field("Max height", Focus::MaxHeight, &self.form.max_height))
-                            .child(self.field("Container", Focus::Container, &self.form.container))
-                    })
-                    .child(self.field("Output template", Focus::Output, &self.form.output))
-                    .child(self.field("Download folder", Focus::Dir, &self.form.dir))
-                    .child(self.field("Subtitle languages", Focus::Subs, &self.form.subs))
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(toggle(
-                                "sw-thumb",
-                                "Embed thumbnail",
-                                o.embed_thumbnail,
-                                |o| &mut o.embed_thumbnail,
-                            ))
-                            .child(toggle(
-                                "sw-meta",
-                                "Embed metadata",
-                                o.embed_metadata,
-                                |o| &mut o.embed_metadata,
-                            ))
-                            .child(toggle("sw-subs", "Embed subtitles", o.embed_subs, |o| {
-                                &mut o.embed_subs
-                            }))
-                            .child(toggle(
-                                "sw-archive",
-                                "Skip already-downloaded (archive)",
-                                o.download_archive,
-                                |o| &mut o.download_archive,
-                            )),
-                    )
-                    .child(
-                        // The escape hatch that makes "all yt-dlp options" true.
-                        self.field("Additional arguments", Focus::Extra, &self.form.extra),
+                        div()
+                            .text_xs()
+                            .text_color(theme().muted_foreground)
+                            .child("Source"),
                     )
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap_1()
+                            .p(4.0)
+                            .rounded(theme().radius)
+                            .bg(theme().background)
+                            .border_1()
+                            .border_color(theme().border)
+                            .child(
+                                Button::new("fmt-best")
+                                    .ghost()
+                                    .small()
+                                    .flex_1()
+                                    .selected(is_best)
+                                    .label("Video + audio")
+                                    .on_click(|this: &mut Self| {
+                                        if let Some(e) = this.editing.as_mut() {
+                                            e.options.format = FormatMode::BestVideoAudio;
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("fmt-audio")
+                                    .ghost()
+                                    .small()
+                                    .flex_1()
+                                    .selected(is_audio)
+                                    .label("Audio only")
+                                    .on_click(|this: &mut Self| {
+                                        if let Some(e) = this.editing.as_mut() {
+                                            e.options.format = FormatMode::AudioOnly {
+                                                codec: "mp3".into(),
+                                            };
+                                        }
+                                    }),
+                            )
+                            .child(
+                                Button::new("fmt-custom")
+                                    .ghost()
+                                    .small()
+                                    .flex_1()
+                                    .selected(is_custom)
+                                    .label("Custom -f")
+                                    .on_click(|this: &mut Self| {
+                                        if let Some(e) = this.editing.as_mut() {
+                                            e.options.format =
+                                                FormatMode::Custom("bv*+ba/b".into());
+                                        }
+                                    }),
+                            ),
+                    )
+                    .into_any_element();
+
+                // Fields that share a row when the editor is wide enough, and
+                // wrap to their own line when it isn't — a grid rather than
+                // one long single-file column.
+                let mut format_fields = vec![
+                    field_row(vec![grid_item(240., self.field("Name", Focus::Name, &self.form.name))]),
+                    field_row(vec![grid_item(280., source_control)]),
+                ];
+                if is_audio {
+                    format_fields.push(field_row(vec![grid_item(
+                        180.,
+                        self.field("Audio codec", Focus::Codec, &self.form.codec),
+                    )]));
+                }
+                if is_custom {
+                    format_fields.push(field_row(vec![grid_item(
+                        280.,
+                        self.field("Format selector", Focus::CustomFmt, &self.form.custom_fmt),
+                    )]));
+                }
+                if is_best {
+                    format_fields.push(field_row(vec![
+                        grid_item(140., self.field("Max height", Focus::MaxHeight, &self.form.max_height)),
+                        grid_item(140., self.field("Container", Focus::Container, &self.form.container)),
+                    ]));
+                }
+
+                v_flex()
+                    .gap_4()
+                    .child(settings_section("Format", format_fields))
+                    .child(settings_section(
+                        "Output",
+                        vec![
+                            field_row(vec![grid_item(
+                                280.,
+                                self.field("Output template", Focus::Output, &self.form.output),
+                            )]),
+                            field_row(vec![
+                                grid_item(220., self.field("Download folder", Focus::Dir, &self.form.dir)),
+                                grid_item(
+                                    160.,
+                                    self.field("Subtitle languages", Focus::Subs, &self.form.subs),
+                                ),
+                            ]),
+                        ],
+                    ))
+                    .child(settings_section(
+                        "Post-processing",
+                        vec![field_row(vec![
+                            grid_item(
+                                220.,
+                                toggle(
+                                    "sw-thumb",
+                                    "Embed thumbnail",
+                                    o.embed_thumbnail,
+                                    |o| &mut o.embed_thumbnail,
+                                ),
+                            ),
+                            grid_item(
+                                220.,
+                                toggle(
+                                    "sw-meta",
+                                    "Embed metadata",
+                                    o.embed_metadata,
+                                    |o| &mut o.embed_metadata,
+                                ),
+                            ),
+                            grid_item(
+                                220.,
+                                toggle("sw-subs", "Embed subtitles", o.embed_subs, |o| {
+                                    &mut o.embed_subs
+                                }),
+                            ),
+                            grid_item(
+                                220.,
+                                toggle(
+                                    "sw-archive",
+                                    "Skip already-downloaded (archive)",
+                                    o.download_archive,
+                                    |o| &mut o.download_archive,
+                                ),
+                            ),
+                        ])],
+                    ))
+                    .child(settings_section(
+                        "Advanced",
+                        vec![
+                            // The escape hatch that makes "all yt-dlp options" true.
+                            self.field("Additional arguments", Focus::Extra, &self.form.extra),
+                        ],
+                    ))
+                    .child(
+                        h_flex()
                             .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .pt_3()
+                            .border_t_1()
+                            .border_color(theme().border)
                             .child(
                                 Switch::new("sw-default")
                                     .checked(is_default)
@@ -2052,91 +2173,72 @@ impl RustyDlp {
                                             e.is_default = checked;
                                         }
                                     }),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                Button::new("preset-save")
-                                    .primary()
-                                    .label("Save preset")
-                                    .on_click(|this: &mut Self| {
-                                        this.save_editing();
-                                    }),
                             )
                             .child(
-                                Button::new("preset-delete")
-                                    .danger()
-                                    .label("Delete")
-                                    .on_click(|this: &mut Self| {
-                                        this.delete_editing();
-                                    }),
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("preset-delete")
+                                            .ghost()
+                                            .text_color(theme().danger)
+                                            .label("Delete")
+                                            .on_click(|this: &mut Self| {
+                                                this.delete_editing();
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("preset-save")
+                                            .primary()
+                                            .label("Save preset")
+                                            .on_click(|this: &mut Self| {
+                                                this.save_editing();
+                                            }),
+                                    ),
                             ),
                     )
                     .into_any_element()
             }
         };
 
-        h_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .child(
-                v_flex()
-                    .w(px(260.))
-                    .flex_shrink_0()
-                    .h_full()
-                    .p_4()
-                    .gap_2()
-                    .border_r_1()
-                    .border_color(theme().border)
-                    .child(div().font_bold().text_sm().child("Presets"))
-                    .child(v_flex().gap_1().children(preset_rows))
-                    .child(
-                        Button::new("preset-new")
-                            .w_full()
-                            .icon(IconName::Plus)
-                            .label("New preset")
-                            .on_click(|this: &mut Self| {
-                                let preset = Preset {
-                                    name: "New preset".into(),
-                                    is_default: false,
-                                    options: default_options(),
-                                };
-                                this.edit_preset(preset);
-                            }),
-                    )
-                    .child(div().flex_1())
+        // General: app-level behavior, not tied to any one preset. Full width
+        // and first, since it's the one section every user hits regardless of
+        // how many presets they keep.
+        let general = settings_section(
+            "General",
+            vec![
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .flex_wrap()
                     .child(
                         v_flex()
-                            .gap_1()
-                            .pt_3()
-                            .border_t_1()
-                            .border_color(theme().border)
-                            .child(div().font_bold().text_sm().child("Application"))
+                            .gap_0p5()
+                            .min_w_0()
+                            .flex_1()
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(theme().muted_foreground)
-                                    .child(format!(
-                                        "yt-dlp: {}",
-                                        self.ytdlp
-                                            .as_ref()
-                                            .map(|p| p.display().to_string())
-                                            .unwrap_or_else(|| "not found".into())
-                                    )),
+                                    .child("yt-dlp"),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme().muted_foreground)
-                                    .child("Downloads start staggered; no concurrency cap."),
-                            )
+                            .child(div().text_sm().truncate().child(
+                                self.ytdlp
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "Not found".into()),
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_2()
                             .child(
                                 Button::new("recheck-bin")
+                                    .ghost()
                                     .small()
-                                    .w_full()
+                                    .border_1()
+                                    .border_color(theme().border)
                                     .label("Re-check binaries")
                                     .on_click(|this: &mut Self| {
                                         this.refresh_ytdlp();
@@ -2144,35 +2246,90 @@ impl RustyDlp {
                             )
                             .child(
                                 Button::new("update-ytdlp")
+                                    .ghost()
                                     .small()
-                                    .w_full()
+                                    .border_1()
+                                    .border_color(theme().border)
                                     .label("Update yt-dlp")
                                     .on_click(|this: &mut Self| {
                                         this.update_ytdlp();
                                     }),
-                            )
-                            .when_some(self.update_status.clone(), |t, msg| {
-                                t.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme().muted_foreground)
-                                        .child(msg),
-                                )
-                            }),
-                    ),
-            )
+                            ),
+                    )
+                    .into_any_element(),
+                div()
+                    .text_xs()
+                    .text_color(theme().muted_foreground)
+                    .child(
+                        self.update_status.clone().unwrap_or_else(|| {
+                            "Downloads start staggered; no concurrency cap.".into()
+                        }),
+                    )
+                    .into_any_element(),
+                settings_row("Minimize to tray on close", coming_soon_badge()),
+                settings_row("Theme", coming_soon_badge()),
+            ],
+        );
+
+        // Presets: a narrow picker beside the editor for whichever one is
+        // selected, so switching preset and tweaking it happen side by side
+        // instead of losing your place navigating between two pages.
+        let presets = settings_section(
+            "Presets",
+            vec![
+                h_flex()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .w(px(220.))
+                            .flex_shrink_0()
+                            .gap_0p5()
+                            .child(v_flex().gap_0p5().children(preset_rows))
+                            .child(
+                                Button::new("preset-new")
+                                    .ghost()
+                                    .w_full()
+                                    .mt_2()
+                                    .border_1()
+                                    .border_color(theme().border)
+                                    .icon(IconName::Plus)
+                                    .label("New preset")
+                                    .on_click(|this: &mut Self| {
+                                        let preset = Preset {
+                                            name: "New preset".into(),
+                                            is_default: false,
+                                            options: default_options(),
+                                        };
+                                        this.edit_preset(preset);
+                                    }),
+                            ),
+                    )
+                    .child(editor)
+                    .into_any_element(),
+            ],
+        );
+
+        v_flex()
+            .id("settings-scroll")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .p_5()
+            .gap_5()
+            .overflow_y_scroll()
             .child(
                 v_flex()
-                    .id("settings-scroll")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .p_5()
-                    .gap_4()
-                    .overflow_y_scroll()
-                    .child(div().font_bold().child("Settings"))
-                    .child(editor),
+                    .gap_0p5()
+                    .child(div().text_size(px(20.), px(28.)).font_bold().child("Settings"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme().muted_foreground)
+                            .child("App behavior, and presets for how yt-dlp fetches and saves a download."),
+                    ),
             )
+            .child(general)
+            .child(presets)
             .into_any_element()
     }
 
@@ -3319,6 +3476,75 @@ fn toggle(
             }
         })
         .into_any_element()
+}
+
+/// A raised card grouping related preset fields, so the editor reads as
+/// distinct sections (what to fetch, where it goes, what happens after)
+/// instead of one long flat list of inputs.
+fn settings_section(title: &str, children: Vec<AnyElement>) -> AnyElement {
+    v_flex()
+        .gap_3()
+        .p_4()
+        .rounded(theme().radius)
+        .bg(theme().surface)
+        .border_1()
+        .border_color(theme().border)
+        .child(div().text_sm().font_bold().child(title.to_string()))
+        .children(children)
+        .into_any_element()
+}
+
+/// Lets a field claim `min_w` before it's forced to wrap onto its own line,
+/// so `field_row` reads as a real grid rather than evenly-split columns that
+/// crush a long path or format string.
+fn grid_item(min_w: f32, el: AnyElement) -> AnyElement {
+    div().flex_1().min_w(px(min_w)).child(el).into_any_element()
+}
+
+/// A row of fields that sit side by side when the editor is wide enough and
+/// stack when it isn't, instead of every field taking the full card width
+/// regardless of how short its value is.
+fn field_row(items: Vec<AnyElement>) -> AnyElement {
+    h_flex().flex_wrap().gap_3().children(items).into_any_element()
+}
+
+/// A label-plus-control row for a general setting, e.g. pairing "Theme" with
+/// its (possibly not-yet-real) control.
+fn settings_row(label: &str, control: AnyElement) -> AnyElement {
+    h_flex()
+        .items_center()
+        .justify_between()
+        .child(div().text_sm().child(label.to_string()))
+        .child(control)
+        .into_any_element()
+}
+
+/// Marks a setting that's laid out but not wired up yet, rather than faking a
+/// toggle that looks live but does nothing when clicked.
+fn coming_soon_badge() -> AnyElement {
+    div()
+        .text_xs()
+        .px_1p5()
+        .rounded_full()
+        .bg(theme().muted)
+        .text_color(theme().muted_foreground)
+        .child("Coming soon")
+        .into_any_element()
+}
+
+/// One-line gist of what a preset actually does, shown under its name in the
+/// sidebar so picking the right preset doesn't require opening each one.
+fn preset_summary(o: &YtdlpOptions) -> String {
+    match &o.format {
+        FormatMode::BestVideoAudio => match (o.max_height, &o.container) {
+            (Some(h), Some(c)) => format!("Up to {h}p \u{b7} {c}"),
+            (Some(h), None) => format!("Up to {h}p"),
+            (None, Some(c)) => format!("Best quality \u{b7} {c}"),
+            (None, None) => "Best video + audio".into(),
+        },
+        FormatMode::AudioOnly { codec } => format!("Audio only \u{b7} {}", codec.to_uppercase()),
+        FormatMode::Custom(_) => "Custom format selector".into(),
+    }
 }
 
 /// Cover art box: the real thumbnail when one exists on disk, otherwise the
