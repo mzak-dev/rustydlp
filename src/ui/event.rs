@@ -4,6 +4,7 @@
 //! except `ScrollState`, which lives in `layout` because layout is what consumes
 //! it.
 
+use super::element::SharedString;
 use super::layout::{Box_, inherited_clip};
 
 /// Whether the box is under the pointer and not clipped away from it.
@@ -44,6 +45,60 @@ pub fn dispatch_click<S>(boxes: &[Box_<'_, S>], x: f32, y: f32, state: &mut S) -
     false
 }
 
+/// The id of the box a hover handler should fire for at this pointer
+/// position: the nearest ancestor of the hit box (inclusive) that has one,
+/// same ancestor-walk `dispatch_click` uses. `None` off any hoverable box, or
+/// when the pointer is outside the window (`x`/`y` not resolvable — callers
+/// pass `None` through instead of calling this).
+pub fn hovered_id<S>(boxes: &[Box_<'_, S>], x: f32, y: f32) -> Option<SharedString> {
+    let hit = hit_test(boxes, x, y)?;
+    let mut index = Some(hit);
+    while let Some(i) = index {
+        if let Some(node) = boxes[i].node
+            && node.hover_handler().is_some()
+        {
+            return node.element_id().cloned();
+        }
+        index = boxes[i].parent;
+    }
+    None
+}
+
+/// Fires the enter/leave transition implied by `current` vs `previous` (the
+/// last id `hovered_id` returned) against *this* frame's box list, and
+/// returns `current` for the caller to keep as the new `previous`.
+///
+/// Looking the handler up by id in the box list handed in — not by holding
+/// onto the box/closure from a previous frame — matters because the element
+/// tree (closures included) is rebuilt fresh every render; a stale reference
+/// into last frame's tree would be a dangling one by the time this runs.
+pub fn dispatch_hover<S>(
+    boxes: &[Box_<'_, S>],
+    previous: &Option<SharedString>,
+    current: Option<SharedString>,
+    state: &mut S,
+) -> Option<SharedString> {
+    if *previous == current {
+        return current;
+    }
+    let mut fire = |id: &SharedString, entered: bool| {
+        if let Some(node) = boxes
+            .iter()
+            .find_map(|b| b.node.filter(|n| n.element_id() == Some(id)))
+            && let Some(handler) = node.hover_handler()
+        {
+            handler(state, entered);
+        }
+    };
+    if let Some(old) = previous {
+        fire(old, false);
+    }
+    if let Some(new) = &current {
+        fire(new, true);
+    }
+    current
+}
+
 /// The scroll region a wheel event belongs to: the innermost scrollable box
 /// under the pointer, with how far it can scroll.
 pub fn scroll_target<S>(boxes: &[Box_<'_, S>], x: f32, y: f32) -> Option<(String, f32)> {
@@ -80,7 +135,7 @@ pub fn wants_pointer_cursor<S>(boxes: &[Box_<'_, S>], x: f32, y: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::element::{Element, div, v_flex};
+    use crate::ui::element::{Element, div, h_flex, v_flex};
     use crate::ui::layout::{FixedMetrics, ScrollState, layout};
     use crate::ui::style::Styled;
     use crate::ui::units::px;
@@ -180,6 +235,47 @@ mod tests {
         assert!(!scroll.scroll_by("job-list", 10.0, region.scroll_max));
         let boxes = lay(&t, (200.0, 100.0), &scroll);
         assert_eq!(boxes[1].bounds.y, -200.0, "clamped to the overflow");
+    }
+
+    /// Moving the pointer from one hoverable tile to another must fire leave
+    /// on the old one and enter on the new one — never both entered at once,
+    /// and never a leave with nothing to pair it with.
+    #[test]
+    fn hover_fires_leave_then_enter_when_moving_between_tiles() {
+        #[derive(Default)]
+        struct Hovers {
+            a: bool,
+            b: bool,
+        }
+        let tree: Element<Hovers> = h_flex()
+            .child(
+                div()
+                    .id("tile-a")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .on_hover(|s: &mut Hovers, entered| s.a = entered),
+            )
+            .child(
+                div()
+                    .id("tile-b")
+                    .w(px(100.))
+                    .h(px(100.))
+                    .on_hover(|s: &mut Hovers, entered| s.b = entered),
+            )
+            .into_any_element();
+
+        let boxes = layout(&tree, (200.0, 100.0), &mut FixedMetrics::default(), &ScrollState::default());
+        let mut state = Hovers::default();
+        let mut previous = None;
+
+        previous = dispatch_hover(&boxes, &previous, hovered_id(&boxes, 50.0, 50.0), &mut state);
+        assert_eq!((state.a, state.b), (true, false));
+
+        previous = dispatch_hover(&boxes, &previous, hovered_id(&boxes, 150.0, 50.0), &mut state);
+        assert_eq!((state.a, state.b), (false, true));
+
+        dispatch_hover(&boxes, &previous, hovered_id(&boxes, 50.0, 500.0), &mut state);
+        assert_eq!((state.a, state.b), (false, false), "off both tiles, both left");
     }
 
     /// A row scrolled out of its region must not be clickable, or an invisible
