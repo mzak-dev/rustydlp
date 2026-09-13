@@ -5,3 +5,7 @@
 
 # Bundled yt-dlp/ffmpeg live next to the built exe; they are fetched, not tracked
 /bin
+
+# vpk pack staging dir and its output — assembled by CI, not tracked
+/publish
+/Releases

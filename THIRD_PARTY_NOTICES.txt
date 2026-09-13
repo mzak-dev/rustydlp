@@ -1,0 +1,22 @@
+rustyDLP bundles the following third-party binaries, unmodified, as separate
+subprocesses. Neither is linked into rustydlp.exe; this file is shipped
+alongside them in the installer.
+
+--------------------------------------------------------------------------
+ffmpeg / ffprobe (bin/ffmpeg.exe, bin/ffprobe.exe)
+--------------------------------------------------------------------------
+Copyright (c) the FFmpeg developers.
+Licensed under the GNU General Public License (GPL), because this build
+includes libx264 for the app's convert-to-mp4 feature.
+
+Build:      BtbN/FFmpeg-Builds win64-gpl (https://github.com/BtbN/FFmpeg-Builds)
+Source:     https://ffmpeg.org/download.html
+Full license text: see ffmpeg-LICENSE.txt next to this file, or
+            https://www.gnu.org/licenses/gpl-3.0.html
+
+--------------------------------------------------------------------------
+yt-dlp (seed/yt-dlp.exe, later self-updating into %LOCALAPPDATA%\rustyDLP\bin)
+--------------------------------------------------------------------------
+Released into the public domain under the Unlicense.
+Source: https://github.com/yt-dlp/yt-dlp
+License text: https://github.com/yt-dlp/yt-dlp/blob/master/LICENSE

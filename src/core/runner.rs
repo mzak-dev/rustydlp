@@ -47,6 +47,41 @@ pub fn exe_relative_bin_dir() -> Option<PathBuf> {
     Some(std::env::current_exe().ok()?.parent()?.join("bin"))
 }
 
+/// `<dir containing our exe>\seed` — where the installer drops the initial
+/// yt-dlp copy. Deliberately not `bin/`: `resolve()` checks `bin/` before the
+/// app-data dir, so a yt-dlp bundled there would out-rank a self-updated
+/// app-data copy, and a Velopack app update (which replaces the whole exe
+/// directory) would silently revert it on every update. Seeding once into
+/// app-data instead keeps that copy — and its self-updates — authoritative.
+fn exe_relative_seed_dir() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("seed"))
+}
+
+/// Copies the bundled yt-dlp into the app-data bin dir the first time it's
+/// missing there, so `resolve()` finds it and `yt-dlp -U` has a copy to
+/// self-update in place. A no-op once that copy exists or nothing was seeded.
+pub fn seed_ytdlp_if_missing() {
+    seed_ytdlp(&bin_dir(), exe_relative_seed_dir().as_deref());
+}
+
+/// The testable half of [`seed_ytdlp_if_missing`]: never overwrites an
+/// existing `dest_dir` copy, which is what keeps a self-updated yt-dlp alive
+/// across reseeding.
+fn seed_ytdlp(dest_dir: &Path, seed_dir: Option<&Path>) {
+    let dest = dest_dir.join(exe_name("yt-dlp"));
+    if dest.is_file() {
+        return;
+    }
+    let Some(src) = seed_dir.map(|d| d.join(exe_name("yt-dlp"))) else {
+        return;
+    };
+    if !src.is_file() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dest_dir);
+    let _ = std::fs::copy(&src, &dest);
+}
+
 /// Resolution order: explicit override -> next to the exe -> app-data bin ->
 /// PATH. Exe-relative comes before app-data so a portable copy wins over a
 /// stale global install; app-data stays in the chain because that is the
@@ -564,6 +599,27 @@ mod tests {
     fn bin_dir_is_user_writable_not_program_files() {
         let d = bin_dir().to_string_lossy().to_lowercase();
         assert!(!d.contains("program files"), "yt-dlp -U could not self-update");
+    }
+
+    #[test]
+    fn seed_ytdlp_copies_the_bundled_copy_but_never_overwrites_a_self_update() {
+        let tmp = std::env::temp_dir().join(crate::core::model::new_id("rustydlp-seed-test"));
+        let seed_dir = tmp.join("seed");
+        let dest_dir = tmp.join("bin");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(seed_dir.join(exe_name("yt-dlp")), b"shipped").unwrap();
+        let dest = dest_dir.join(exe_name("yt-dlp"));
+
+        seed_ytdlp(&dest_dir, Some(&seed_dir));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"shipped");
+
+        // A version bump reseeds against the same still-missing check; an
+        // already-self-updated copy must survive it untouched.
+        std::fs::write(&dest, b"self-updated").unwrap();
+        seed_ytdlp(&dest_dir, Some(&seed_dir));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"self-updated");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

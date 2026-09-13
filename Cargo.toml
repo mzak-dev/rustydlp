@@ -79,6 +79,10 @@ cpal = "0.15"
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
 clipboard-win = "5"
+# Installer/auto-update runtime. Windows-only for the same reason as rfd/
+# clipboard-win above: there is no installer to run lifecycle hooks for, or
+# updates to check, on a platform this app doesn't ship a binary for.
+velopack = "1"
 
 # Embeds the .exe's icon (build.rs). Windows-only for the same reason as the
 # two above: there is no icon resource to embed on a platform this app

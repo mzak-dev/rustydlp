@@ -74,14 +74,60 @@ jobs:
           ref: ${{ needs.release-please.outputs.tag_name }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p rustydlp
+
+      # Stages the exe plus the binaries it needs but can't ship in git:
+      # ffmpeg/ffprobe (GPL build, for libx264 in the convert feature) land
+      # in publish/bin so runner.rs's existing exe-relative lookup finds them
+      # for free; yt-dlp lands in publish/seed, NOT bin, so it only ever seeds
+      # the app-data copy once (see seed_ytdlp_if_missing) instead of shadowing
+      # a self-updated one on every app update.
+      - name: Assemble publish directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path publish/bin, publish/seed | Out-Null
+          Copy-Item target/release/rustydlp.exe publish/rustydlp.exe
+          Copy-Item THIRD_PARTY_NOTICES.txt publish/
+
+          # BtbN's `latest` tag always points at the newest ffmpeg master
+          # build. It isn't byte-reproducible across time, but it's always
+          # resolvable — unlike a dated autobuild tag, which BtbN eventually
+          # prunes.
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-extracted
+          $ffmpegBin = Get-ChildItem -Recurse -Path ffmpeg-extracted -Filter ffmpeg.exe | Select-Object -First 1 -ExpandProperty DirectoryName
+          Copy-Item "$ffmpegBin/ffmpeg.exe" publish/bin/
+          Copy-Item "$ffmpegBin/ffprobe.exe" publish/bin/
+          $ffmpegLicense = Get-ChildItem -Recurse -Path ffmpeg-extracted -Filter "LICENSE*" | Select-Object -First 1
+          if ($ffmpegLicense) { Copy-Item $ffmpegLicense.FullName publish/ffmpeg-LICENSE.txt }
+
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" -OutFile publish/seed/yt-dlp.exe
+
+      # windows-latest ships a .NET SDK already; vpk is just a dotnet global
+      # tool on top of it. `dotnet tool install -g` doesn't reliably put its
+      # install dir on PATH for the rest of the job, so add it explicitly.
+      - name: Install vpk
+        shell: pwsh
+        run: |
+          dotnet tool install -g vpk
+          echo "$env:USERPROFILE\.dotnet\tools" >> $env:GITHUB_PATH
+
+      - name: Pack Velopack release
+        shell: pwsh
+        run: |
+          $version = "${{ needs.release-please.outputs.tag_name }}".TrimStart('v')
+          vpk pack -u rustyDLP -v $version -p publish -e rustydlp.exe -i assets/app-icon.ico
+
       - uses: actions/upload-artifact@v4
         with:
           name: rustydlp-${{ needs.release-please.outputs.tag_name }}
-          path: target/release/rustydlp.exe
+          path: Releases/*
 
   # release-please already created the tag and the GitHub release (empty of
-  # binaries) when its PR was merged; this only attaches the Windows build to
-  # it as a downloadable asset.
+  # binaries) when its PR was merged; this only attaches the Velopack release
+  # assets (installer, portable bundle, update feed) to it as downloadable
+  # assets — the same files vpk pack produced, just uploaded directly rather
+  # than through `vpk upload github`, which would need its own dotnet install
+  # on this job's runner for no benefit.
   attach-binary:
     needs: [release-please, build]
     if: needs.release-please.outputs.release_created == 'true'
@@ -92,8 +138,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: rustydlp-${{ needs.release-please.outputs.tag_name }}
+          path: Releases
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.release-please.outputs.tag_name }}
-        run: gh release upload "$TAG" rustydlp.exe
+        run: gh release upload "$TAG" Releases/*
