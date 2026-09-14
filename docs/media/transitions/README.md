@@ -1,7 +1,8 @@
 # Transition contact sheets
 
-One sheet per animation, sampled six times across its own span, left to right,
-top row first — the whole of `ui::anim::DURATION` for a transition, one full
+`status-chip.png` is a still: the detail pane's live status line in each phase
+a job passes through. The rest are one sheet per animation, sampled six times
+across its own span, left to right, top row first — the whole of `ui::anim::DURATION` for a transition, one full
 sweep of `LOADING_SWEEP` for `player-loading`, which loops rather than
 finishing. Rendered through the app's own pipeline onto a CPU Skia surface, so
 they are what the window actually paints, not a mock-up.
@@ -10,6 +11,7 @@ Generated, not hand-captured. They go stale the moment the motion changes:
 
 ```
 cargo test --lib -- --ignored transition_contact_sheets
+cargo test --lib -- --ignored status_chip_phases
 ```
 
 writes them to `target/transitions`, along with two stand-ins it needs and

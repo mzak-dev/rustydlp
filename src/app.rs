@@ -134,6 +134,15 @@ struct Live {
     fraction: Option<f32>,
     speed: Option<f64>,
     eta: Option<f64>,
+    /// yt-dlp's own `status` from the last progress line — `downloading`
+    /// while bytes are moving, `finished` once a stream is complete but the
+    /// run is still going (merging, converting thumbnails, writing metadata).
+    status: Option<String>,
+    /// The file that progress line was about. `--print` implies `--quiet`, so
+    /// none of yt-dlp's `[Merger]`/`[ExtractAudio]` narration reaches us —
+    /// this is the only thing that says *which* stream is being fetched, via
+    /// the intermediate name yt-dlp writes (`<title>.f137.mp4`).
+    filename: Option<String>,
     log: Vec<String>,
 }
 
@@ -1063,6 +1072,10 @@ impl RustyDlp {
                 }
                 live.speed = p.speed;
                 live.eta = p.eta;
+                live.status = p.status.clone();
+                if p.filename.is_some() {
+                    live.filename = p.filename.clone();
+                }
             }
             Event::Info(info) => {
                 if let Some(job) = self.jobs.iter_mut().find(|j| j.id == job_id) {
@@ -3278,7 +3291,12 @@ impl RustyDlp {
                                 .child(div().font_bold().text_sm().mt_2().child("Files"))
                                 .children(files),
                         )
-                    }),
+                    })
+                    // Last, under the files, because it is the one line here
+                    // that keeps changing while you watch it -- and because a
+                    // running job has no files yet, which is exactly when it
+                    // matters most.
+                    .child(status_chip(job, live)),
             )
             .into_any_element()
     }
@@ -4146,6 +4164,183 @@ fn filter_jobs(jobs: &[Job], tab: SidebarTab) -> Vec<&Job> {
 
 /// The small badge a library tile shows over its thumbnail: what happened to
 /// this job, in the one word there's room for.
+/// What a job is doing *right now*, as opposed to `JobState`, which is what
+/// it is persisted as.
+///
+/// Built only from what the tools actually report. `--print` implies
+/// `--quiet` (see `ytdlp::download_args`), so yt-dlp's own narration —
+/// `[Merger] Merging formats`, `[ExtractAudio]` — never reaches stdout;
+/// everything below is derived from the progress object's `status` and
+/// `filename`, plus the job's own state. Anything finer would be a guess
+/// dressed up as a readout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Queued,
+    /// Resolving the page and picking formats: yt-dlp is running but has not
+    /// reported a byte yet.
+    Fetching,
+    Downloading(Stream),
+    Converting,
+    /// Every stream is in, the process has not exited: muxing, converting the
+    /// thumbnail, writing the info json. Which of those is not knowable from
+    /// here, so the label does not pretend to know.
+    Processing,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Which half of a separate-streams download is moving. yt-dlp fetches video
+/// and audio as separate files and muxes them afterwards, so "downloading" on
+/// its own is only half the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Video,
+    Audio,
+    /// A progressive format, or a name that says nothing useful.
+    Unknown,
+}
+
+impl Phase {
+    fn label(self, kind: JobKind) -> &'static str {
+        match self {
+            Phase::Queued => "Queued",
+            Phase::Fetching => "Fetching info",
+            Phase::Downloading(Stream::Video) => "Downloading video",
+            Phase::Downloading(Stream::Audio) => "Downloading audio",
+            Phase::Downloading(Stream::Unknown) => "Downloading",
+            Phase::Converting => "Converting",
+            Phase::Processing => "Processing",
+            Phase::Completed => match kind {
+                JobKind::Convert => "Converted",
+                JobKind::Download => "Downloaded",
+            },
+            Phase::Failed => "Failed",
+            Phase::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Whether work is still happening, which is what decides how the chip
+    /// reads: live phases are the accent, finished ones recede.
+    fn is_active(self) -> bool {
+        matches!(
+            self,
+            Phase::Queued
+                | Phase::Fetching
+                | Phase::Downloading(_)
+                | Phase::Converting
+                | Phase::Processing
+        )
+    }
+}
+
+/// The current phase of `job`, given whatever its last progress line said.
+fn job_phase(job: &Job, live: Option<&Live>) -> Phase {
+    match job.state {
+        JobState::Queued => Phase::Queued,
+        JobState::Probing => Phase::Fetching,
+        JobState::Done => Phase::Completed,
+        JobState::Failed => Phase::Failed,
+        JobState::Cancelled => Phase::Cancelled,
+        JobState::Running => match job.kind {
+            JobKind::Convert => Phase::Converting,
+            JobKind::Download => match live.and_then(|l| l.status.as_deref()) {
+                // yt-dlp reports `finished` per *stream*, so this is only the
+                // end of the whole run once the process exits -- until then it
+                // means the next thing is post-processing.
+                Some("finished") => Phase::Processing,
+                Some("downloading") => {
+                    Phase::Downloading(stream_of(live.and_then(|l| l.filename.as_deref())))
+                }
+                // A status yt-dlp grew after this was written, or none yet.
+                Some(_) | None => Phase::Fetching,
+            },
+        },
+    }
+}
+
+/// Video or audio, from the intermediate file yt-dlp is writing. Reuses
+/// `classify`, so the two never disagree about what an extension means —
+/// except that here an unrecognised extension is genuinely unknown rather
+/// than assumed to be video.
+fn stream_of(filename: Option<&str>) -> Stream {
+    let Some(name) = filename else {
+        return Stream::Unknown;
+    };
+    let lower = name.to_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or("");
+    match classify(&lower) {
+        FileKind::Audio => Stream::Audio,
+        // `classify` falls back to Video for anything it does not recognise,
+        // so the extension has to be one it would actually call video.
+        FileKind::Video if matches!(ext, "mp4" | "webm" | "mkv" | "mov" | "flv" | "avi") => {
+            Stream::Video
+        }
+        _ => Stream::Unknown,
+    }
+}
+
+/// The detail pane's live status line: which phase the job is in, and the
+/// numbers that go with it while it is still moving.
+///
+/// Deliberately not animated. A pulsing dot would suit the rest of the
+/// interface, but it would also hold the redraw loop at 60Hz for as long as a
+/// download is open on screen, which is the exact cost that made the progress
+/// indicator stutter in the first place. The label changes when the phase
+/// does; that is the signal.
+fn status_chip(job: &Job, live: Option<&Live>) -> AnyElement {
+    let phase = job_phase(job, live);
+    let (bg, fg) = match phase {
+        Phase::Failed | Phase::Cancelled => (theme().danger.opacity(0.18), theme().danger),
+        _ if phase.is_active() => (theme().accent, theme().accent_foreground),
+        _ => (theme().muted, theme().muted_foreground),
+    };
+
+    // Speed and ETA only while something is actually being fetched: on a
+    // finished job they are the last reading before it stopped, which is not
+    // a status, just a stale number.
+    let detail = match phase {
+        Phase::Downloading(_) | Phase::Converting => {
+            let speed = live.and_then(|l| l.speed).map(|s| format!("{}/s", human_bytes(s)));
+            let eta = live
+                .and_then(|l| l.eta)
+                .filter(|e| *e > 0.0)
+                .map(|e| format!("{} left", human_duration(e)));
+            [speed, eta].into_iter().flatten().collect::<Vec<_>>().join(" \u{b7} ")
+        }
+        _ => String::new(),
+    };
+
+    v_flex()
+        .w_full()
+        .mt_2()
+        .gap_1()
+        .child(
+            h_flex().child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .px_1p5()
+                    .rounded_full()
+                    .bg(bg)
+                    .text_color(fg)
+                    .child(phase.label(job.kind)),
+            ),
+        )
+        .when(!detail.is_empty(), |this| {
+            this.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_xs()
+                    .truncate()
+                    .text_color(theme().muted_foreground)
+                    .child(detail),
+            )
+        })
+        .into_any_element()
+}
+
 fn job_status_chip(job: &Job) -> (&'static str, bool) {
     match job.state {
         JobState::Failed => ("Failed", true),
@@ -4256,8 +4451,9 @@ mod tests {
     // gone with gpui; the explicit list stays because it documents what is
     // actually under test.
     use super::{
-        AnyElement, Job, JobKind, JobState, LOADING_SWEEP, Route, RustyDlp, SidebarTab, Updates,
-        filter_jobs, is_active, is_retryable, select_arg, state_after_failure,
+        AnyElement, Job, JobKind, JobState, LOADING_SWEEP, Live, Phase, Route, RustyDlp,
+        SidebarTab, Stream, Updates, filter_jobs, is_active, is_retryable, job_phase, select_arg,
+        state_after_failure, stream_of,
     };
     use crate::core::model::{File as MFile, FileKind, Item};
     use crate::render::Backend;
@@ -4711,11 +4907,7 @@ mod tests {
     /// Lays the frames out in a grid, captioned with where in the transition
     /// each one sits. Captions go through the app's own text pipeline, so the
     /// sheet needs no font handling of its own.
-    fn contact_sheet(
-        frames: &[(f32, Vec<u8>)],
-        painter: &mut Painter,
-        over: std::time::Duration,
-    ) -> RasterBackend {
+    fn contact_sheet(frames: &[(String, Vec<u8>)], painter: &mut Painter) -> RasterBackend {
         use crate::render::Backend;
         use crate::ui::rgb;
 
@@ -4731,7 +4923,7 @@ mod tests {
         let mut sheet = RasterBackend::new(width as u32, height as u32);
         sheet.begin_frame(width as u32, height as u32, rgb(0x0a0a0a));
 
-        for (i, (step, rgba)) in frames.iter().enumerate() {
+        for (i, (caption, rgba)) in frames.iter().enumerate() {
             let x = PAD + (i % COLS) as f32 * (fw + PAD);
             let y = PAD + (i / COLS) as f32 * (CAPTION + fh + PAD);
 
@@ -4739,7 +4931,7 @@ mod tests {
                 .w(px(fw))
                 .text_xs()
                 .text_color(theme().muted_foreground)
-                .child(format!("{:.0}ms", step * over.as_millis() as f32))
+                .child(caption.clone())
                 .into_any_element();
             let boxes = layout(
                 &caption,
@@ -4819,6 +5011,76 @@ mod tests {
         let path = out.join("fixture-thumb.png");
         std::fs::write(&path, r.encode_png()).expect("write thumbnail");
         path.to_string_lossy().into_owned()
+    }
+
+    /// Writes one sheet showing the detail pane's status chip in each phase a
+    /// job passes through, so the labels can be read rather than inferred from
+    /// the match arms.
+    ///
+    /// Run with: cargo test --lib -- --ignored status_chip_phases
+    #[test]
+    #[ignore = "writes a PNG to target/transitions"]
+    fn status_chip_phases() {
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transitions");
+        std::fs::create_dir_all(&out).expect("output dir");
+        let thumb = fixture_thumb(&out);
+
+        /// A case: its caption, the job's persisted state, and what the last
+        /// progress line said (`status`, `filename`), if there was one.
+        type PhaseCase = (&'static str, JobState, Option<(&'static str, &'static str)>);
+
+        let cases: [PhaseCase; 7] = [
+            ("Queued", JobState::Queued, None),
+            ("Running, nothing reported yet", JobState::Running, None),
+            ("Running, video stream", JobState::Running, Some(("downloading", "clip.f137.mp4"))),
+            ("Running, audio stream", JobState::Running, Some(("downloading", "clip.f140.m4a"))),
+            ("Streams in, muxing", JobState::Running, Some(("finished", "clip.f137.mp4"))),
+            ("Failed", JobState::Failed, None),
+            // The one that has to read as *not* live, or the whole chip says
+            // nothing: a stale `downloading` from the last progress line is
+            // still in `live` here, exactly as it would be in the app.
+            ("Completed", JobState::Done, Some(("downloading", "clip.f137.mp4"))),
+        ];
+
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        for (caption, state, progress) in cases {
+            let (mut app, mut painter) = fixture();
+            let mut job = download_job("Big Buck Bunny (1080p)", state);
+            job.items[0].thumb_path = Some(thumb.clone());
+            if state == JobState::Running {
+                job.items[0].files.clear();
+            }
+            if let Some((status, filename)) = progress {
+                app.live.insert(
+                    job.id.clone(),
+                    Live {
+                        status: Some(status.into()),
+                        filename: Some(filename.into()),
+                        fraction: Some(0.41),
+                        speed: Some(3.5 * 1024.0 * 1024.0),
+                        eta: Some(96.0),
+                        ..Live::default()
+                    },
+                );
+            }
+            app.selected = Some(job.id.clone());
+            app.jobs = vec![job];
+            // Twice: the first settles the popover's entrance, the second is
+            // the frame worth looking at.
+            render(&mut app, &mut painter);
+            std::thread::sleep(crate::ui::anim::DURATION);
+            frames.push((caption.to_string(), render(&mut app, &mut painter).read_rgba()));
+        }
+
+        let path = out.join("status-chip.png");
+        std::fs::write(&path, contact_sheet(&frames, &mut painter_only()).encode_png())
+            .expect("write sheet");
+        println!("wrote {}", path.display());
+    }
+
+    /// A painter with nothing but the shaper the sheet's captions need.
+    fn painter_only() -> Painter {
+        fixture().1
     }
 
     /// Writes one PNG contact sheet per transition, so the motion can be
@@ -4917,12 +5179,93 @@ mod tests {
             render(&mut app, &mut painter);
             act(&mut app, &mut painter);
 
-            let frames = transition_frames(&mut app, &mut painter, over);
-            let png = contact_sheet(&frames, &mut painter, over).encode_png();
+            let frames: Vec<(String, Vec<u8>)> = transition_frames(&mut app, &mut painter, over)
+                .into_iter()
+                .map(|(step, rgba)| (format!("{:.0}ms", step * over.as_millis() as f32), rgba))
+                .collect();
+            let png = contact_sheet(&frames, &mut painter).encode_png();
             let path = out.join(format!("{name}.png"));
             std::fs::write(&path, png).expect("write sheet");
             println!("wrote {}", path.display());
         }
+    }
+
+    /// The phase is what the tools actually said, not a guess: a status yt-dlp
+    /// grows later must not read as a confident wrong answer, and `finished`
+    /// means one stream is in, not that the run is over.
+    #[test]
+    fn the_phase_follows_what_yt_dlp_reported() {
+        let mut job = download_job("A", JobState::Running);
+        let live = |status: Option<&str>, filename: Option<&str>| Live {
+            status: status.map(str::to_string),
+            filename: filename.map(str::to_string),
+            ..Live::default()
+        };
+
+        let downloading = live(Some("downloading"), Some("Some Video.f137.mp4"));
+        assert_eq!(job_phase(&job, Some(&downloading)), Phase::Downloading(Stream::Video));
+
+        let audio = live(Some("downloading"), Some("Some Video.f140.m4a"));
+        assert_eq!(job_phase(&job, Some(&audio)), Phase::Downloading(Stream::Audio));
+
+        // Every stream in, process still running: post-processing, not done.
+        let finished = live(Some("finished"), Some("Some Video.f137.mp4"));
+        assert_eq!(job_phase(&job, Some(&finished)), Phase::Processing);
+
+        // Running with nothing reported yet, and a status from a future
+        // yt-dlp, both fall back rather than claiming something specific.
+        assert_eq!(job_phase(&job, None), Phase::Fetching);
+        let unknown = live(Some("post_processing_v2"), None);
+        assert_eq!(job_phase(&job, Some(&unknown)), Phase::Fetching);
+
+        // The persisted state wins once the run is over: a stale `downloading`
+        // from the last progress line must not outlive the job.
+        job.state = JobState::Done;
+        assert_eq!(job_phase(&job, Some(&downloading)), Phase::Completed);
+        job.state = JobState::Failed;
+        assert_eq!(job_phase(&job, Some(&downloading)), Phase::Failed);
+    }
+
+    /// An extension `classify` does not recognise is video by default, which
+    /// is right for a finished file and wrong for a status label — saying
+    /// "Downloading video" about a `.part` of unknown kind is a guess.
+    #[test]
+    fn an_unrecognised_intermediate_file_claims_nothing() {
+        assert_eq!(stream_of(None), Stream::Unknown);
+        assert_eq!(stream_of(Some("clip.f616.mp4")), Stream::Video);
+        assert_eq!(stream_of(Some("clip.f251.opus")), Stream::Audio);
+        assert_eq!(stream_of(Some("clip.f616.unheardof")), Stream::Unknown);
+    }
+
+    /// The chip is the one line in the detail pane that keeps changing while
+    /// a download runs, and the moment it matters most is before any file
+    /// exists to list above it.
+    #[test]
+    fn the_detail_pane_shows_the_live_phase_even_with_no_files_yet() {
+        let (mut app, mut painter) = fixture();
+        let mut job = download_job("Some Video", JobState::Running);
+        job.items[0].files.clear();
+        app.live.insert(
+            job.id.clone(),
+            Live {
+                status: Some("downloading".into()),
+                filename: Some("Some Video.f137.mp4".into()),
+                speed: Some(2.0 * 1024.0 * 1024.0),
+                eta: Some(42.0),
+                ..Live::default()
+            },
+        );
+        app.selected = Some(job.id.clone());
+        app.jobs = vec![job];
+
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        assert!(find_text(&boxes, "Downloading video").is_some(), "no phase chip");
+        assert!(
+            boxes.iter().any(|b| b.text.is_some_and(|t| t.contains("2.0 MB/s"))),
+            "the speed that goes with it is missing"
+        );
+        assert!(find_text(&boxes, "Files").is_none(), "no files yet, so no Files section");
     }
 
     /// This is a yt-dlp client, so titles are not ASCII. Non-Latin and emoji have
