@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/mzak-dev/rustydlp/compare/v0.7.0...v0.8.0) (2026-09-14)
+
+
+### Features
+
+* **ui:** keep an open playlist's row in line instead of pushing it down ([a1bffb4](https://github.com/mzak-dev/rustydlp/commit/a1bffb406aaca85a2973a098710f9f4e3b17f5dc))
+
+
+### Bug Fixes
+
+* **ui:** drop the near-white outline on an expanded playlist tile ([4c2e06b](https://github.com/mzak-dev/rustydlp/commit/4c2e06b4e30846a51e7a99c1bd91a4609d07428f))
+
 ## [0.7.0](https://github.com/mzak-dev/rustydlp/compare/v0.6.0...v0.7.0) (2026-09-14)
 
 
