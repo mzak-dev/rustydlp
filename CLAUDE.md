@@ -17,3 +17,7 @@ Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/
 ### Commit messages
 
 Conventional Commits (Angular convention) — required, since `release-please` reads them to version and changelog releases. See `docs/agents/commit-conventions.md`.
+
+### Releases
+
+Three paths — automated (release-please), manual (`workflow_dispatch`), and a `-preview` prerelease per pull request — over one shared version script. See `docs/agents/releases.md`.

@@ -9,7 +9,8 @@ diff that is not is a regression.
 
 | Difference | Why |
 |---|---|
-| No animation anywhere | `main` has none. The closed PR #9 added it and was superseded by this rewrite; see the note in the plan about why its bouncy overshoot was impossible under gpui and is not under this renderer. |
+| Animation where `main` has none | `main` is static. The closed PR #9 added animation and was superseded by this rewrite; see the note in the plan about why its bouncy overshoot was impossible under gpui and is not under this renderer. Widgets settle with that bounce; whole screens do not — a page carrying every word on it past its resting point and back reads as a wobble, so a screen swap cross-fades and slides along the navbar's axis instead (`ui::anim::page_swap`), and the library popover morphs out of the tile that opened it rather than appearing over it (`ui::anim::morph_rect`) — a real layout at every intermediate size, since there is no transform to scale a snapshot with. |
+| Settings has a back button, top left of its title | It is the one screen reached from a toolbar button rather than from the tab bar, so the tab bar does not show where you are or offer a way out. `main` leaves that same toolbar toggle as the only way back. |
 | Segmented tab bar has no animated active indicator | Same. The static look is what `main` shows. |
 | `list_hover` and `radius` are guesses | Both are absent from gpui-component's `default-theme.json`; they come from its Rust defaults. **Sample from the running legacy build.** |
 | Button `Default`/`Danger` colours are derived | `default-theme.json` has no `button*` keys. Derived from `secondary`/`danger`; **sample from the running build.** |

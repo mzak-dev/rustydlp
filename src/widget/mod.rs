@@ -106,7 +106,7 @@ mod tests {
         let (x, y) = (second.bounds.x + 2.0, second.bounds.y + 2.0);
 
         let mut state = State::default();
-        assert!(dispatch_click(&boxes, x, y, &mut state));
+        assert!(dispatch_click(&boxes, x, y, &mut state).is_some());
         assert_eq!(state.clicked, Some(1));
     }
 

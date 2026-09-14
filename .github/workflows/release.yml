@@ -60,59 +60,27 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
+      current: ${{ steps.resolve.outputs.current }}
     steps:
       # Releases are cut from whatever branch the run was dispatched against —
       # `main` from the Actions UI's default, a release branch if you pick one.
+      # fetch-depth 0 for the tags, which the reuse check below reads.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
+      # Both the arithmetic and the file edits live in .github/scripts/version.py,
+      # shared with the per-PR preview build. They were duplicated inline here
+      # and drifting was only a matter of time — the Cargo.lock rewrite in
+      # particular is the kind of thing that gets fixed in one copy.
       - name: Resolve the version
         id: resolve
         env:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_BUMP: ${{ inputs.bump }}
         run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import os, re, sys, tomllib
-
-          requested = os.environ["INPUT_VERSION"].strip()
-          # Semver, minus build metadata: a `+` is legal semver but Cargo tags
-          # and git tags both handle it badly, so it is rejected rather than
-          # half-supported.
-          semver = re.compile(
-              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-              r"(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
-              r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?$"
-          )
-
-          with open("Cargo.toml", "rb") as f:
-              current = tomllib.load(f)["package"]["version"]
-
-          if requested:
-              if requested.startswith("v"):
-                  sys.exit(f"::error::version must not start with 'v': {requested}")
-              if not semver.match(requested):
-                  sys.exit(f"::error::not a semver version: {requested}")
-              version = requested
-          else:
-              # Bumping off a prerelease drops the prerelease part, the same way
-              # `cargo set-version --bump` does: 1.2.3-rc.1 + patch is 1.2.4.
-              core = current.split("-", 1)[0].split("+", 1)[0]
-              major, minor, patch = (int(p) for p in core.split("."))
-              bump = os.environ["INPUT_BUMP"]
-              if bump == "major":
-                  major, minor, patch = major + 1, 0, 0
-              elif bump == "minor":
-                  minor, patch = minor + 1, 0
-              else:
-                  patch += 1
-              version = f"{major}.{minor}.{patch}"
-
-          print(f"version={version}")
-          print(f"tag=v{version}")
-          print(f"current={current}")
-          PY
+          python3 .github/scripts/version.py resolve \
+            --version "$INPUT_VERSION" --bump "$INPUT_BUMP" >> "$GITHUB_OUTPUT"
 
       - name: Refuse to reuse a tag
         env:
@@ -134,43 +102,7 @@ jobs:
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: |
-          python3 - <<'PY'
-          import json, os, re
-
-          version = os.environ["VERSION"]
-
-          # Only the [package] version: the first `version = ` at the top level
-          # of Cargo.toml, before any dependency stanza sets one of its own.
-          toml = open("Cargo.toml", encoding="utf-8").read()
-          toml, n = re.subn(
-              r'(?m)\A(.*?^version = )"[^"]*"',
-              rf'\g<1>"{version}"',
-              toml,
-              count=1,
-              flags=re.S,
-          )
-          assert n == 1, "no [package] version found in Cargo.toml"
-          open("Cargo.toml", "w", encoding="utf-8").write(toml)
-
-          # The lockfile carries the workspace member's own version too, and a
-          # stale one makes every later `--locked` build fail.
-          lock = open("Cargo.lock", encoding="utf-8").read()
-          lock, n = re.subn(
-              r'(?m)^(\[\[package\]\]\nname = "rustydlp"\nversion = )"[^"]*"',
-              rf'\g<1>"{version}"',
-              lock,
-              count=1,
-          )
-          assert n == 1, "no rustydlp package entry found in Cargo.lock"
-          open("Cargo.lock", "w", encoding="utf-8").write(lock)
-
-          manifest_path = ".release-please-manifest.json"
-          manifest = json.load(open(manifest_path, encoding="utf-8"))
-          manifest["."] = version
-          with open(manifest_path, "w", encoding="utf-8") as f:
-              json.dump(manifest, f, indent=2)
-              f.write("\n")
-          PY
+          python3 .github/scripts/version.py write "$VERSION" --manifest
           git --no-pager diff --stat
 
       - name: Summarize the plan

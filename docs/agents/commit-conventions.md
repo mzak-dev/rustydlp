@@ -51,11 +51,9 @@ lost if the PR is merged with "Create a merge commit" instead.
 `.github/workflows/release.yml` ("Manual release") is the escape hatch: run it
 from the Actions tab with an exact `version` (or a `patch`/`minor`/`major`
 bump), optionally as a prerelease, a draft, or a `dry_run` that only prints the
-plan. It bumps `Cargo.toml`, `Cargo.lock` and `.release-please-manifest.json`
-together — the manifest is what release-please reads as "the last release", so a
-manual release leaves the automated path bumping from the right baseline rather
-than trying to re-cut a version that already exists.
-
-Reach for it for a hotfix, a first `0.1.0`, an `-rc` build, or to redo a release
-whose build or upload failed. Everything else should still go through
+plan. Reach for it for a hotfix, a first `0.1.0`, an `-rc` build, or to redo a
+release whose build or upload failed. Everything else should still go through
 Conventional Commits on `main`.
+
+All three release paths — automated, manual, and the `-preview` prerelease each
+pull request gets — are described in [releases.md](releases.md).
