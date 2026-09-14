@@ -10,7 +10,7 @@ use std::rc::Rc;
 use super::icon::Icon;
 use crate::ui::color::{Rgba, transparent};
 use crate::ui::element::{Element, IntoElement, SharedString, h_flex};
-use crate::ui::style::{StyleRefinement, Styled};
+use crate::ui::style::{FluentBuilder as _, StyleRefinement, Styled};
 use crate::ui::theme::theme;
 use crate::ui::units::px;
 
@@ -70,6 +70,7 @@ pub struct Button<S> {
     variant: ButtonVariant,
     size: ButtonSize,
     selected: bool,
+    disabled: bool,
     on_click: Option<Handler<S>>,
     style: StyleRefinement,
 }
@@ -83,6 +84,7 @@ impl<S> Button<S> {
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             selected: false,
+            disabled: false,
             on_click: None,
             style: StyleRefinement::default(),
         }
@@ -123,6 +125,14 @@ impl<S> Button<S> {
         self
     }
 
+    /// Greys the button out and drops its handler, so the affordance and the
+    /// behaviour cannot disagree — a button that looks live and does nothing
+    /// reads as a bug in the app rather than a missing precondition.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+
     pub fn on_click(mut self, handler: impl Fn(&mut S) + 'static) -> Self {
         self.on_click = Some(Rc::new(handler));
         self
@@ -148,6 +158,8 @@ impl<S: 'static> IntoElement<S> for Button<S> {
         let (bg, fg, border) = colors(self.variant, self.selected);
         let icon_only = self.label.is_none();
 
+        let (bg, fg) = if self.disabled { (t.muted, t.muted_foreground) } else { (bg, fg) };
+
         let mut el = h_flex()
             .id(self.id)
             .items_center()
@@ -156,9 +168,9 @@ impl<S: 'static> IntoElement<S> for Button<S> {
             .rounded(t.radius)
             .bg(bg)
             .text_color(fg)
-            .cursor_pointer();
+            .when(!self.disabled, |el| el.cursor_pointer());
 
-        if !border.is_transparent() {
+        if !border.is_transparent() && !self.disabled {
             el = el.border_1().border_color(border);
         }
 
@@ -174,8 +186,10 @@ impl<S: 'static> IntoElement<S> for Button<S> {
             el = el.text_sm();
         }
 
-        let hover = hover_bg(self.variant);
-        el = el.hover(move |s| s.bg(hover));
+        if !self.disabled {
+            let hover = hover_bg(self.variant);
+            el = el.hover(move |s| s.bg(hover));
+        }
 
         if let Some(icon) = self.icon {
             el = el.child(icon.element::<S>());
@@ -183,7 +197,9 @@ impl<S: 'static> IntoElement<S> for Button<S> {
         if let Some(label) = self.label {
             el = el.child(label);
         }
-        if let Some(handler) = self.on_click {
+        if let Some(handler) = self.on_click
+            && !self.disabled
+        {
             el = el.on_click(move |state: &mut S| handler(state));
         }
 

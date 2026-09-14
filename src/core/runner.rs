@@ -404,6 +404,29 @@ impl ConvertFormat {
         }
     }
 
+    /// The container on its own, for a picker that puts the codecs on a
+    /// second line rather than in brackets.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Mp4H264Aac => "MP4",
+            Self::MkvH264Aac => "MKV",
+            Self::WebmVp9Opus => "WebM",
+            Self::Mp3Audio => "MP3",
+        }
+    }
+
+    /// What picking it actually gets you. Kept next to `ffmpeg_codec_args`,
+    /// which is what makes each claim true — change one and this is right
+    /// there to change with it.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Mp4H264Aac => "H.264 · AAC · plays anywhere",
+            Self::MkvH264Aac => "H.264 · AAC · flexible container",
+            Self::WebmVp9Opus => "VP9 · Opus · smaller, slower",
+            Self::Mp3Audio => "Audio only · video is dropped",
+        }
+    }
+
     fn extension(self) -> &'static str {
         self.as_str()
     }

@@ -68,6 +68,15 @@ pub struct Inherited {
     /// text it actually applies to — the same route `font_size`/`color`/
     /// `bold` already take to get from a styled div down to its bare string.
     pub truncate: bool,
+    /// The product of every `.opacity()` from the root down to this box. The
+    /// painter has no layer stack to fade a subtree with, so the fade is
+    /// carried down here instead and applied per box — which is what lets one
+    /// `.opacity()` on a screen's wrapper fade the whole screen, rather than
+    /// only the (usually empty) wrapper box itself.
+    pub opacity: f32,
+    /// False inside a `.pointer_events_none()` subtree: the box is painted but
+    /// takes no part in hit-testing, hover or scrolling.
+    pub interactive: bool,
 }
 
 impl Default for Inherited {
@@ -78,6 +87,8 @@ impl Default for Inherited {
             color: theme().foreground,
             bold: false,
             truncate: false,
+            opacity: 1.0,
+            interactive: true,
         }
     }
 }
@@ -100,6 +111,17 @@ impl Inherited {
         }
         if let Some(t) = style.truncate {
             self.truncate = t;
+        }
+        // Multiplied, not overwritten: a half-faded screen containing an
+        // already-dimmed row has to end up dimmer than either alone.
+        if let Some(o) = style.opacity {
+            self.opacity *= o;
+        }
+        // One-way: an inert subtree cannot opt a child back in, the same way
+        // CSS's `pointer-events: none` needs an explicit `auto` to undo and
+        // nothing here has a use for one.
+        if style.pointer_events_none == Some(true) {
+            self.interactive = false;
         }
         self
     }
@@ -243,14 +265,21 @@ fn to_taffy_style(s: &StyleRefinement) -> Style {
             JustifyContent::SpaceBetween => TJustify::SpaceBetween,
         });
     }
+    let inset = Rect {
+        top: lpa(s.inset.top),
+        right: lpa(s.inset.right),
+        bottom: lpa(s.inset.bottom),
+        left: lpa(s.inset.left),
+    };
     if s.absolute == Some(true) {
         out.position = Position::Absolute;
-        out.inset = Rect {
-            top: lpa(s.inset.top),
-            right: lpa(s.inset.right),
-            bottom: lpa(s.inset.bottom),
-            left: lpa(s.inset.left),
-        };
+        out.inset = inset;
+    } else if s.relative == Some(true) {
+        // As in CSS: the box is laid out in flow, then drawn shifted by its
+        // inset, leaving everything around it where it was. An `auto` edge
+        // (the default) shifts by nothing.
+        out.position = Position::Relative;
+        out.inset = inset;
     }
     // Scroll and hidden both clip; gpui draws no scrollbar, and taffy's
     // default scrollbar_width of 0 matches that, so no gutter is reserved.
@@ -520,6 +549,57 @@ mod tests {
         assert_eq!(text.inherited.color, rgb(0xa3a3a3));
         assert_eq!(text.bounds.height, 16.0, "measured to the text_xs line box");
         assert_eq!(text.bounds.width, 200.0, "block text box fills its parent");
+    }
+
+    /// One `.opacity()` on a wrapper has to fade everything inside it, because
+    /// that is what a screen crossfade is: the painter has no layer to fade, so
+    /// the value is carried down here and applied per box.
+    #[test]
+    fn opacity_multiplies_all_the_way_down_the_tree() {
+        let tree: E = div()
+            .opacity(0.5)
+            .child(div().child(div().opacity(0.5).child("x")))
+            .into_any_element();
+
+        let boxes = lay(&tree, (200.0, 200.0));
+        assert_eq!(boxes[0].inherited.opacity, 0.5, "the wrapper itself");
+        assert_eq!(boxes[1].inherited.opacity, 0.5, "a plain child inherits it");
+        assert_eq!(boxes[2].inherited.opacity, 0.25, "and a dimmed one compounds with it");
+        let text = boxes.iter().find(|b| b.text == Some("x")).expect("text box");
+        assert_eq!(text.inherited.opacity, 0.25, "text leaves are faded too");
+    }
+
+    /// The outgoing screen of a page swap is painted but inert, and so is
+    /// everything inside it.
+    #[test]
+    fn pointer_events_none_makes_the_whole_subtree_inert() {
+        let tree: E = div()
+            .child(div().pointer_events_none().child(div().child("ghost")))
+            .child(div().child("live"))
+            .into_any_element();
+
+        let boxes = lay(&tree, (200.0, 200.0));
+        let by_text = |t: &str| {
+            boxes.iter().find(|b| b.text == Some(t)).unwrap_or_else(|| panic!("no {t}"))
+        };
+        assert!(!by_text("ghost").inherited.interactive, "inert all the way down");
+        assert!(by_text("live").inherited.interactive, "and only inside that subtree");
+    }
+
+    /// `position: relative` + an inset shifts where a box is drawn without
+    /// moving anything around it — how a card lifts into place during its
+    /// entrance while the row it sits in stays put.
+    #[test]
+    fn a_relative_inset_offsets_the_box_without_reflowing_its_siblings() {
+        let tree: E = v_flex()
+            .w(px(100.))
+            .child(div().h(px(20.)).relative().top(px(-6.)))
+            .child(div().h(px(20.)))
+            .into_any_element();
+
+        let boxes = lay(&tree, (100.0, 100.0));
+        assert_eq!(boxes[1].bounds.y, -6.0, "drawn six pixels up");
+        assert_eq!(boxes[2].bounds.y, 20.0, "its sibling stays where the flow put it");
     }
 
     /// In a flex row -- which is what `h_flex()` gives, and what most of the
