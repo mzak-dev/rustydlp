@@ -183,6 +183,17 @@ impl Shell {
             self.dirty = true;
         }
 
+        // The library grid wraps in taffy, so how many tiles fit across is
+        // only known once a frame has been laid out -- and `library` needs
+        // that count to break a row around an expanded playlist. Measured
+        // here and handed back for the next frame; a changed width (a resize)
+        // asks for that frame directly, since `dirty` is cleared below.
+        if let Some(width) = box_width(&boxes, "library-grid")
+            && self.app.set_grid_width(width)
+        {
+            window.request_redraw();
+        }
+
         paint(backend.canvas(), &boxes, &mut self.painter, self.pointer);
         window.pre_present_notify();
         backend.present();
@@ -339,6 +350,14 @@ fn clipboard() -> Option<String> {
 #[cfg(windows)]
 fn set_clipboard(text: &str) {
     let _ = clipboard_win::set_clipboard_string(text);
+}
+
+/// The laid-out width of the box with this id, if it is on screen.
+fn box_width<S>(boxes: &[crate::ui::layout::Box_<'_, S>], id: &str) -> Option<f32> {
+    boxes
+        .iter()
+        .find(|b| b.node.and_then(|n| n.element_id()).is_some_and(|i| &**i == id))
+        .map(|b| b.bounds.width)
 }
 
 /// The clipboard is Windows-only, like the app. Elsewhere the interface still

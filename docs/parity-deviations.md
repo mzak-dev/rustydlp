@@ -15,6 +15,7 @@ diff that is not is a regression.
 | `list_hover` and `radius` are guesses | Both are absent from gpui-component's `default-theme.json`; they come from its Rust defaults. **Sample from the running legacy build.** |
 | Button `Default`/`Danger` colours are derived | `default-theme.json` has no `button*` keys. Derived from `secondary`/`danger`; **sample from the running build.** |
 | Switch and tab metrics | Switch is gpui-component's documented 36x20/16/2. Tab padding and height are derived, not read. |
+| A downloaded playlist is one group tile that expands in place | The flat library gave a multi-item job one tile per video, so a long playlist buried every other download. The group tile restores the gpui build's per-playlist grouping without bringing back its separate "Videos" screen. |
 | A bidi selection draws as one span | Not two visual runs. The fields hold URLs, paths and yt-dlp arguments. |
 
 ## Must be resolved before parity is signed off

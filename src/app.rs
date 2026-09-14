@@ -5,7 +5,7 @@
 //! diffed while parity is signed off. The gpui version is at `src/app.rs` in
 //! commit 374d659 and earlier.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -162,6 +162,17 @@ pub struct RustyDlp {
     selected: Option<String>,
     /// Item id, when drilled into a multi-item job's grid.
     open_item: Option<String>,
+    /// Job ids whose playlist group tile is currently expanded in the library.
+    /// A set rather than a single `Option`, because expanding one playlist is
+    /// no reason to fold away another the user already opened.
+    expanded_groups: HashSet<String>,
+    /// Width the library's tile grid was last laid out at, pushed in by
+    /// `shell.rs` after a frame's layout. `library` needs a column count to
+    /// know where an open playlist's row ends, and the wrap that decides it
+    /// happens in taffy, well after the element tree is built — so the count
+    /// is measured from the frame before rather than assumed. `None` until
+    /// the library has been on screen once.
+    grid_width: Option<f32>,
     route: Route,
     tab: SidebarTab,
     modal: bool,
@@ -553,6 +564,8 @@ impl RustyDlp {
             live: HashMap::new(),
             selected: None,
             open_item: None,
+            expanded_groups: HashSet::new(),
+            grid_width: None,
             route: Route::Library,
             tab: SidebarTab::Home,
             modal: false,
@@ -724,6 +737,27 @@ impl RustyDlp {
     /// shortcut changes it without going through `WindowAction` at all).
     pub fn set_window_maximized(&mut self, maximized: bool) {
         self.window_maximized = maximized;
+    }
+
+    /// Records the width the library grid laid out at, and reports whether
+    /// that changed — a changed width means the column count `library` splits
+    /// rows by is stale, so the caller owes one more frame. See `grid_width`.
+    pub fn set_grid_width(&mut self, width: f32) -> bool {
+        let changed = self.grid_width != Some(width);
+        self.grid_width = Some(width);
+        changed
+    }
+
+    /// How many tiles fit across the library grid, from the last measured
+    /// width. `None` before the library has ever been laid out, where the
+    /// only honest answer is "no idea" and `library` falls back to breaking
+    /// the row at the open tile.
+    fn grid_columns(&self) -> Option<usize> {
+        let width = self.grid_width?;
+        // The trailing tile in a row has no gap after it, so the gap is added
+        // to the width rather than subtracted per tile.
+        let cols = (width + TILE_GAP) / (TILE_W.0 + TILE_GAP);
+        Some((cols.floor() as usize).max(1))
     }
 
     /// The window's current size in logical pixels. Pushed in by `shell.rs`
@@ -1219,6 +1253,7 @@ impl RustyDlp {
         self.jobs.retain(|j| j.id != job_id);
         self.live.remove(job_id);
         self.cancels.remove(job_id);
+        self.expanded_groups.remove(job_id);
         if self.selected.as_deref() == Some(job_id) {
             self.selected = None;
         }
@@ -1790,26 +1825,75 @@ impl RustyDlp {
         container.into_any_element()
     }
 
-    /// Every finished download or conversion, newest first, as one flat grid
-    /// — replaces the old sidebar job list, the Convert tab's own list, and
-    /// the per-job "Videos" grid a multi-item playlist used to drill into,
-    /// all three of which are now just tiles in the same library. Clicking a
-    /// tile opens `library_popover`, not a swap of this pane's own content.
+    /// Every finished download or conversion, newest first — replaces the old
+    /// sidebar job list and the Convert tab's own list, which are now just
+    /// tiles in the same library. Clicking a tile opens `library_popover`, not
+    /// a swap of this pane's own content.
+    ///
+    /// A playlist (a job that landed more than one item) contributes a single
+    /// group tile rather than one tile per video, so a 200-entry playlist can
+    /// no longer bury every other download under itself. Clicking the group
+    /// tile expands it in place — see `playlist_panel` — and its videos are
+    /// the same `library_tile`s, which still open the popover when clicked.
     fn library(&mut self) -> AnyElement {
         let mut jobs = filter_jobs(&self.jobs, SidebarTab::Home);
         jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
 
-        let mut tiles: Vec<AnyElement> = Vec::new();
+        // The grid is a run of wrapping tile sections interrupted by the
+        // full-width panel of whichever playlists are open. Built as one
+        // ordered list of blocks rather than a single wrap container, because
+        // a panel has to be able to break the flow — nothing in this layout
+        // engine lets a child span a wrap row the way CSS grid would.
+        //
+        // A section does not stop at the open tile, it stops at the end of
+        // the row the open tile is on: whatever already shares that row keeps
+        // its place beside it, and only the tiles that would not have fitted
+        // move below the panel. That needs a column count, which is what
+        // `grid_columns` measures; without one (the first ever frame) the
+        // section ends at the open tile, which is never wrong, just emptier.
+
+        // Every job puts at least one tile on screen — a group tile, or one
+        // per item — so there is nothing to show exactly when there are no
+        // finished jobs.
+        let is_empty = jobs.is_empty();
+        let columns = self.grid_columns();
+        let mut blocks: Vec<AnyElement> = Vec::new();
+        let mut row: Vec<AnyElement> = Vec::new();
+        // Panels owed to the section being filled, in the order their tiles
+        // appear — two playlists opened on the same row stack underneath it.
+        let mut panels: Vec<AnyElement> = Vec::new();
+        let mut close_at: Option<usize> = None;
         for job in &jobs {
-            if job.items.is_empty() {
-                tiles.push(self.library_tile(job, None));
+            if is_group(job) {
+                let expanded = self.expanded_groups.contains(&job.id);
+                row.push(self.library_group_tile(job, expanded));
+                if expanded {
+                    panels.push(self.playlist_panel(job));
+                    let at = row.len() - 1;
+                    // Keeps the first break: the section always ends at or
+                    // before it, so a second playlist opened within the same
+                    // section is on that same row and asks for the same end.
+                    let at_end_of_row = columns.map_or(row.len(), |c| (at / c + 1) * c);
+                    close_at.get_or_insert(at_end_of_row);
+                }
+            } else if job.items.is_empty() {
+                row.push(self.library_tile(job, None));
             } else {
                 for item in &job.items {
-                    tiles.push(self.library_tile(job, Some(item)));
+                    row.push(self.library_tile(job, Some(item)));
                 }
             }
+            if close_at.is_some_and(|c| row.len() >= c) {
+                blocks.push(tile_row(std::mem::take(&mut row)));
+                blocks.append(&mut panels);
+                close_at = None;
+            }
         }
-        let is_empty = tiles.is_empty();
+        if !row.is_empty() {
+            blocks.push(tile_row(row));
+        }
+        // A playlist opened by the last tile on screen still owes its panel.
+        blocks.append(&mut panels);
 
         v_flex()
             .id("library-scroll")
@@ -1842,7 +1926,7 @@ impl RustyDlp {
                         ),
                 )
             })
-            .child(div().flex().flex_wrap().gap_3().children(tiles))
+            .child(v_flex().id("library-grid").w_full().gap_4().children(blocks))
             .into_any_element()
     }
 
@@ -1888,7 +1972,7 @@ impl RustyDlp {
 
         v_flex()
             .id(SharedString::from(format!("tile-{key}")))
-            .w(px(220.))
+            .w(TILE_W)
             .gap_2()
             .p_2()
             .rounded(theme().radius)
@@ -1956,6 +2040,279 @@ impl RustyDlp {
                 t.child(div().text_xs().text_color(theme().muted_foreground).child(subtitle))
             })
             .into_any_element()
+    }
+
+    /// The single tile a downloaded playlist gets in place of one tile per
+    /// video. Clicking it toggles `playlist_panel` open rather than opening
+    /// the popover: a playlist has no one file to play, so "open" here means
+    /// "show me what's in it", and the click into a video comes after.
+    ///
+    /// The two bars above the cover are the stack: they say at a glance that
+    /// the tile stands for several videos, which a lone thumbnail and a count
+    /// in the subtitle do not.
+    fn library_group_tile(&self, job: &Job, expanded: bool) -> AnyElement {
+        let items = sorted_items(job);
+        let count = items.len();
+        let thumb = items.iter().find_map(|i| i.thumb_path.as_deref());
+        let bytes: i64 = items
+            .iter()
+            .flat_map(|i| i.files.iter())
+            .filter_map(|f| f.bytes)
+            .sum();
+        let duration: f64 = items.iter().filter_map(|i| i.duration).sum();
+
+        let mut parts = vec![format!("{count} videos")];
+        if duration > 0.0 {
+            parts.push(human_duration(duration));
+        }
+        if bytes > 0 {
+            parts.push(human_bytes(bytes as f64));
+        }
+        let subtitle = parts.join(" \u{b7} ");
+
+        let (chip_label, chip_danger) = job_status_chip(job);
+        let title = if job.title.is_empty() {
+            format!("{count} videos")
+        } else {
+            job.title.clone()
+        };
+
+        // Keyed off the job, not an item, so neither the element id nor the
+        // preview can collide with the per-item tiles the expanded panel
+        // shows for the same videos.
+        let key = format!("group-{}", job.id);
+        let hover_key = key.clone();
+        let preview = self
+            .hover_preview
+            .as_ref()
+            .filter(|p| p.item_id == hover_key)
+            .and_then(|p| p.frame.clone());
+        // Hovering the stack previews the playlist's first playable video —
+        // the same first-present-file rule `library_tile` plays by.
+        let playable = items.iter().find_map(|i| {
+            i.files
+                .iter()
+                .find(|f| {
+                    matches!(f.kind, FileKind::Video | FileKind::Audio)
+                        && std::path::Path::new(&f.path).is_file()
+                })
+                .map(|f| f.path.clone())
+        });
+
+        let job_id = job.id.clone();
+
+        v_flex()
+            .id(SharedString::from(key))
+            .w(TILE_W)
+            .gap_2()
+            .p_2()
+            .rounded(theme().radius)
+            .border_1()
+            .border_color(theme().border)
+            // Open reads from the filled background, the chevron and the panel
+            // below — not from a brighter border. `ring` here was a near-white
+            // outline on an otherwise all-neutral screen.
+            .when(expanded, |t| t.bg(theme().surface))
+            .hover(|this| this.bg(theme().list_hover))
+            .cursor_pointer()
+            .on_click(move |this: &mut Self| {
+                this.toggle_group(&job_id);
+            })
+            .when_some(playable, |t, path| {
+                let enter_key = hover_key.clone();
+                let leave_key = hover_key.clone();
+                t.on_hover(move |this: &mut Self, entered| {
+                    if entered {
+                        this.schedule_hover_preview(enter_key.clone(), path.clone());
+                    } else {
+                        this.stop_hover_preview_for(&leave_key);
+                    }
+                })
+            })
+            .child(
+                // Tight gap: these three boxes are one stack of cards, not
+                // three rows of the tile, so they sit closer than `gap_2`.
+                v_flex()
+                    .w_full()
+                    .gap_0p5()
+                    .child(
+                        div().w_full().px(18.).child(
+                            div()
+                                .w_full()
+                                .h(px(3.))
+                                .rounded(theme().radius)
+                                .bg(theme().muted_foreground)
+                                .opacity(0.25),
+                        ),
+                    )
+                    .child(
+                        div().w_full().px(9.).child(
+                            div()
+                                .w_full()
+                                .h(px(3.))
+                                .rounded(theme().radius)
+                                .bg(theme().muted_foreground)
+                                .opacity(0.45),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .child(match preview {
+                                Some(frame) => img(crate::ui::element::ImageSource::Rgba {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    data: frame.data,
+                                    id: frame.pts.to_bits(),
+                                })
+                                .w_full()
+                                .h(px(102.))
+                                .rounded(theme().radius)
+                                .overflow_hidden()
+                                .object_fit(ObjectFit::Cover)
+                                .into_any_element(),
+                                // 102 rather than the plain tile's 112: the
+                                // two stack bars and their gaps make up the
+                                // other ten, so a group tile and a plain one
+                                // still line their titles up side by side.
+                                None => cover(thumb, px(102.), px(48.)),
+                            })
+                            .when(!chip_label.is_empty(), |t| {
+                                t.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(6.))
+                                        .left(px(6.))
+                                        .text_xs()
+                                        .px_1p5()
+                                        .rounded(theme().radius)
+                                        .bg(if chip_danger {
+                                            theme().danger
+                                        } else {
+                                            black().opacity(0.6)
+                                        })
+                                        .text_color(if chip_danger {
+                                            theme().danger_foreground
+                                        } else {
+                                            theme().foreground
+                                        })
+                                        .child(chip_label),
+                                )
+                            })
+                            .child(
+                                // Bottom-right rather than beside the status
+                                // chip, which already owns the top-left.
+                                div()
+                                    .absolute()
+                                    .bottom(px(6.))
+                                    .right(px(6.))
+                                    .text_xs()
+                                    .px_1p5()
+                                    .rounded(theme().radius)
+                                    .bg(black().opacity(0.6))
+                                    .text_color(theme().foreground)
+                                    .child(format!("{count}")),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        // Tinted by wrapping rather than on the icon itself:
+                        // `Icon` paints as a mask in its box's text colour,
+                        // which it inherits from this div.
+                        div().flex_shrink_0().text_color(theme().muted_foreground).child(
+                            Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(px(14.)),
+                        ),
+                    )
+                    .child(div().flex_1().min_w_0().text_sm().truncate().child(title)),
+            )
+            .child(div().text_xs().text_color(theme().muted_foreground).child(subtitle))
+            .into_any_element()
+    }
+
+    /// What an expanded group tile opens into: the playlist's videos, in
+    /// playlist order, as ordinary library tiles — so clicking one lands in
+    /// the same popover it would have from the flat grid.
+    ///
+    /// Full width and on `surface`, under its own header, rather than tiles
+    /// loose in the grid: without that frame there is nothing to say where
+    /// the playlist's contents end and the next download begins.
+    ///
+    /// Appears and disappears outright, with no entrance animation: opacity
+    /// here paints the box itself and not its subtree (see `paint`), so a
+    /// fade would dissolve the panel's own frame while its tiles stayed
+    /// solid — worse than no animation at all.
+    fn playlist_panel(&self, job: &Job) -> AnyElement {
+        let tiles: Vec<AnyElement> = sorted_items(job)
+            .into_iter()
+            .map(|item| self.library_tile(job, Some(item)))
+            .collect();
+        let count = tiles.len();
+        let job_id = job.id.clone();
+        let title = if job.title.is_empty() {
+            "Playlist".to_string()
+        } else {
+            job.title.clone()
+        };
+
+        v_flex()
+            .id(SharedString::from(format!("group-panel-{}", job.id)))
+            .w_full()
+            .gap_3()
+            .p_3()
+            .rounded(theme().radius)
+            .border_1()
+            .border_color(theme().border)
+            .bg(theme().surface)
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("group-header-{}", job.id)))
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(move |this: &mut Self| {
+                        this.toggle_group(&job_id);
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(theme().muted_foreground)
+                            .child(Icon::new(IconName::ChevronDown).size(px(14.))),
+                    )
+                    .child(div().flex_1().min_w_0().text_sm().font_bold().truncate().child(title))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme().muted_foreground)
+                            .child(format!("{count} videos")),
+                    ),
+            )
+            .child(tile_row(tiles))
+            .into_any_element()
+    }
+
+    /// Opens a playlist's group tile, or folds it back up. Stops whatever the
+    /// stack was previewing: expanding moves every tile below it down, so the
+    /// pointer is no longer over what it was hovering.
+    fn toggle_group(&mut self, job_id: &str) {
+        self.stop_hover_preview();
+        if !self.expanded_groups.remove(job_id) {
+            self.expanded_groups.insert(job_id.to_string());
+        }
     }
 
     /// In progress moved out of the sidebar and into here because it mixes
@@ -4557,6 +4914,36 @@ fn filter_jobs(jobs: &[Job], tab: SidebarTab) -> Vec<&Job> {
         .collect()
 }
 
+/// One library tile's width, and the gap between them. Shared by the tiles
+/// themselves and by `grid_columns`, which works out where a row ends from
+/// the same two numbers taffy wraps by.
+const TILE_W: Pixels = px(220.);
+const TILE_GAP: f32 = 12.;
+
+/// Whether a job is shown as one playlist group tile rather than a tile per
+/// video. Two items is already a playlist by yt-dlp's reckoning; one is a
+/// single video whichever URL asked for it, and grouping it would put a
+/// pointless extra click in front of the only thing inside.
+fn is_group(job: &Job) -> bool {
+    job.items.len() > 1
+}
+
+/// A job's videos in playlist order. `items` is in arrival order — yt-dlp
+/// emits info lines as each download finishes, which for a playlist is not
+/// the order it lists them in — so anything showing a playlist's contents
+/// has to sort by the index yt-dlp recorded.
+fn sorted_items(job: &Job) -> Vec<&Item> {
+    let mut items: Vec<&Item> = job.items.iter().collect();
+    items.sort_by_key(|i| i.index);
+    items
+}
+
+/// One wrapping row of library tiles. The library is a stack of these rather
+/// than a single wrap container, so an expanded playlist can interrupt it.
+fn tile_row(tiles: Vec<AnyElement>) -> AnyElement {
+    div().flex().flex_wrap().gap(TILE_GAP).children(tiles).into_any_element()
+}
+
 /// The small badge a library tile shows over its thumbnail: what happened to
 /// this job, in the one word there's room for.
 /// What a job is doing *right now*, as opposed to `JobState`, which is what
@@ -4846,9 +5233,9 @@ mod tests {
     // gone with gpui; the explicit list stays because it documents what is
     // actually under test.
     use super::{
-        AnyElement, Job, JobKind, JobState, LOADING_SWEEP, Live, Phase, Route, RustyDlp,
-        ProbeState, SidebarTab, Stream, Updates, filter_jobs, is_active, is_retryable, job_phase,
-        select_arg, state_after_failure, stream_of,
+        AnyElement, Job, JobKind, JobState, LOADING_SWEEP, Live, Phase, ProbeState, Route,
+        RustyDlp, SidebarTab, Stream, Updates, filter_jobs, is_active, is_group, is_retryable,
+        job_phase, select_arg, sorted_items, state_after_failure, stream_of,
     };
     use crate::core::model::{File as MFile, FileKind, Item};
     use crate::render::Backend;
@@ -4918,6 +5305,293 @@ mod tests {
             }],
         });
         j
+    }
+
+    /// A finished playlist: several videos under one job, deliberately pushed
+    /// out of playlist order, which is how they arrive (yt-dlp reports each
+    /// video as its download finishes, not as the playlist lists them).
+    fn playlist_job(title: &str, count: i64) -> Job {
+        let mut j = Job::new("https://x/list", "default");
+        j.title = title.to_string();
+        j.state = JobState::Done;
+        for n in (0..count).rev() {
+            j.items.push(Item {
+                id: format!("p{n}"),
+                index: n,
+                title: format!("Video {n}"),
+                duration: Some(60.0),
+                thumb_path: None,
+                webpage_url: format!("https://x/list?v={n}"),
+                files: vec![MFile {
+                    id: format!("f{n}"),
+                    path: format!("C:/dl/video{n}.mp4"),
+                    kind: FileKind::Video,
+                    format_id: None,
+                    bytes: Some(1024 * 1024),
+                }],
+            });
+        }
+        j
+    }
+
+    /// Ids of every laid-out box, so a test can ask what the library actually
+    /// put on screen.
+    fn rendered_ids(app: &mut RustyDlp, painter: &mut Painter) -> Vec<String> {
+        let tree = app.render();
+        boxes_of(&tree, painter)
+            .iter()
+            .filter_map(|b| b.node.and_then(|n| n.element_id()).map(|i| i.to_string()))
+            .collect()
+    }
+
+    /// Only a job that landed more than one video is a playlist. A single
+    /// video, whichever URL asked for it, must stay a plain tile rather than
+    /// growing a click in front of the only thing inside it.
+    #[test]
+    fn only_a_multi_item_job_groups() {
+        assert!(!is_group(&job_in(JobState::Done)), "no items at all");
+        assert!(!is_group(&download_job("One", JobState::Done)), "a single video");
+        assert!(is_group(&playlist_job("Mix", 2)));
+        assert!(is_group(&playlist_job("Mix", 40)));
+    }
+
+    /// Items arrive as each download finishes, so anything showing a playlist's
+    /// contents has to put them back in the order yt-dlp listed them.
+    #[test]
+    fn a_playlists_videos_are_shown_in_playlist_order() {
+        let job = playlist_job("Mix", 4);
+        assert_eq!(
+            job.items.iter().map(|i| i.index).collect::<Vec<_>>(),
+            vec![3, 2, 1, 0],
+            "the fixture is deliberately out of order"
+        );
+        assert_eq!(
+            sorted_items(&job).iter().map(|i| i.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    /// The regression this feature exists for: a playlist used to spread one
+    /// tile per video across the library, burying every other download. It
+    /// must contribute exactly one tile until it is opened, and the videos
+    /// must be reachable — as their own tiles — once it is.
+    #[test]
+    fn a_playlist_is_one_tile_until_it_is_expanded() {
+        let (mut app, mut painter) = fixture();
+        let playlist = playlist_job("Some Mix", 5);
+        let group_id = format!("group-{}", playlist.id);
+        app.jobs = vec![playlist.clone(), download_job("A Single Video", JobState::Done)];
+
+        let collapsed = rendered_ids(&mut app, &mut painter);
+        assert!(collapsed.contains(&group_id), "no group tile for the playlist");
+        assert!(
+            !collapsed.iter().any(|id| id.starts_with("tile-p")),
+            "a collapsed playlist must not also list its videos: {collapsed:?}"
+        );
+        assert!(
+            collapsed.iter().any(|id| id.starts_with("tile-")),
+            "the single video keeps its own plain tile"
+        );
+
+        click_id(&mut app, &mut painter, &group_id);
+        assert!(app.expanded_groups.contains(&playlist.id), "the click didn't open it");
+
+        let expanded = rendered_ids(&mut app, &mut painter);
+        for item in &playlist.items {
+            assert!(
+                expanded.contains(&format!("tile-{}", item.id)),
+                "video {} is missing from the opened playlist",
+                item.id
+            );
+        }
+        assert!(expanded.contains(&group_id), "the group tile stays, now open");
+
+        // And it folds back up.
+        click_id(&mut app, &mut painter, &group_id);
+        assert!(!app.expanded_groups.contains(&playlist.id));
+        assert!(
+            !rendered_ids(&mut app, &mut painter)
+                .iter()
+                .any(|id| id.starts_with("tile-p")),
+            "collapsing has to take the videos away again"
+        );
+    }
+
+    /// The point of expanding: the videos inside are the same library tiles as
+    /// anywhere else, so clicking one opens that video's popover rather than
+    /// re-opening the playlist.
+    #[test]
+    fn clicking_a_video_inside_an_expanded_playlist_opens_it() {
+        let (mut app, mut painter) = fixture();
+        let playlist = playlist_job("Some Mix", 3);
+        let job_id = playlist.id.clone();
+        app.expanded_groups.insert(job_id.clone());
+        app.jobs = vec![playlist];
+
+        click_id(&mut app, &mut painter, "tile-p1");
+
+        assert_eq!(app.selected.as_deref(), Some(job_id.as_str()));
+        assert_eq!(app.open_item.as_deref(), Some("p1"), "the popover opens on the video clicked");
+        assert!(app.route == Route::Library);
+        // Opening a video must not close the playlist it was opened from.
+        assert!(app.expanded_groups.contains(&job_id));
+    }
+
+    /// Deleting a job has to forget that its group was open, or the id lingers
+    /// in the set for the life of the process.
+    #[test]
+    fn deleting_a_playlist_forgets_its_expansion() {
+        let (mut app, _painter) = fixture();
+        let playlist = playlist_job("Some Mix", 3);
+        let job_id = playlist.id.clone();
+        app.jobs = vec![playlist];
+        app.expanded_groups.insert(job_id.clone());
+
+        app.delete_job(&job_id);
+        assert!(app.expanded_groups.is_empty());
+    }
+
+    /// A finished single-video job, with ids unique to `n` so several can be
+    /// on screen at once without their tiles sharing an element id.
+    fn single_job(n: usize) -> Job {
+        let mut j = Job::new("https://x/y", "default");
+        j.title = format!("Single {n}");
+        j.state = JobState::Done;
+        j.items.push(Item {
+            id: format!("s{n}"),
+            index: 0,
+            title: format!("Single {n}"),
+            duration: Some(61.0),
+            thumb_path: None,
+            webpage_url: format!("https://x/y?v={n}"),
+            files: vec![MFile {
+                id: format!("sf{n}"),
+                path: "C:/dl/video.mp4".into(),
+                kind: FileKind::Video,
+                format_id: None,
+                bytes: Some(1024 * 1024),
+            }],
+        });
+        j
+    }
+
+    /// Every laid-out box's id and top edge, which is all the row assertions
+    /// need: tiles on one row share a `y`, and a block below has a larger one.
+    fn rendered_tops(app: &mut RustyDlp, painter: &mut Painter) -> Vec<(String, f32)> {
+        let tree = app.render();
+        boxes_of(&tree, painter)
+            .iter()
+            .filter_map(|b| {
+                b.node
+                    .and_then(|n| n.element_id())
+                    .map(|i| (i.to_string(), b.bounds.y))
+            })
+            .collect()
+    }
+
+    /// Lays out once and hands the grid's width back to the app, which is what
+    /// `shell.rs` does after every frame — the column count comes from a real
+    /// measurement, never from an assumption about the window.
+    fn measure(app: &mut RustyDlp, painter: &mut Painter) {
+        let tree = app.render();
+        let boxes = boxes_of(&tree, painter);
+        let width = find_id(&boxes, "library-grid")
+            .expect("the library grid has to be measurable")
+            .bounds
+            .width;
+        app.set_grid_width(width);
+    }
+
+    /// The shipped window is 1180 wide; the library pane's padding leaves
+    /// 1140 for the grid, which is four 220px tiles and their 12px gaps with
+    /// 112px to spare. If this ever changes, the row-break arithmetic below
+    /// is what notices.
+    #[test]
+    fn the_column_count_comes_from_the_measured_grid() {
+        let (mut app, mut painter) = fixture();
+        app.jobs = vec![single_job(0)];
+        assert_eq!(app.grid_columns(), None, "nothing has been laid out yet");
+
+        measure(&mut app, &mut painter);
+        assert_eq!(app.grid_columns(), Some(4));
+
+        // Narrower panes fit fewer, and never fewer than one.
+        app.set_grid_width(700.0);
+        assert_eq!(app.grid_columns(), Some(3));
+        app.set_grid_width(231.0);
+        assert_eq!(app.grid_columns(), Some(1));
+        app.set_grid_width(40.0);
+        assert_eq!(app.grid_columns(), Some(1), "a column count of zero would show nothing");
+    }
+
+    /// Opening a playlist must not evict the tiles beside it. The section runs
+    /// to the end of the row the open tile sits on, so its neighbours keep
+    /// their place in line and only what would not have fitted moves below the
+    /// panel.
+    #[test]
+    fn an_open_playlist_keeps_the_rest_of_its_row_in_line() {
+        let (mut app, mut painter) = fixture();
+        let playlist = playlist_job("Mix", 3);
+        let job_id = playlist.id.clone();
+        let mut jobs = vec![playlist];
+        jobs.extend((0..6).map(single_job));
+        app.jobs = jobs;
+
+        measure(&mut app, &mut painter);
+        assert_eq!(app.grid_columns(), Some(4));
+        app.expanded_groups.insert(job_id.clone());
+
+        let tops = rendered_tops(&mut app, &mut painter);
+        let top = |id: &str| {
+            tops.iter()
+                .find(|(i, _)| i == id)
+                .unwrap_or_else(|| panic!("no box with id {id}"))
+                .1
+        };
+
+        let group = top(&format!("group-{job_id}"));
+        let panel = top(&format!("group-panel-{job_id}"));
+
+        // Three singles fill out the open tile's row of four, beside it.
+        for n in 0..3 {
+            assert_eq!(top(&format!("tile-s{n}")), group, "single {n} left its row");
+        }
+        assert!(panel > group, "the panel has to open below the row, not above it");
+        // The rest could not fit that row, so they carry on under the panel.
+        for n in 3..6 {
+            assert!(
+                top(&format!("tile-s{n}")) > panel,
+                "single {n} should have moved below the open playlist"
+            );
+        }
+    }
+
+    /// Before the grid has ever been measured there is no column count to
+    /// break a row by, so the section ends at the open tile — a sparser row,
+    /// but never a panel spliced into the middle of one.
+    #[test]
+    fn without_a_measurement_the_row_ends_at_the_open_playlist() {
+        let (mut app, mut painter) = fixture();
+        let playlist = playlist_job("Mix", 3);
+        let job_id = playlist.id.clone();
+        let mut jobs = vec![playlist];
+        jobs.extend((0..2).map(single_job));
+        app.jobs = jobs;
+        app.expanded_groups.insert(job_id.clone());
+        assert_eq!(app.grid_columns(), None);
+
+        let tops = rendered_tops(&mut app, &mut painter);
+        let top = |id: &str| {
+            tops.iter()
+                .find(|(i, _)| i == id)
+                .unwrap_or_else(|| panic!("no box with id {id}"))
+                .1
+        };
+        let panel = top(&format!("group-panel-{job_id}"));
+        assert!(panel > top(&format!("group-{job_id}")));
+        for n in 0..2 {
+            assert!(top(&format!("tile-s{n}")) > panel, "single {n} should be below the panel");
+        }
     }
 
     /// The shell renders at the window size the app opens with, and the sidebar
