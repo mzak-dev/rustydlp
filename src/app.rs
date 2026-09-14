@@ -24,6 +24,7 @@ use crate::ui::style::{FluentBuilder as _, ObjectFit, Styled as _};
 use crate::ui::theme::theme;
 use crate::ui::units::{Length, Pixels, px, relative};
 use crate::ui::black;
+use crate::ui::anim::{SWAP_DISTANCE, page_swap};
 use crate::widget::{
     Button, Icon, IconName, Input, InputState, Slider, SliderState, Switch, Tab, TabBar,
 };
@@ -73,7 +74,7 @@ impl Updates {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Route {
     Library,
     Settings,
@@ -1628,37 +1629,81 @@ impl RustyDlp {
             .into_any_element()
     }
 
+    /// Which screen the main pane is showing, as a position on the one
+    /// left-to-right axis the navbar lays its destinations out on: the two
+    /// tabs in the order `TabBar` draws them, then Settings, which sits to the
+    /// right of both in the toolbar. `main_pane` slides a swap along this
+    /// axis, so the direction of travel matches where the thing you clicked
+    /// actually is.
+    fn pane_index(&self) -> u64 {
+        match (self.route, self.tab) {
+            (Route::Settings, _) => 2,
+            (Route::Library, SidebarTab::Home) => 0,
+            (Route::Library, SidebarTab::InProgress) => 1,
+        }
+    }
+
+    /// The screen at `index` on that axis. Called for the screen arriving and,
+    /// while a swap is playing, for the one leaving — both are built from the
+    /// same state, so the outgoing one is a live render rather than a snapshot
+    /// of the last frame (which this renderer, rebuilding the tree every
+    /// frame, keeps nothing of).
+    fn pane_at(&mut self, index: u64) -> AnyElement {
+        match index {
+            2 => self.settings(),
+            1 => self.in_progress_pane(),
+            _ => self.library(),
+        }
+    }
+
     fn main_pane(&mut self) -> AnyElement {
-        // `key` buckets *which screen* is showing: switching tabs replays the
-        // entrance below. Opening the library popover does not change it —
-        // the popover is a separate overlay (see `library_popover`), not a
-        // swap of what the main pane itself shows.
-        let (key, content): (u64, AnyElement) = if self.route == Route::Settings {
-            (0, self.settings())
-        } else {
-            match self.tab {
-                SidebarTab::Home => (1, self.library()),
-                SidebarTab::InProgress => (2, self.in_progress_pane()),
-            }
+        // Opening the library popover does not change the index — the popover
+        // is a separate overlay (see `library_popover`), not a swap of what
+        // the main pane itself shows.
+        let index = self.pane_index();
+        let (leaving, progress) = self.anim.transition("main-pane", index);
+
+        // Both screens are absolutely positioned inside a container that stays
+        // normally flexed (so it keeps its slot in the window's column, at a
+        // fixed size, while its contents move): this layout engine only
+        // resolves an inset offset for an absolutely positioned box — the same
+        // trick `stage()` uses to overlay the player frame without disturbing
+        // its container's size. `left` alone, with `w_full` rather than
+        // `inset_0`, is what makes that offset a slide instead of a squeeze.
+        let pane = |offset: f32, opacity: f32, content: AnyElement| {
+            div()
+                .absolute()
+                .top(px(0.))
+                .left(px(offset))
+                .w_full()
+                .h_full()
+                .flex()
+                .opacity(opacity)
+                .child(content)
         };
 
-        // One-shot fade + bounce-slide entrance, replayed whenever `key`
-        // changes. The inner box is absolutely positioned within the outer
-        // one (which stays normally flexed, unanimated, so it keeps its slot
-        // in the main row) rather than sliding the pane itself, because this
-        // layout engine only resolves an inset offset for an absolutely
-        // positioned box — the same trick `stage()` uses to overlay the
-        // player frame without disturbing its container's size.
-        let progress = self.anim.entrance_progress("main-pane", key);
-        let opacity = progress.clamp(0.0, 1.0);
-        let eased = crate::ui::Animator::ease(progress);
-        let offset = -8.0 + 8.0 * eased;
+        let mut container = h_flex().flex_1().min_h_0().relative().overflow_hidden();
 
-        h_flex()
-            .flex_1()
-            .min_h_0()
-            .child(div().absolute().inset_0().opacity(opacity).top(px(offset)).child(content))
-            .into_any_element()
+        if let Some(from) = leaving {
+            // Forward when the destination sits further right on the axis.
+            let direction = if index > from { 1.0 } else { -1.0 };
+            let swap = page_swap(progress, direction, SWAP_DISTANCE);
+            let outgoing = self.pane_at(from);
+            let incoming = self.pane_at(index);
+            container = container
+                // Painted, but inert: the screen on its way out must not
+                // answer a click aimed at the one arriving over it, and must
+                // not light up under the pointer either.
+                .child(
+                    pane(swap.outgoing_offset, swap.outgoing_opacity, outgoing)
+                        .pointer_events_none(),
+                )
+                .child(pane(swap.incoming_offset, swap.incoming_opacity, incoming));
+        } else {
+            container = container.child(pane(0.0, 1.0, self.pane_at(index)));
+        }
+
+        container.into_any_element()
     }
 
     /// Every finished download or conversion, newest first, as one flat grid
@@ -2298,14 +2343,34 @@ impl RustyDlp {
             .gap_5()
             .overflow_y_scroll()
             .child(
-                v_flex()
-                    .gap_0p5()
-                    .child(div().text_size(px(20.), px(28.)).font_bold().child("Settings"))
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    // Settings is the one screen you arrive at from a toolbar
+                    // button rather than from the tab bar, so it is also the
+                    // one with nowhere obvious to go back to: the tab bar
+                    // shows which tab is selected, not that you are three
+                    // levels away from it. This is that way back, and it
+                    // returns to whichever tab you left, not to a fixed one.
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme().muted_foreground)
-                            .child("App behavior, and presets for how yt-dlp fetches and saves a download."),
+                        Button::new("settings-back")
+                            .ghost()
+                            .icon(IconName::ChevronLeft)
+                            .on_click(|this: &mut Self| {
+                                this.route = Route::Library;
+                                this.close_popover();
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(div().text_size(px(20.), px(28.)).font_bold().child("Settings"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme().muted_foreground)
+                                    .child("App behavior, and presets for how yt-dlp fetches and saves a download."),
+                            ),
                     ),
             )
             .child(general)
@@ -3142,11 +3207,12 @@ impl RustyDlp {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             job.id.hash(&mut h);
             item.as_ref().map(|i| &i.id).hash(&mut h);
-            h.finish()
+            // Low bit forced so an identity can never be `CLOSED`, which
+            // `render` parks this same key at while the popover is shut.
+            h.finish() | 1
         };
         let progress = self.anim.entrance_progress("popover", identity);
-        let opacity = progress.clamp(0.0, 1.0);
-        let offset = 16.0 - 16.0 * crate::ui::Animator::ease(progress);
+        let (opacity, offset) = overlay_entrance(progress);
 
         let fullscreen = self.detail_fullscreen;
         let w = self.anim.tween_f32("popover-w", if fullscreen { 0.97 } else { 0.72 });
@@ -3161,6 +3227,11 @@ impl RustyDlp {
                 .flex()
                 .items_center()
                 .justify_center()
+                // The fade goes on the whole overlay, dimmed backdrop
+                // included: the card arriving over an already-dark window was
+                // half of what made this read as a separate screen appearing
+                // rather than as the tile you clicked opening up.
+                .opacity(opacity)
                 .bg(black().opacity(0.55))
                 .on_click(|this: &mut Self| this.close_popover())
                 .child(
@@ -3169,7 +3240,6 @@ impl RustyDlp {
                         .w(relative(w))
                         .h(relative(h))
                         .top(px(offset))
-                        .opacity(opacity)
                         .rounded(theme().radius)
                         .border_1()
                         .border_color(theme().border)
@@ -3212,7 +3282,7 @@ impl RustyDlp {
         )
     }
 
-    fn modal(&self) -> AnyElement {
+    fn modal(&self, progress: f32) -> AnyElement {
         let preview: AnyElement = match &self.probe {
             ProbeState::Idle => div().into_any_element(),
             ProbeState::Running => div()
@@ -3256,6 +3326,8 @@ impl RustyDlp {
             }
         };
 
+        let (opacity, offset) = overlay_entrance(progress);
+
         // ponytail: hand-rolled overlay rather than gpui_component::dialog —
         // one absolutely-positioned div, no modal-manager lifecycle to learn.
         div()
@@ -3264,9 +3336,12 @@ impl RustyDlp {
             .flex()
             .items_center()
             .justify_center()
+            .opacity(opacity)
             .bg(black().opacity(0.5))
             .child(
                 v_flex()
+                    .relative()
+                    .top(px(offset))
                     .w(px(520.))
                     .p_5()
                     .gap_4()
@@ -3357,10 +3432,12 @@ impl RustyDlp {
         });
     }
 
-    fn convert_format_picker(&self) -> AnyElement {
+    fn convert_format_picker(&self, progress: f32) -> AnyElement {
         let Some(source) = self.convert_picker.clone() else {
             return div().into_any_element();
         };
+
+        let (opacity, offset) = overlay_entrance(progress);
 
         // ponytail: hand-rolled overlay, same as the New download modal —
         // one absolutely-positioned div, no modal-manager lifecycle to learn.
@@ -3370,9 +3447,12 @@ impl RustyDlp {
             .flex()
             .items_center()
             .justify_center()
+            .opacity(opacity)
             .bg(black().opacity(0.5))
             .child(
                 v_flex()
+                    .relative()
+                    .top(px(offset))
                     .w(px(420.))
                     .p_5()
                     .gap_3()
@@ -3620,6 +3700,27 @@ fn toggle(
 /// A raised card grouping related preset fields, so the editor reads as
 /// distinct sections (what to fetch, where it goes, what happens after)
 /// instead of one long flat list of inputs.
+/// The identity an overlay's entrance is parked at while it is closed. Any
+/// real overlay identity is a hash, and `library_popover` forces the low bit
+/// so none of them can collide with it.
+const CLOSED: u64 = 0;
+
+/// The entrance every overlay plays: a fade of the whole thing, backdrop
+/// included, with the card itself rising the last few pixels into place.
+///
+/// One function so the popover and both modals move identically — three
+/// overlays that appeared three different ways is most of what "disconnected"
+/// meant. Returns `(opacity, offset)`; the offset eases with the page-swap
+/// curve rather than the widget bounce, for the reason `ease_out_cubic`
+/// gives.
+fn overlay_entrance(progress: f32) -> (f32, f32) {
+    let t = progress.clamp(0.0, 1.0);
+    (t, OVERLAY_RISE - OVERLAY_RISE * crate::ui::Animator::ease_out(t))
+}
+
+/// How far an overlay's card rises into place.
+const OVERLAY_RISE: f32 = 12.0;
+
 fn settings_section(title: &str, children: Vec<AnyElement>) -> AnyElement {
     v_flex()
         .gap_3()
@@ -3822,12 +3923,24 @@ impl RustyDlp {
         let popover = self.library_popover();
         if popover.is_none() {
             self.ensure_player(None, None);
+            // Resets the popover's entrance while nothing is open. Without a
+            // closed-state poll its identity would still be the last item's,
+            // so reopening that same tile would find nothing changed and skip
+            // the animation entirely — the case where a transition is most
+            // obviously missing is the one you repeat.
+            self.anim.entrance_progress("popover", CLOSED);
         }
-        let modal = if self.modal { Some(self.modal()) } else { None };
+        // Same reason these are polled every frame rather than only while
+        // their overlay is up.
+        let modal_in = self.anim.entrance_progress("modal", self.modal as u64);
+        let convert_in = self
+            .anim
+            .entrance_progress("convert-modal", self.convert_picker.is_some() as u64);
+        let modal = self.modal.then(|| self.modal(modal_in));
         let convert_modal = self
             .convert_picker
             .is_some()
-            .then(|| self.convert_format_picker());
+            .then(|| self.convert_format_picker(convert_in));
         let toast = self.startup_error.clone().map(|msg| self.startup_error_toast(msg));
 
         div()
@@ -3869,13 +3982,17 @@ mod tests {
     // gone with gpui; the explicit list stays because it documents what is
     // actually under test.
     use super::{
-        Job, JobKind, JobState, Route, RustyDlp, SidebarTab, Updates, filter_jobs, is_active,
-        is_retryable, select_arg, state_after_failure,
+        AnyElement, Job, JobKind, JobState, Route, RustyDlp, SidebarTab, Updates, filter_jobs,
+        is_active, is_retryable, select_arg, state_after_failure,
     };
     use crate::core::model::{File as MFile, FileKind, Item};
     use crate::render::Backend;
     use crate::render::raster::RasterBackend;
-    use crate::ui::layout::{ScrollState, layout};
+    use crate::ui::element::div;
+    use crate::ui::event::{dispatch_click, wants_pointer_cursor};
+    use crate::ui::style::Styled as _;
+    use crate::ui::units::px;
+    use crate::ui::layout::{Box_, ScrollState, layout};
     use crate::ui::paint::{Painter, paint};
     use crate::ui::text::Shaper;
     use crate::ui::theme::theme;
@@ -4029,6 +4146,124 @@ mod tests {
         assert!(!r.read_rgba().is_empty(), "settings rendered nothing");
     }
 
+    /// Lays this frame out the way `render` paints it, for the tests that need
+    /// to look at boxes rather than pixels.
+    fn boxes_of<'a>(tree: &'a AnyElement, painter: &mut Painter) -> Vec<Box_<'a, RustyDlp>> {
+        layout(
+            tree,
+            (WINDOW.0 as f32, WINDOW.1 as f32),
+            &mut painter.shaper,
+            &ScrollState::default(),
+        )
+    }
+
+    fn find_text<'a, 'b>(boxes: &'b [Box_<'a, RustyDlp>], text: &str) -> Option<&'b Box_<'a, RustyDlp>> {
+        boxes.iter().find(|b| b.text == Some(text))
+    }
+
+    fn find_id<'a, 'b>(boxes: &'b [Box_<'a, RustyDlp>], id: &str) -> Option<&'b Box_<'a, RustyDlp>> {
+        boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| n.element_id()).is_some_and(|i| &**i == id))
+    }
+
+    /// The complaint this motion answers: the screen you left used to vanish
+    /// on the first frame, so a swap started from an empty window. Both have
+    /// to be on screen, offset from each other, while it plays.
+    #[test]
+    fn both_screens_are_drawn_while_a_page_swap_plays() {
+        let (mut app, mut painter) = fixture();
+        app.jobs = vec![download_job("Some Video", JobState::Done)];
+        // Settles the main pane on Library first -- the very first render of
+        // a screen has nothing to come from and deliberately does not animate.
+        render(&mut app, &mut painter);
+
+        app.route = Route::Settings;
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+
+        let leaving = find_text(&boxes, "Library").expect("the screen being left is still drawn");
+        let arriving = find_text(&boxes, "Settings").expect("the screen arriving is drawn too");
+        assert!(
+            leaving.inherited.opacity > arriving.inherited.opacity,
+            "the fades are staggered: leaving {} vs arriving {}",
+            leaving.inherited.opacity,
+            arriving.inherited.opacity
+        );
+        assert!(
+            arriving.bounds.x > leaving.bounds.x,
+            "and Settings, which sits right of the tabs, slides in from the right"
+        );
+        assert!(!leaving.inherited.interactive, "the outgoing screen is inert");
+        assert!(arriving.inherited.interactive);
+    }
+
+    /// Going back reverses the direction of travel, so the motion says which
+    /// way you moved rather than playing the same animation both ways.
+    #[test]
+    fn going_back_from_settings_slides_the_other_way() {
+        let (mut app, mut painter) = fixture();
+        app.route = Route::Settings;
+        render(&mut app, &mut painter);
+
+        app.route = Route::Library;
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+
+        let leaving = find_text(&boxes, "Settings").expect("settings still drawn");
+        let arriving = find_text(&boxes, "Library").expect("library drawn");
+        assert!(
+            arriving.bounds.x < leaving.bounds.x,
+            "the returning screen comes back in from the left"
+        );
+    }
+
+    /// A click during the crossfade belongs to the screen arriving, never to
+    /// the half-faded one it is replacing.
+    #[test]
+    fn the_outgoing_screen_takes_no_clicks_during_a_swap() {
+        let (mut app, mut painter) = fixture();
+        let job = download_job("Some Video", JobState::Done);
+        app.jobs = vec![job.clone()];
+        render(&mut app, &mut painter);
+
+        app.route = Route::Settings;
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let tile = find_id(&boxes, &format!("tile-{}", job.items[0].id))
+            .expect("the outgoing library's tile is still drawn")
+            .bounds;
+        let (x, y) = (tile.x + tile.width / 2.0, tile.y + tile.height / 2.0);
+        assert!(!wants_pointer_cursor(&boxes, x, y), "no hand cursor over a screen on its way out");
+
+        drop(boxes);
+        drop(tree);
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let mut app2 = app;
+        dispatch_click(&boxes, x, y, &mut app2);
+        assert!(app2.selected.is_none(), "the tile underneath must not open");
+    }
+
+    /// Settings is the one screen reached from a toolbar button rather than
+    /// from the tab bar, so it carries its own way back, top left of its title.
+    #[test]
+    fn settings_has_a_back_button_left_of_its_title() {
+        let (mut app, mut painter) = fixture();
+        app.route = Route::Settings;
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+
+        let back = find_id(&boxes, "settings-back").expect("no back button").bounds;
+        let title = find_text(&boxes, "Settings").expect("no settings title").bounds;
+        assert!(back.x < title.x, "to the left of the label: {} vs {}", back.x, title.x);
+        assert!(back.y < 160.0, "and at the top of the screen: {}", back.y);
+
+        let (cx, cy) = (back.x + back.width / 2.0, back.y + back.height / 2.0);
+        assert!(dispatch_click(&boxes, cx, cy, &mut app), "the back button is clickable");
+        assert_eq!(app.route, Route::Library, "and it goes back to the library");
+    }
+
     /// A selected job opens the detail pane, which is the densest screen: title,
     /// metadata, the action row and the poster.
     #[test]
@@ -4054,6 +4289,147 @@ mod tests {
         app.convert_picker = Some("C:/dl/a.mkv".into());
         let mut r = render(&mut app, &mut painter);
         assert_eq!(r.pixel(590, 380).3, 0xff);
+    }
+
+    // -- transition contact sheets -----------------------------------------
+
+    /// Frame size in the sheet, as a fraction of the window.
+    const SHEET_SCALE: f32 = 0.5;
+    /// Where a transition is sampled, as a fraction of `anim::DURATION`.
+    const SHEET_STEPS: [f32; 6] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+
+    /// Renders `app` at each of `SHEET_STEPS` along a transition that starts
+    /// now, sleeping between frames so the animator -- which reads the clock,
+    /// having no notion of a frame number -- is sampled at those points.
+    fn transition_frames(app: &mut RustyDlp, painter: &mut Painter) -> Vec<(f32, Vec<u8>)> {
+        use crate::ui::anim::DURATION;
+        let start = std::time::Instant::now();
+        let mut out = Vec::new();
+        for step in SHEET_STEPS {
+            let due = start + DURATION.mul_f32(step);
+            if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            out.push((step, render(app, painter).read_rgba()));
+        }
+        out
+    }
+
+    /// Lays the frames out in a grid, captioned with where in the transition
+    /// each one sits. Captions go through the app's own text pipeline, so the
+    /// sheet needs no font handling of its own.
+    fn contact_sheet(frames: &[(f32, Vec<u8>)], painter: &mut Painter) -> RasterBackend {
+        use crate::render::Backend;
+        use crate::ui::rgb;
+
+        const PAD: f32 = 16.0;
+        const CAPTION: f32 = 18.0;
+        const COLS: usize = 3;
+
+        let (fw, fh) = (WINDOW.0 as f32 * SHEET_SCALE, WINDOW.1 as f32 * SHEET_SCALE);
+        let rows = frames.len().div_ceil(COLS);
+        let width = PAD + COLS as f32 * (fw + PAD);
+        let height = PAD + rows as f32 * (CAPTION + fh + PAD);
+
+        let mut sheet = RasterBackend::new(width as u32, height as u32);
+        sheet.begin_frame(width as u32, height as u32, rgb(0x0a0a0a));
+
+        for (i, (step, rgba)) in frames.iter().enumerate() {
+            let x = PAD + (i % COLS) as f32 * (fw + PAD);
+            let y = PAD + (i / COLS) as f32 * (CAPTION + fh + PAD);
+
+            let caption: AnyElement = div()
+                .w(px(fw))
+                .text_xs()
+                .text_color(theme().muted_foreground)
+                .child(format!("{:.0}% of the swap \u{b7} {:.0}ms", step * 100.0, step * 300.0))
+                .into_any_element();
+            let boxes = layout(
+                &caption,
+                (fw, CAPTION),
+                &mut painter.shaper,
+                &ScrollState::default(),
+            );
+            let canvas = sheet.canvas();
+            let restore = canvas.save();
+            canvas.translate((x, y));
+            paint(canvas, &boxes, painter, None);
+            canvas.restore_to_count(restore);
+
+            let info = skia_safe::ImageInfo::new(
+                (WINDOW.0 as i32, WINDOW.1 as i32),
+                skia_safe::ColorType::RGBA8888,
+                skia_safe::AlphaType::Unpremul,
+                None,
+            );
+            let image = skia_safe::images::raster_from_data(
+                &info,
+                skia_safe::Data::new_copy(rgba),
+                WINDOW.0 as usize * 4,
+            )
+            .expect("frame image");
+            let dst = skia_safe::Rect::from_xywh(x, y + CAPTION, fw, fh);
+            let mut opts = skia_safe::Paint::default();
+            opts.set_anti_alias(true);
+            sheet.canvas().draw_image_rect(&image, None, dst, &opts);
+        }
+        sheet
+    }
+
+    /// The mutation a transition case stands in for: exactly what the click
+    /// that starts it would have done.
+    type Navigate = Box<dyn Fn(&mut RustyDlp)>;
+
+    /// Writes one PNG contact sheet per transition, so the motion can be
+    /// looked at rather than only asserted about. Ignored by default: it
+    /// sleeps through five transitions in real time and writes files.
+    ///
+    /// Run with: cargo test --lib -- --ignored transition_contact_sheets
+    #[test]
+    #[ignore = "renders in real time and writes PNGs to target/transitions"]
+    fn transition_contact_sheets() {
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transitions");
+        std::fs::create_dir_all(&out).expect("output dir");
+
+        let job = download_job("Big Buck Bunny (1080p)", JobState::Done);
+        let running = {
+            let mut j = download_job("Sintel trailer", JobState::Running);
+            j.id = "running-1".into();
+            j.items[0].id = "running-item".into();
+            j
+        };
+
+        // Each case renders once to settle the screen it starts on -- the very
+        // first render of a screen has nothing to come from -- then mutates
+        // exactly what the click would have, and samples the result.
+        let cases: Vec<(&str, Navigate)> = vec![
+            ("library-to-settings", Box::new(|a: &mut RustyDlp| a.route = Route::Settings)),
+            ("settings-to-library", Box::new(|a: &mut RustyDlp| a.route = Route::Library)),
+            (
+                "home-to-in-progress",
+                Box::new(|a: &mut RustyDlp| a.tab = SidebarTab::InProgress),
+            ),
+            ("tile-to-popover", Box::new(|a: &mut RustyDlp| a.selected = Some("j-1".into()))),
+            ("new-download-modal", Box::new(|a: &mut RustyDlp| a.modal = true)),
+        ];
+
+        for (name, act) in cases {
+            let (mut app, mut painter) = fixture();
+            let mut first = job.clone();
+            first.id = "j-1".into();
+            app.jobs = vec![first, running.clone()];
+            if name == "settings-to-library" {
+                app.route = Route::Settings;
+            }
+            render(&mut app, &mut painter);
+            act(&mut app);
+
+            let frames = transition_frames(&mut app, &mut painter);
+            let png = contact_sheet(&frames, &mut painter).encode_png();
+            let path = out.join(format!("{name}.png"));
+            std::fs::write(&path, png).expect("write sheet");
+            println!("wrote {}", path.display());
+        }
     }
 
     /// This is a yt-dlp client, so titles are not ASCII. Non-Latin and emoji have

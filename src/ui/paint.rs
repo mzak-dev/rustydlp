@@ -132,9 +132,12 @@ pub fn paint<S>(
         }
 
         // Hover is bounds containment, as in gpui: a parent counts as hovered
-        // while the pointer is over one of its children.
+        // while the pointer is over one of its children. An inert subtree (the
+        // outgoing screen of a page transition) is skipped: it answers no
+        // clicks, so lighting up under the pointer would be a lie.
         let mut style = b.style.clone();
         if let Some(hover) = b.node.and_then(|n| n.hover_style())
+            && b.inherited.interactive
             && let Some((px_, py_)) = pointer
             && b.bounds.contains(px_, py_)
             && clip.is_none_or(|c| c.contains(px_, py_))
@@ -142,10 +145,12 @@ pub fn paint<S>(
             style.layer(hover);
         }
         let b = &Box_ { style, ..*b };
-        // Subtree opacity would need its own layer; every `.opacity()` in the
-        // app is on a colour rather than an element, so this applies to the box
-        // itself and is flagged if an element-level one ever appears.
-        let alpha = b.style.opacity.unwrap_or(1.0);
+        // Every `.opacity()` from the root down, already multiplied together by
+        // `Inherited::refine`. Applied per box rather than by compositing the
+        // subtree into its own layer -- the fade is uniform either way for the
+        // non-overlapping boxes a screen is built from, and it costs no
+        // offscreen surface per faded element.
+        let alpha = b.inherited.opacity;
 
         let radius = radius_of(&b.style, &b.bounds);
         if let Some(bg) = b.style.background

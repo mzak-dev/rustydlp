@@ -92,6 +92,11 @@ pub struct StyleRefinement {
     pub padding: Edges<Option<f32>>,
     pub margin: Edges<Option<f32>>,
     pub absolute: Option<bool>,
+    /// CSS `position: relative` — the box keeps the slot layout gave it, and
+    /// `inset` shifts where it is *drawn* out of that slot. What a card needs
+    /// to lift into place during its entrance without the row it sits in
+    /// reflowing around it.
+    pub relative: Option<bool>,
     pub inset: Edges<Option<f32>>,
     pub overflow_y_scroll: Option<bool>,
     pub overflow_hidden: Option<bool>,
@@ -109,6 +114,11 @@ pub struct StyleRefinement {
     pub border_widths: Edges<Option<f32>>,
     pub border_color: Option<Rgba>,
     pub opacity: Option<f32>,
+    /// Takes this box *and its whole subtree* out of pointer routing: nothing
+    /// inside it hit-tests, hovers or scrolls. Set on the outgoing screen of a
+    /// page transition, which is painted for the length of the crossfade but
+    /// must never answer a click meant for the screen arriving over it.
+    pub pointer_events_none: Option<bool>,
     pub truncate: Option<bool>,
     pub cursor_pointer: Option<bool>,
     pub object_fit: Option<ObjectFit>,
@@ -123,9 +133,9 @@ impl StyleRefinement {
         take!(
             flex, flex_direction, flex_grow, flex_shrink, flex_wrap, align_items,
             justify_content, gap, width, height, min_width, min_height, max_width,
-            absolute, overflow_y_scroll, overflow_hidden, background, text_color,
+            absolute, relative, overflow_y_scroll, overflow_hidden, background, text_color,
             font_size, line_height, font_bold, corner_radius, corner_pill, border_color,
-            opacity, truncate, cursor_pointer, object_fit,
+            opacity, pointer_events_none, truncate, cursor_pointer, object_fit,
         );
         macro_rules! take_edges {
             ($($f:ident),* $(,)?) => { $(
@@ -387,8 +397,16 @@ pub trait Styled: Sized {
         self.style().border_widths.left = Some(1.0);
         self
     }
+    /// Fades the box *and everything inside it*: opacity multiplies down the
+    /// tree (see `Inherited::opacity`), so one call fades a whole screen.
     fn opacity(mut self, v: f32) -> Self {
         self.style().opacity = Some(v);
+        self
+    }
+    /// Makes the box and its subtree inert to the pointer — painted, but
+    /// invisible to hit-testing, hover and scroll. See the field's doc.
+    fn pointer_events_none(mut self) -> Self {
+        self.style().pointer_events_none = Some(true);
         self
     }
 
@@ -422,10 +440,13 @@ pub trait Styled: Sized {
         self.style().absolute = Some(true);
         self
     }
-    /// A no-op for layout here: every box already establishes a containing
-    /// block for its absolute children. Kept so call sites port unchanged, and
-    /// because it documents intent at the call site.
-    fn relative(self) -> Self {
+    /// Establishes a containing block for absolute children — which every box
+    /// here already does, so that part is documentation — *and* opts the box
+    /// into being offset by `top`/`left`/`right`/`bottom` without leaving the
+    /// slot layout gave it. Only boxes that say `.relative()` are offset that
+    /// way, so a stray inset on an ordinary box still means nothing.
+    fn relative(mut self) -> Self {
+        self.style().relative = Some(true);
         self
     }
     fn inset_0(mut self) -> Self {

@@ -12,7 +12,7 @@ pub mod text;
 pub mod theme;
 pub mod units;
 
-pub use anim::Animator;
+pub use anim::{Animator, PageSwap, SWAP_DISTANCE, page_swap};
 pub use color::{Rgba, black, rgb, transparent};
 pub use element::{
     AnyElement, Content, Div, Element, ImageSource, IntoElement, SharedString, TextNode, div,

@@ -7,10 +7,11 @@
 use super::element::SharedString;
 use super::layout::{Box_, inherited_clip};
 
-/// Whether the box is under the pointer and not clipped away from it.
+/// Whether the box is under the pointer, not clipped away from it, and not
+/// inside a `.pointer_events_none()` subtree.
 fn visible_at<S>(boxes: &[Box_<'_, S>], i: usize, x: f32, y: f32) -> bool {
     let b = &boxes[i];
-    if !b.bounds.contains(x, y) {
+    if !b.inherited.interactive || !b.bounds.contains(x, y) {
         return false;
     }
     inherited_clip(boxes, i).is_none_or(|c| c.contains(x, y))
@@ -276,6 +277,47 @@ mod tests {
 
         dispatch_hover(&boxes, &previous, hovered_id(&boxes, 50.0, 500.0), &mut state);
         assert_eq!((state.a, state.b), (false, false), "off both tiles, both left");
+    }
+
+    /// The outgoing screen of a page swap is painted over the whole pane for
+    /// the length of the crossfade. A click during it belongs to the screen
+    /// arriving, never to the one leaving.
+    #[test]
+    fn an_inert_subtree_answers_no_clicks() {
+        // The inert one is drawn last, i.e. on top: paint order alone would
+        // hand it the click, so only the inert flag can keep it off.
+        let tree: Element<Clicks> = div()
+            .w(px(400.))
+            .h(px(300.))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .on_click(|c: &mut Clicks| c.row += 1),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .pointer_events_none()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(400.))
+                            .h(px(300.))
+                            .on_click(|c: &mut Clicks| c.backdrop += 1),
+                    ),
+            )
+            .into_any_element();
+
+        let boxes = lay(&tree, (400.0, 300.0), &ScrollState::default());
+        let mut clicks = Clicks::default();
+        dispatch_click(&boxes, 200.0, 150.0, &mut clicks);
+        assert_eq!((clicks.row, clicks.backdrop), (1, 0), "the screen underneath takes it");
+        assert!(
+            !wants_pointer_cursor(&boxes, 200.0, 150.0),
+            "and the pointer never turns into a hand over a screen that cannot answer"
+        );
     }
 
     /// A row scrolled out of its region must not be clickable, or an invisible
