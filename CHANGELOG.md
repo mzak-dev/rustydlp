@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/mzak-dev/rustydlp/compare/v0.6.0...v0.7.0) (2026-09-14)
+
+
+### Features
+
+* **ui:** cross-fade between screens and add a way back out of Settings ([b521c40](https://github.com/mzak-dev/rustydlp/commit/b521c40f8eb3b2fe5edbc7efd28389cc31da4e24))
+* **ui:** morph the library popover out of the tile that opened it ([1431a90](https://github.com/mzak-dev/rustydlp/commit/1431a901c0660d2e5f56a689ef861e6e7f1b9733))
+* **ui:** rebuild the download and convert dialogs ([ea93836](https://github.com/mzak-dev/rustydlp/commit/ea938368ccd95e9c6342429103c7023a7f0c88ae))
+* **ui:** show a loading bar while a file opens, and stop the download indicator stuttering ([9b9a4b0](https://github.com/mzak-dev/rustydlp/commit/9b9a4b01506e9c41a38f5ac18084e02d71795b68))
+* **ui:** show what a job is actually doing, under the detail pane's files ([caa8381](https://github.com/mzak-dev/rustydlp/commit/caa83814487ecc77e46abf0a4a74d1a5682e4a92))
+
 ## [0.6.0](https://github.com/mzak-dev/rustydlp/compare/rustydlp-v0.5.0...rustydlp-v0.6.0) (2026-09-13)
 
 
