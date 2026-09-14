@@ -156,6 +156,13 @@ pub struct RustyDlp {
     /// A set rather than a single `Option`, because expanding one playlist is
     /// no reason to fold away another the user already opened.
     expanded_groups: HashSet<String>,
+    /// Width the library's tile grid was last laid out at, pushed in by
+    /// `shell.rs` after a frame's layout. `library` needs a column count to
+    /// know where an open playlist's row ends, and the wrap that decides it
+    /// happens in taffy, well after the element tree is built — so the count
+    /// is measured from the frame before rather than assumed. `None` until
+    /// the library has been on screen once.
+    grid_width: Option<f32>,
     route: Route,
     tab: SidebarTab,
     modal: bool,
@@ -507,6 +514,7 @@ impl RustyDlp {
             selected: None,
             open_item: None,
             expanded_groups: HashSet::new(),
+            grid_width: None,
             route: Route::Library,
             tab: SidebarTab::Home,
             modal: false,
@@ -671,6 +679,27 @@ impl RustyDlp {
     /// shortcut changes it without going through `WindowAction` at all).
     pub fn set_window_maximized(&mut self, maximized: bool) {
         self.window_maximized = maximized;
+    }
+
+    /// Records the width the library grid laid out at, and reports whether
+    /// that changed — a changed width means the column count `library` splits
+    /// rows by is stale, so the caller owes one more frame. See `grid_width`.
+    pub fn set_grid_width(&mut self, width: f32) -> bool {
+        let changed = self.grid_width != Some(width);
+        self.grid_width = Some(width);
+        changed
+    }
+
+    /// How many tiles fit across the library grid, from the last measured
+    /// width. `None` before the library has ever been laid out, where the
+    /// only honest answer is "no idea" and `library` falls back to breaking
+    /// the row at the open tile.
+    fn grid_columns(&self) -> Option<usize> {
+        let width = self.grid_width?;
+        // The trailing tile in a row has no gap after it, so the gap is added
+        // to the width rather than subtracted per tile.
+        let cols = (width + TILE_GAP) / (TILE_W.0 + TILE_GAP);
+        Some((cols.floor() as usize).max(1))
     }
 
     /// Steers a slider from a pointer position.
@@ -1681,38 +1710,61 @@ impl RustyDlp {
         let mut jobs = filter_jobs(&self.jobs, SidebarTab::Home);
         jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
 
-        // The grid is a run of wrapping tile rows interrupted by the
+        // The grid is a run of wrapping tile sections interrupted by the
         // full-width panel of whichever playlists are open. Built as one
-        // ordered list of blocks rather than a single wrap container so that
-        // an expanded playlist's videos sit directly under their own group
-        // tile instead of at the end of the grid, and so that the tiles after
-        // it resume on a fresh row rather than wrapping around the panel.
+        // ordered list of blocks rather than a single wrap container, because
+        // a panel has to be able to break the flow — nothing in this layout
+        // engine lets a child span a wrap row the way CSS grid would.
+        //
+        // A section does not stop at the open tile, it stops at the end of
+        // the row the open tile is on: whatever already shares that row keeps
+        // its place beside it, and only the tiles that would not have fitted
+        // move below the panel. That needs a column count, which is what
+        // `grid_columns` measures; without one (the first ever frame) the
+        // section ends at the open tile, which is never wrong, just emptier.
+
+        // Every job puts at least one tile on screen — a group tile, or one
+        // per item — so there is nothing to show exactly when there are no
+        // finished jobs.
+        let is_empty = jobs.is_empty();
+        let columns = self.grid_columns();
         let mut blocks: Vec<AnyElement> = Vec::new();
         let mut row: Vec<AnyElement> = Vec::new();
-        let mut tile_count = 0usize;
+        // Panels owed to the section being filled, in the order their tiles
+        // appear — two playlists opened on the same row stack underneath it.
+        let mut panels: Vec<AnyElement> = Vec::new();
+        let mut close_at: Option<usize> = None;
         for job in &jobs {
             if is_group(job) {
                 let expanded = self.expanded_groups.contains(&job.id);
                 row.push(self.library_group_tile(job, expanded));
-                tile_count += 1;
                 if expanded {
-                    blocks.push(tile_row(std::mem::take(&mut row)));
-                    blocks.push(self.playlist_panel(job));
+                    panels.push(self.playlist_panel(job));
+                    let at = row.len() - 1;
+                    // Keeps the first break: the section always ends at or
+                    // before it, so a second playlist opened within the same
+                    // section is on that same row and asks for the same end.
+                    let at_end_of_row = columns.map_or(row.len(), |c| (at / c + 1) * c);
+                    close_at.get_or_insert(at_end_of_row);
                 }
             } else if job.items.is_empty() {
                 row.push(self.library_tile(job, None));
-                tile_count += 1;
             } else {
                 for item in &job.items {
                     row.push(self.library_tile(job, Some(item)));
-                    tile_count += 1;
                 }
+            }
+            if close_at.is_some_and(|c| row.len() >= c) {
+                blocks.push(tile_row(std::mem::take(&mut row)));
+                blocks.append(&mut panels);
+                close_at = None;
             }
         }
         if !row.is_empty() {
             blocks.push(tile_row(row));
         }
-        let is_empty = tile_count == 0;
+        // A playlist opened by the last tile on screen still owes its panel.
+        blocks.append(&mut panels);
 
         v_flex()
             .id("library-scroll")
@@ -1745,7 +1797,7 @@ impl RustyDlp {
                         ),
                 )
             })
-            .children(blocks)
+            .child(v_flex().id("library-grid").w_full().gap_4().children(blocks))
             .into_any_element()
     }
 
@@ -1791,7 +1843,7 @@ impl RustyDlp {
 
         v_flex()
             .id(SharedString::from(format!("tile-{key}")))
-            .w(px(220.))
+            .w(TILE_W)
             .gap_2()
             .p_2()
             .rounded(theme().radius)
@@ -1922,7 +1974,7 @@ impl RustyDlp {
 
         v_flex()
             .id(SharedString::from(key))
-            .w(px(220.))
+            .w(TILE_W)
             .gap_2()
             .p_2()
             .rounded(theme().radius)
@@ -4082,6 +4134,12 @@ fn filter_jobs(jobs: &[Job], tab: SidebarTab) -> Vec<&Job> {
         .collect()
 }
 
+/// One library tile's width, and the gap between them. Shared by the tiles
+/// themselves and by `grid_columns`, which works out where a row ends from
+/// the same two numbers taffy wraps by.
+const TILE_W: Pixels = px(220.);
+const TILE_GAP: f32 = 12.;
+
 /// Whether a job is shown as one playlist group tile rather than a tile per
 /// video. Two items is already a playlist by yt-dlp's reckoning; one is a
 /// single video whichever URL asked for it, and grouping it would put a
@@ -4103,7 +4161,7 @@ fn sorted_items(job: &Job) -> Vec<&Item> {
 /// One wrapping row of library tiles. The library is a stack of these rather
 /// than a single wrap container, so an expanded playlist can interrupt it.
 fn tile_row(tiles: Vec<AnyElement>) -> AnyElement {
-    div().flex().flex_wrap().gap_3().children(tiles).into_any_element()
+    div().flex().flex_wrap().gap(TILE_GAP).children(tiles).into_any_element()
 }
 
 /// The small badge a library tile shows over its thumbnail: what happened to
@@ -4439,6 +4497,162 @@ mod tests {
 
         app.delete_job(&job_id);
         assert!(app.expanded_groups.is_empty());
+    }
+
+    /// A finished single-video job, with ids unique to `n` so several can be
+    /// on screen at once without their tiles sharing an element id.
+    fn single_job(n: usize) -> Job {
+        let mut j = Job::new("https://x/y", "default");
+        j.title = format!("Single {n}");
+        j.state = JobState::Done;
+        j.items.push(Item {
+            id: format!("s{n}"),
+            index: 0,
+            title: format!("Single {n}"),
+            duration: Some(61.0),
+            thumb_path: None,
+            webpage_url: format!("https://x/y?v={n}"),
+            files: vec![MFile {
+                id: format!("sf{n}"),
+                path: "C:/dl/video.mp4".into(),
+                kind: FileKind::Video,
+                format_id: None,
+                bytes: Some(1024 * 1024),
+            }],
+        });
+        j
+    }
+
+    /// Every laid-out box's id and top edge, which is all the row assertions
+    /// need: tiles on one row share a `y`, and a block below has a larger one.
+    fn rendered_tops(app: &mut RustyDlp, painter: &mut Painter) -> Vec<(String, f32)> {
+        let tree = app.render();
+        let boxes = layout(
+            &tree,
+            (WINDOW.0 as f32, WINDOW.1 as f32),
+            &mut painter.shaper,
+            &ScrollState::default(),
+        );
+        boxes
+            .iter()
+            .filter_map(|b| {
+                b.node
+                    .and_then(|n| n.element_id())
+                    .map(|i| (i.to_string(), b.bounds.y))
+            })
+            .collect()
+    }
+
+    /// Lays out once and hands the grid's width back to the app, which is what
+    /// `shell.rs` does after every frame — the column count comes from a real
+    /// measurement, never from an assumption about the window.
+    fn measure(app: &mut RustyDlp, painter: &mut Painter) {
+        let tree = app.render();
+        let boxes = layout(
+            &tree,
+            (WINDOW.0 as f32, WINDOW.1 as f32),
+            &mut painter.shaper,
+            &ScrollState::default(),
+        );
+        let width = boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| n.element_id()).is_some_and(|i| &**i == "library-grid"))
+            .expect("the library grid has to be measurable")
+            .bounds
+            .width;
+        app.set_grid_width(width);
+    }
+
+    /// The shipped window is 1180 wide; the library pane's padding leaves
+    /// 1140 for the grid, which is four 220px tiles and their 12px gaps with
+    /// 112px to spare. If this ever changes, the row-break arithmetic below
+    /// is what notices.
+    #[test]
+    fn the_column_count_comes_from_the_measured_grid() {
+        let (mut app, mut painter) = fixture();
+        app.jobs = vec![single_job(0)];
+        assert_eq!(app.grid_columns(), None, "nothing has been laid out yet");
+
+        measure(&mut app, &mut painter);
+        assert_eq!(app.grid_columns(), Some(4));
+
+        // Narrower panes fit fewer, and never fewer than one.
+        app.set_grid_width(700.0);
+        assert_eq!(app.grid_columns(), Some(3));
+        app.set_grid_width(231.0);
+        assert_eq!(app.grid_columns(), Some(1));
+        app.set_grid_width(40.0);
+        assert_eq!(app.grid_columns(), Some(1), "a column count of zero would show nothing");
+    }
+
+    /// Opening a playlist must not evict the tiles beside it. The section runs
+    /// to the end of the row the open tile sits on, so its neighbours keep
+    /// their place in line and only what would not have fitted moves below the
+    /// panel.
+    #[test]
+    fn an_open_playlist_keeps_the_rest_of_its_row_in_line() {
+        let (mut app, mut painter) = fixture();
+        let playlist = playlist_job("Mix", 3);
+        let job_id = playlist.id.clone();
+        let mut jobs = vec![playlist];
+        jobs.extend((0..6).map(single_job));
+        app.jobs = jobs;
+
+        measure(&mut app, &mut painter);
+        assert_eq!(app.grid_columns(), Some(4));
+        app.expanded_groups.insert(job_id.clone());
+
+        let tops = rendered_tops(&mut app, &mut painter);
+        let top = |id: &str| {
+            tops.iter()
+                .find(|(i, _)| i == id)
+                .unwrap_or_else(|| panic!("no box with id {id}"))
+                .1
+        };
+
+        let group = top(&format!("group-{job_id}"));
+        let panel = top(&format!("group-panel-{job_id}"));
+
+        // Three singles fill out the open tile's row of four, beside it.
+        for n in 0..3 {
+            assert_eq!(top(&format!("tile-s{n}")), group, "single {n} left its row");
+        }
+        assert!(panel > group, "the panel has to open below the row, not above it");
+        // The rest could not fit that row, so they carry on under the panel.
+        for n in 3..6 {
+            assert!(
+                top(&format!("tile-s{n}")) > panel,
+                "single {n} should have moved below the open playlist"
+            );
+        }
+    }
+
+    /// Before the grid has ever been measured there is no column count to
+    /// break a row by, so the section ends at the open tile — a sparser row,
+    /// but never a panel spliced into the middle of one.
+    #[test]
+    fn without_a_measurement_the_row_ends_at_the_open_playlist() {
+        let (mut app, mut painter) = fixture();
+        let playlist = playlist_job("Mix", 3);
+        let job_id = playlist.id.clone();
+        let mut jobs = vec![playlist];
+        jobs.extend((0..2).map(single_job));
+        app.jobs = jobs;
+        app.expanded_groups.insert(job_id.clone());
+        assert_eq!(app.grid_columns(), None);
+
+        let tops = rendered_tops(&mut app, &mut painter);
+        let top = |id: &str| {
+            tops.iter()
+                .find(|(i, _)| i == id)
+                .unwrap_or_else(|| panic!("no box with id {id}"))
+                .1
+        };
+        let panel = top(&format!("group-panel-{job_id}"));
+        assert!(panel > top(&format!("group-{job_id}")));
+        for n in 0..2 {
+            assert!(top(&format!("tile-s{n}")) > panel, "single {n} should be below the panel");
+        }
     }
 
     /// The shell renders at the window size the app opens with, and the sidebar
