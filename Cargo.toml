@@ -6,9 +6,14 @@ edition = "2024"
 # Everything except the window entry point lives in the library, so the interface
 # can be compiled and golden-tested without one: `cargo test --lib` renders whole
 # screens to a CPU Skia surface, with no GPU and no display server.
+#
+# `cdylib` is what `wasm-bindgen` needs to process the wasm32 build (see
+# `src/web/` and `docs/adr/0005-wasm-render-experiment.md`); `rlib` is what the
+# `rustydlp` binary below and `cargo test --lib` still link against natively.
 [lib]
 name = "rustydlp"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "rustydlp"
@@ -16,12 +21,6 @@ path = "src/main.rs"
 
 [dependencies]
 # -- the interface ----------------------------------------------------------
-# default features matter: `binary-cache` is what downloads the prebuilt static
-# libs. Turning them off 404s on the binaries release and falls back to a full
-# source build, which needs a skia checkout this crate does not ship. That also
-# means `embed-icudtl` comes along whether or not we shape with ICU — prebuilt
-# archives are keyed on the feature combo, so a leaner combo costs more, not less.
-skia-safe = "0.87"
 # Shaping only: glyph ids + positions go to Skia's TextBlob, so Skia's own GPU
 # atlas does the rasterizing. No ICU, no SwashCache bitmap bridge.
 cosmic-text = "0.14"
@@ -48,14 +47,6 @@ softbuffer = "0.4"
 # -- core/ ------------------------------------------------------------------
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# SQLite via rusqlite, synchronous. `bundled` compiles SQLite itself, so the
-# .exe carries no system sqlite3 dependency.
-#
-# Replaced turso, which cost 158 crates against rusqlite's 10 — more than half
-# the whole dependency tree for the one component that needed none of it. Being
-# synchronous also suits this crate: the store is only ever touched from a worker
-# thread, so the async API bought nothing and cost a block_on at every call.
-rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
 # Only the channels: threads in core/ hand events to the interface over these.
 # The `futures` facade would also pull its executor, io and sink crates, none of
@@ -66,6 +57,33 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # these futures complete under a bare block_on, which is what lets this crate
 # avoid an executor entirely.
 pollster = "0.4"
+
+# `core/`, `app.rs`, `render/` and `shell.rs` are native-only: subprocesses
+# (yt-dlp, ffmpeg), OS threads, a bundled C SQLite build and real audio/window
+# devices are all things a wasm32 build cannot have (see `src/lib.rs` and
+# `docs/adr/0005-wasm-render-experiment.md`). Everything those layers need is
+# gathered here rather than left unconditional, so `cargo build --target
+# wasm32-unknown-unknown` never even tries to compile them.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# default features matter: `binary-cache` is what downloads the prebuilt static
+# libs. Turning them off 404s on the binaries release and falls back to a full
+# source build, which needs a skia checkout this crate does not ship. That also
+# means `embed-icudtl` comes along whether or not we shape with ICU — prebuilt
+# archives are keyed on the feature combo, so a leaner combo costs more, not less.
+#
+# No prebuilt archive covers wasm32-unknown-unknown for this feature combo
+# either (confirmed: `skia-bindings`' download 404s and falls back to a full
+# source build even here) — the reason this crate has a `render` and a
+# separate `web` render path instead of one. See ADR-0001 and ADR-0005.
+skia-safe = "0.87"
+# SQLite via rusqlite, synchronous. `bundled` compiles SQLite itself, so the
+# .exe carries no system sqlite3 dependency.
+#
+# Replaced turso, which cost 158 crates against rusqlite's 10 — more than half
+# the whole dependency tree for the one component that needed none of it. Being
+# synchronous also suits this crate: the store is only ever touched from a worker
+# thread, so the async API bought nothing and cost a block_on at every call.
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Resolves the real Videos/Downloads folders via the Windows known-folder API
 # rather than assuming %USERPROFILE%\... — correct when they've been relocated.
 dirs = "6"
@@ -95,6 +113,16 @@ windows = { version = "0.61", features = [
 # doesn't ship a binary for.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# -- src/web/ (wasm32 experiment) --------------------------------------------
+# The whole point of the experiment: no C++ toolchain, no prebuilt-binary
+# lottery, just `cargo build --target wasm32-unknown-unknown` on stable. See
+# docs/adr/0005-wasm-render-experiment.md.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+# Routes a wasm panic to `console.error` instead of a silent abort — the only
+# way to see a panic message in a browser tab.
+console_error_panic_hook = "0.1"
 
 # opt-level 2 on dependencies only — our own crate stays at 0 so incremental
 # rebuilds during UI work stay fast. Skia arrives prebuilt, so this is mostly

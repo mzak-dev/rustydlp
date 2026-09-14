@@ -4,3 +4,6 @@
 channel = "1.95.0"
 profile = "minimal"
 components = ["rustfmt", "clippy"]
+# wasm32-unknown-unknown builds `src/web/`, the experimental browser render
+# path -- see docs/adr/0005-wasm-render-experiment.md.
+targets = ["wasm32-unknown-unknown"]

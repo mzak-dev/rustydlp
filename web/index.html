@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>rustyDLP — wasm experiment</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #0a0a0a;
+    color: #fafafa;
+    font: 14px/1.4 -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
+  p { color: #a3a3a3; max-width: 640px; margin: 0 0 20px; }
+  canvas { display: block; border: 1px solid #262626; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <h1>rustyDLP — WebAssembly render experiment</h1>
+  <p>
+    Layout and paint only, running in the browser. Downloads, conversion and
+    playback need a subprocess and a real filesystem, neither of which a
+    browser sandbox has, so this build fabricates its own screen data instead
+    of talking to yt-dlp or a library database. See
+    <code>docs/adr/0005-wasm-render-experiment.md</code> in the repo for the
+    scope and the reasoning. Winit creates the canvas below itself and appends
+    it here on load.
+  </p>
+  <!-- The wasm-bindgen `web` target produces an ES module with an `init`
+       default export; calling it instantiates and runs the wasm, which then
+       creates and appends its own <canvas> per `src/web/mod.rs`. -->
+  <script type="module">
+    import init from "./dist/rustydlp.js";
+    await init();
+  </script>
+</body>
+</html>

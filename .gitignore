@@ -5,3 +5,7 @@
 
 # Bundled yt-dlp/ffmpeg live next to the built exe; they are fetched, not tracked
 /bin
+
+# wasm-bindgen output for the web/ experiment (docs/adr/0005) -- rebuilt from
+# the wasm32 target, not tracked, same as /target above.
+/web/dist
