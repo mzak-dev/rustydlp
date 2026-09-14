@@ -1,5 +1,7 @@
 //! Draws laid-out boxes onto a Skia canvas.
 
+use std::time::{Duration, Instant};
+
 use skia_safe::{Canvas, Color4f, Paint, RRect, Rect};
 
 use super::color::Rgba;
@@ -99,6 +101,80 @@ pub struct Painter {
     /// at all. Only the last frame is kept: nothing in this app ever shows
     /// two decoded-video images on screen at once.
     pub(crate) video_cache: Option<(u64, skia_safe::Image)>,
+    /// Decoded file-backed images, keyed by path — every library thumbnail.
+    ///
+    /// Without this, `ImageSource::Path` was read off disk and decoded again
+    /// on *every* frame, for every tile on screen. That is invisible while the
+    /// window is static, and ruinous the moment anything animates: a download
+    /// in progress keeps a tween alive, the loop then redraws at 60Hz, and the
+    /// whole grid's PNGs were being re-read sixty times a second behind it.
+    pub(crate) image_cache: ImageCache,
+}
+
+/// See `Painter::image_cache`.
+#[derive(Default)]
+pub(crate) struct ImageCache {
+    entries: std::collections::HashMap<String, CachedImage>,
+    /// Bumped once per `paint`, so eviction can tell what is still on screen.
+    frame: u64,
+}
+
+struct CachedImage {
+    /// `None` for a path that could not be read or decoded — cached too, so a
+    /// missing sidecar is not retried sixty times a second, but with `at` so
+    /// it *is* retried eventually: yt-dlp writes the thumbnail after the row
+    /// for it already exists.
+    image: Option<skia_safe::Image>,
+    at: Instant,
+    last_used: u64,
+}
+
+/// How long a failed decode stays cached before the file is looked at again.
+const RETRY_AFTER: Duration = Duration::from_millis(500);
+
+/// Decoded images kept at once. Each holds its encoded bytes (Skia decodes
+/// lazily into its own bounded resource cache), so this is tens of megabytes
+/// at the very worst, not the whole library.
+const MAX_CACHED_IMAGES: usize = 96;
+
+impl ImageCache {
+    fn begin_frame(&mut self) {
+        self.frame += 1;
+        if self.entries.len() > MAX_CACHED_IMAGES {
+            // Least recently drawn first, down to the cap. A grid scrolled
+            // past the cap re-decodes on the way back, which is a cost paid
+            // once per scroll rather than once per frame.
+            let mut ages: Vec<(u64, String)> = self
+                .entries
+                .iter()
+                .map(|(path, e)| (e.last_used, path.clone()))
+                .collect();
+            ages.sort_unstable();
+            for (_, path) in ages.into_iter().take(self.entries.len() - MAX_CACHED_IMAGES) {
+                self.entries.remove(&path);
+            }
+        }
+    }
+
+    fn get(&mut self, path: &std::path::Path) -> Option<skia_safe::Image> {
+        let key = path.to_string_lossy();
+        let now = Instant::now();
+        if let Some(entry) = self.entries.get_mut(key.as_ref()) {
+            let stale = entry.image.is_none() && now.duration_since(entry.at) >= RETRY_AFTER;
+            if !stale {
+                entry.last_used = self.frame;
+                return entry.image.clone();
+            }
+        }
+        let image = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| skia_safe::Image::from_encoded(skia_safe::Data::new_copy(&bytes)));
+        self.entries.insert(
+            key.into_owned(),
+            CachedImage { image: image.clone(), at: now, last_used: self.frame },
+        );
+        image
+    }
 }
 
 impl Painter {
@@ -115,6 +191,7 @@ pub fn paint<S>(
     painter: &mut Painter,
     pointer: Option<(f32, f32)>,
 ) {
+    painter.image_cache.begin_frame();
     for (i, b) in boxes.iter().enumerate() {
         if b.bounds.width <= 0.0 || b.bounds.height <= 0.0 {
             continue;
@@ -184,7 +261,15 @@ pub fn paint<S>(
 
         match b.node.map(|n| n.content()) {
             Some(Content::Image(src)) => {
-                draw_image(canvas, &b.bounds, src, b.style.object_fit, alpha, &mut painter.video_cache);
+                draw_image(
+                    canvas,
+                    &b.bounds,
+                    src,
+                    b.style.object_fit,
+                    alpha,
+                    &mut painter.video_cache,
+                    &mut painter.image_cache,
+                );
             }
             // An alpha mask filled with the box's text colour, as gpui did.
             Some(Content::Svg(path)) if !path.is_empty() => {
@@ -235,6 +320,7 @@ fn draw_image(
     fit: Option<super::style::ObjectFit>,
     alpha: f32,
     video_cache: &mut Option<(u64, skia_safe::Image)>,
+    images: &mut ImageCache,
 ) {
     use super::element::ImageSource;
     use super::style::ObjectFit;
@@ -264,9 +350,7 @@ fn draw_image(
                 image
             }
         },
-        ImageSource::Path(p) => std::fs::read(p)
-            .ok()
-            .and_then(|bytes| skia_safe::Image::from_encoded(skia_safe::Data::new_copy(&bytes))),
+        ImageSource::Path(p) => images.get(p),
     };
     let Some(image) = image else { return };
 
@@ -463,5 +547,80 @@ mod tests {
             assert!(p[0] > 0, "covered pixels carry the red tint");
             assert_eq!((p[1], p[2]), (0, 0), "and nothing else");
         }
+    }
+
+    /// A tiny real PNG, so the cache has something that actually decodes.
+    fn write_png(path: &std::path::Path) {
+        let mut backend = RasterBackend::new(8, 8);
+        backend.begin_frame(8, 8, rgb(0x336699));
+        std::fs::write(path, backend.encode_png()).expect("write png");
+    }
+
+    /// The whole point of the cache: the second draw of the same thumbnail
+    /// must not go back to disk. Proven by deleting the file in between --
+    /// a re-read would fail, so still getting an image means it came from
+    /// memory. Before this, every tile was re-read and re-decoded on every
+    /// frame, sixty times a second behind any running animation.
+    #[test]
+    fn a_decoded_image_is_reused_instead_of_re_read() {
+        let dir = std::env::temp_dir().join("rustydlp-image-cache-hit");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("thumb.png");
+        write_png(&path);
+
+        let mut cache = ImageCache::default();
+        cache.begin_frame();
+        assert!(cache.get(&path).is_some(), "first read decodes");
+
+        std::fs::remove_file(&path).expect("remove");
+        cache.begin_frame();
+        assert!(cache.get(&path).is_some(), "second draw served from memory, not disk");
+    }
+
+    /// A failure is cached too, or a missing sidecar is retried on every
+    /// frame -- but only briefly, because yt-dlp writes a thumbnail *after*
+    /// the row that shows it already exists.
+    #[test]
+    fn a_failed_read_is_cached_but_not_forever() {
+        let dir = std::env::temp_dir().join("rustydlp-image-cache-miss");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("late.png");
+        let _ = std::fs::remove_file(&path);
+
+        let mut cache = ImageCache::default();
+        cache.begin_frame();
+        assert!(cache.get(&path).is_none(), "nothing there yet");
+
+        write_png(&path);
+        cache.begin_frame();
+        assert!(cache.get(&path).is_none(), "the miss is held, not re-read immediately");
+
+        std::thread::sleep(RETRY_AFTER + Duration::from_millis(20));
+        cache.begin_frame();
+        assert!(cache.get(&path).is_some(), "and picked up once the retry window passes");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Unbounded, the cache would hold every thumbnail a long session ever
+    /// scrolled past.
+    #[test]
+    fn the_image_cache_evicts_down_to_its_cap() {
+        let dir = std::env::temp_dir().join("rustydlp-image-cache-cap");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut cache = ImageCache::default();
+
+        for i in 0..MAX_CACHED_IMAGES + 8 {
+            let path = dir.join(format!("t{i}.png"));
+            write_png(&path);
+            cache.begin_frame();
+            assert!(cache.get(&path).is_some());
+            let _ = std::fs::remove_file(&path);
+        }
+        cache.begin_frame();
+        assert!(
+            cache.entries.len() <= MAX_CACHED_IMAGES,
+            "capped at {MAX_CACHED_IMAGES}, held {}",
+            cache.entries.len()
+        );
     }
 }

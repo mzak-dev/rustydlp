@@ -1020,20 +1020,29 @@ impl RustyDlp {
 
         // `download.events` is already a plain futures channel fed by a thread
         // runner.rs spawned, so pumping it needs a thread and a block_on, not an
-        // executor. `apply_event` still decides when the run ended, but that
-        // decision is made on the app's thread and sent back here.
+        // executor. `apply_event` still decides when the run ended; the flag is
+        // how that decision gets back here.
+        //
+        // Deliberately not a round trip per event. This used to send a reply
+        // channel with every line and block on it, which put the download's
+        // whole event pipe behind the interface's frame rate: one slow repaint
+        // stalled the pump, and the progress a repaint was drawing was
+        // therefore always older than the one it was waiting on. A flag the
+        // handler sets costs nothing and lets yt-dlp's output drain as fast as
+        // it arrives. Ordering is unchanged -- `finish_job` is queued behind
+        // every event already sent, on the same channel.
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.updates.spawn(move |updates| {
             let mut events = download.events;
             while let Some(event) = pollster::block_on(events.next()) {
-                let (tx, rx) = std::sync::mpsc::channel();
                 let id = job_id.clone();
+                let flag = ended.clone();
                 updates.send(move |this| {
-                    let _ = tx.send(this.apply_event(&id, event));
+                    if this.apply_event(&id, event) {
+                        flag.store(true, Ordering::SeqCst);
+                    }
                 });
-                // Unwrap-or-true: a closed channel means the app is gone, which
-                // is the same "stop pumping" answer the old `unwrap_or(true)`
-                // gave when the entity had been dropped.
-                if rx.recv().unwrap_or(true) {
+                if ended.load(Ordering::SeqCst) {
                     break;
                 }
             }
@@ -1614,8 +1623,13 @@ impl RustyDlp {
             if active { theme().sidebar_accent } else { theme().sidebar_accent.opacity(0.0) };
         let bg = self.anim.tween_color(format!("job-bg-{}", job.id), target_bg);
 
+        // `follow_f32`, not `tween_f32`: this bar is a readout of a number
+        // yt-dlp keeps revising, not a surface settling after a click. On the
+        // widget bounce it never reached one value before the next arrived, so
+        // it ran permanently behind the real figure and jittered around it
+        // where the overshoot met the next retarget.
         let target_pct = live.and_then(|l| l.fraction).map(|p| p.clamp(0.0, 1.0));
-        let pct = target_pct.map(|p| self.anim.tween_f32(format!("job-pct-{}", job.id), p));
+        let pct = target_pct.map(|p| self.anim.follow_f32(format!("job-pct-{}", job.id), p));
 
         v_flex()
             .id(SharedString::from(job.id.clone()))
@@ -1665,12 +1679,9 @@ impl RustyDlp {
                                 .h_full()
                                 .rounded_full()
                                 .bg(theme().progress_bar)
-                                // Not reclamped to 0..=1: `pct` is already the
-                                // eased value, and letting a slight overshoot
-                                // past the target through (clipped by the
-                                // track's own `overflow_hidden` if it pokes
-                                // past 100%) is the bounce this app's other
-                                // animated surfaces share.
+                                // `follow_f32` does not overshoot, so this is
+                                // already within 0..=1; the track's own
+                                // `overflow_hidden` stays as the backstop.
                                 .w(relative(pct)),
                         ),
                 )
@@ -2827,11 +2838,16 @@ impl RustyDlp {
     ) -> AnyElement {
         let thumb = item.and_then(|i| i.thumb_path.as_deref());
 
+        // A load is in flight for this item, or one has started and no frame
+        // has come back yet. Either way there is nothing to watch and no
+        // percentage to quote, which is exactly what the bar is for.
+        let loading = self.player_pending.is_some();
+
         let Some(player) = &self.player else {
-            return self.stage(cover(thumb, relative(1.), px(96.)));
+            return self.stage(cover(thumb, relative(1.), px(96.)), loading);
         };
         let Some(frame) = player.frame.clone() else {
-            return self.stage(cover(thumb, relative(1.), px(96.)));
+            return self.stage(cover(thumb, relative(1.), px(96.)), true);
         };
 
         // Read out before syncing: the slider is behind `&mut self`, and the
@@ -2866,6 +2882,9 @@ impl RustyDlp {
                         .size_full()
                         .object_fit(ObjectFit::Contain)
                         .into_any_element(),
+                    // True while a seek is respawning ffmpeg behind the last
+                    // frame of the run it replaced.
+                    loading,
                 ),
             )
             .child(
@@ -2918,7 +2937,15 @@ impl RustyDlp {
     /// 1080p frame stayed letterboxed into the same short strip. `Contain`
     /// keeps the whole frame visible whatever shape the pane ends up, and
     /// `relative` is what the frame positions itself against.
-    fn stage(&self, content: AnyElement) -> AnyElement {
+    ///
+    /// `loading` puts an indeterminate bar over it. Opening a file means
+    /// resolving ffmpeg, probing it and waiting for a first decoded frame, all
+    /// off this thread — seconds, for a large file on a cold cache — and until
+    /// now every one of those seconds looked exactly like a still poster that
+    /// had simply decided not to play. Seeking lands here too: the outgoing
+    /// run's last frame deliberately stays on screen while the new one spins
+    /// up, so without this the picture just sits there, frozen and unexplained.
+    fn stage(&self, content: AnyElement, loading: bool) -> AnyElement {
         div()
             .relative()
             .w_full()
@@ -2930,6 +2957,60 @@ impl RustyDlp {
             .overflow_hidden()
             .bg(black())
             .child(content)
+            .when(loading, |this| {
+                this.child(
+                    v_flex()
+                        .absolute()
+                        .inset_0()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        // Enough of a scrim to read the label against a bright
+                        // poster, not enough to hide what is being opened.
+                        .bg(black().opacity(0.35))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme().foreground.opacity(0.85))
+                                .child("Loading…"),
+                        )
+                        .child(self.indeterminate_bar("stage-loading", px(140.))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// A bar for work with no measurable progress: a segment sweeping the
+    /// track, leaving one end as it enters the other, so the motion never
+    /// stops or doubles back.
+    ///
+    /// Everything else animated in this app is going somewhere — a screen to
+    /// its resting place, a card to its open size, a progress bar to a figure
+    /// yt-dlp reported. This is the one indicator that admits it has no idea
+    /// how far along it is, which is why it loops (`Animator::cycle`) rather
+    /// than tweening toward anything.
+    fn indeterminate_bar(&self, key: &str, width: Pixels) -> AnyElement {
+        let phase = self.anim.cycle(key, LOADING_SWEEP);
+        let segment = width.0 * 0.35;
+        // Starts fully off the left edge and ends fully off the right, so the
+        // wrap at the end of each period is invisible.
+        let x = -segment + (width.0 + segment) * phase;
+        div()
+            .relative()
+            .w(width)
+            .h(px(3.))
+            .rounded_full()
+            .overflow_hidden()
+            .bg(theme().muted)
+            .child(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .w(px(segment))
+                    .h_full()
+                    .rounded_full()
+                    .bg(theme().progress_bar),
+            )
             .into_any_element()
     }
 
@@ -3676,15 +3757,19 @@ impl RustyDlp {
             .and_then(|i| i.duration);
         let output_path = convert.output_path.to_string_lossy().to_string();
 
+        // No round trip per event, for the reason `launch` gives.
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.updates.spawn(move |updates| {
             let mut events = convert.events;
             while let Some(event) = pollster::block_on(events.next()) {
-                let (tx, rx) = std::sync::mpsc::channel();
                 let id = job_id.clone();
+                let flag = ended.clone();
                 updates.send(move |this| {
-                    let _ = tx.send(this.apply_convert_event(&id, duration, event));
+                    if this.apply_convert_event(&id, duration, event) {
+                        flag.store(true, Ordering::SeqCst);
+                    }
                 });
-                if rx.recv().unwrap_or(true) {
+                if ended.load(Ordering::SeqCst) {
                     break;
                 }
             }
@@ -3894,6 +3979,10 @@ fn overlay_entrance(progress: f32) -> (f32, f32) {
     let t = progress.clamp(0.0, 1.0);
     (t, OVERLAY_RISE - OVERLAY_RISE * crate::ui::Animator::ease_out(t))
 }
+
+/// One pass of the indeterminate bar across its track. Slow enough to read as
+/// deliberate rather than frantic; fast enough that a glance catches movement.
+const LOADING_SWEEP: Duration = Duration::from_millis(1100);
 
 /// How far an overlay's card rises into place.
 const OVERLAY_RISE: f32 = 12.0;
@@ -4167,8 +4256,8 @@ mod tests {
     // gone with gpui; the explicit list stays because it documents what is
     // actually under test.
     use super::{
-        AnyElement, Job, JobKind, JobState, Route, RustyDlp, SidebarTab, Updates, filter_jobs,
-        is_active, is_retryable, select_arg, state_after_failure,
+        AnyElement, Job, JobKind, JobState, LOADING_SWEEP, Route, RustyDlp, SidebarTab, Updates,
+        filter_jobs, is_active, is_retryable, select_arg, state_after_failure,
     };
     use crate::core::model::{File as MFile, FileKind, Item};
     use crate::render::Backend;
@@ -4534,6 +4623,37 @@ mod tests {
         assert!(find_id(&boxes, "popover-collapse").is_none(), "and is gone once it lands");
     }
 
+    /// Opening a file means resolving ffmpeg, probing it and waiting for a
+    /// first decoded frame — seconds, on a cold cache — and every one of them
+    /// used to look like a poster that had simply decided not to play.
+    #[test]
+    fn the_stage_shows_a_loading_bar_while_a_file_is_opening() {
+        let dir = std::env::temp_dir().join("rustydlp-stage-loading");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let video = dir.join("clip.mp4");
+        std::fs::write(&video, b"not a real video, only a path that exists").expect("write");
+
+        let (mut app, mut painter) = fixture();
+        let mut job = download_job("Some Video", JobState::Done);
+        job.items[0].files[0].path = video.to_string_lossy().into_owned();
+        app.selected = Some(job.id.clone());
+        app.jobs = vec![job];
+
+        // The render is what calls `ensure_player`, which starts the load and
+        // so sets the pending state the bar keys off, before `player_view`
+        // builds the stage in that same pass.
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        assert!(app.player_pending.is_some(), "a load should be in flight");
+        assert!(
+            find_text(&boxes, "Loading…").is_some(),
+            "the stage says nothing about the wait"
+        );
+        assert!(app.is_animating(), "and the indeterminate bar keeps redrawing");
+
+        let _ = std::fs::remove_file(&video);
+    }
+
     /// A selected job opens the detail pane, which is the densest screen: title,
     /// metadata, the action row and the poster.
     #[test]
@@ -4571,12 +4691,15 @@ mod tests {
     /// Renders `app` at each of `SHEET_STEPS` along a transition that starts
     /// now, sleeping between frames so the animator -- which reads the clock,
     /// having no notion of a frame number -- is sampled at those points.
-    fn transition_frames(app: &mut RustyDlp, painter: &mut Painter) -> Vec<(f32, Vec<u8>)> {
-        use crate::ui::anim::DURATION;
+    fn transition_frames(
+        app: &mut RustyDlp,
+        painter: &mut Painter,
+        over: std::time::Duration,
+    ) -> Vec<(f32, Vec<u8>)> {
         let start = std::time::Instant::now();
         let mut out = Vec::new();
         for step in SHEET_STEPS {
-            let due = start + DURATION.mul_f32(step);
+            let due = start + over.mul_f32(step);
             if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
                 std::thread::sleep(wait);
             }
@@ -4588,7 +4711,11 @@ mod tests {
     /// Lays the frames out in a grid, captioned with where in the transition
     /// each one sits. Captions go through the app's own text pipeline, so the
     /// sheet needs no font handling of its own.
-    fn contact_sheet(frames: &[(f32, Vec<u8>)], painter: &mut Painter) -> RasterBackend {
+    fn contact_sheet(
+        frames: &[(f32, Vec<u8>)],
+        painter: &mut Painter,
+        over: std::time::Duration,
+    ) -> RasterBackend {
         use crate::render::Backend;
         use crate::ui::rgb;
 
@@ -4612,7 +4739,7 @@ mod tests {
                 .w(px(fw))
                 .text_xs()
                 .text_color(theme().muted_foreground)
-                .child(format!("{:.0}% of the swap \u{b7} {:.0}ms", step * 100.0, step * 300.0))
+                .child(format!("{:.0}ms", step * over.as_millis() as f32))
                 .into_any_element();
             let boxes = layout(
                 &caption,
@@ -4721,43 +4848,65 @@ mod tests {
         let noop: fn() -> Navigate = || Box::new(|_: &mut RustyDlp, _: &mut Painter| {});
         let open_popover: fn() -> Navigate =
             || Box::new(|a: &mut RustyDlp, p: &mut Painter| click_id(a, p, "tile-i1"));
+        let swap = crate::ui::anim::DURATION;
 
-        // (name, how the screen it starts on is reached, what starts the
-        // transition). The first runs before the settling render below, the
-        // second right after it.
-        let cases: Vec<(&str, Navigate, Navigate)> = vec![
+        // (name, what the sheet spans, how the screen it starts on is reached,
+        // what starts the animation). The third runs before the settling
+        // render below, the fourth right after it.
+        let cases: Vec<(&str, std::time::Duration, Navigate, Navigate)> = vec![
             (
                 "library-to-settings",
+                swap,
                 noop(),
                 Box::new(|a: &mut RustyDlp, _: &mut Painter| a.route = Route::Settings),
             ),
             (
                 "settings-to-library",
+                swap,
                 Box::new(|a: &mut RustyDlp, _: &mut Painter| a.route = Route::Settings),
                 Box::new(|a: &mut RustyDlp, _: &mut Painter| a.route = Route::Library),
             ),
             (
                 "home-to-in-progress",
+                swap,
                 noop(),
                 Box::new(|a: &mut RustyDlp, _: &mut Painter| a.tab = SidebarTab::InProgress),
             ),
-            ("tile-to-popover", noop(), open_popover()),
+            ("tile-to-popover", swap, noop(), open_popover()),
             (
                 "popover-to-tile",
+                swap,
                 open_popover(),
                 Box::new(|a: &mut RustyDlp, _: &mut Painter| a.close_popover()),
             ),
             (
                 "new-download-modal",
+                swap,
                 noop(),
                 Box::new(|a: &mut RustyDlp, _: &mut Painter| a.modal = true),
             ),
+            // Not a transition: a loop, sampled across one full sweep. The
+            // item's file has to exist for the player to try opening it at
+            // all, so the case points it at a stand-in written next to the
+            // sheets -- nothing decodes it here, the load never completes,
+            // which is exactly the state being photographed.
+            (
+                "player-loading",
+                LOADING_SWEEP,
+                open_popover(),
+                noop(),
+            ),
         ];
 
-        for (name, before, act) in cases {
+        for (name, over, before, act) in cases {
             let (mut app, mut painter) = fixture();
             let mut first = job.clone();
             first.id = "j-1".into();
+            if name == "player-loading" {
+                let stand_in = out.join("fixture-clip.mp4");
+                std::fs::write(&stand_in, b"a path that exists, nothing more").expect("write");
+                first.items[0].files[0].path = stand_in.to_string_lossy().into_owned();
+            }
             app.jobs = vec![first, running.clone()];
             before(&mut app, &mut painter);
             // Twice, a full duration apart: whatever `before` started has to
@@ -4768,8 +4917,8 @@ mod tests {
             render(&mut app, &mut painter);
             act(&mut app, &mut painter);
 
-            let frames = transition_frames(&mut app, &mut painter);
-            let png = contact_sheet(&frames, &mut painter).encode_png();
+            let frames = transition_frames(&mut app, &mut painter, over);
+            let png = contact_sheet(&frames, &mut painter, over).encode_png();
             let path = out.join(format!("{name}.png"));
             std::fs::write(&path, png).expect("write sheet");
             println!("wrote {}", path.display());

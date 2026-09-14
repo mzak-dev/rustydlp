@@ -19,6 +19,16 @@ use super::units::Bounds;
 /// in the app moves at the same pace.
 pub const DURATION: Duration = Duration::from_millis(300);
 
+/// How long a tween that is *following live data* takes to catch up.
+///
+/// Much shorter than `DURATION`, and paired with a curve that does not
+/// overshoot (see [`Animator::follow_f32`]): a download's progress bar is not
+/// a surface settling into place after a gesture, it is a readout of a number
+/// that keeps changing. Given the full 300ms of a bounce it never arrives
+/// before the next value retargets it, so it sits permanently behind the
+/// truth, wobbling — which is what a stuttering progress bar actually is.
+pub const FOLLOW: Duration = Duration::from_millis(120);
+
 /// Overshoots past the target then settles back -- the "bounce" motion
 /// language. Unlike gpui's `AnimationElement`, which debug_asserts the eased
 /// delta stays in `[0, 1]` and panics the instant a true overshoot curve is
@@ -60,8 +70,12 @@ fn lerp_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
     }
 }
 
+fn elapsed_fraction_over(started: Instant, now: Instant, duration: Duration) -> f32 {
+    (now.duration_since(started).as_secs_f32() / duration.as_secs_f32()).min(1.0)
+}
+
 fn elapsed_fraction(started: Instant, now: Instant) -> f32 {
-    (now.duration_since(started).as_secs_f32() / DURATION.as_secs_f32()).min(1.0)
+    elapsed_fraction_over(started, now, DURATION)
 }
 
 /// A `started` timestamp that already reads as settled (`elapsed_fraction`
@@ -139,11 +153,44 @@ pub fn morph_rect(from: Bounds, to: Bounds, progress: f32) -> Bounds {
     }
 }
 
+/// Which curve a tween eases with. Widgets settling into place bounce; a
+/// readout following live data must not, or it reads as noise in the data.
+#[derive(Clone, Copy, PartialEq)]
+enum Curve {
+    Back,
+    Out,
+}
+
+impl Curve {
+    fn apply(self, t: f32) -> f32 {
+        match self {
+            Curve::Back => ease_out_back(t),
+            Curve::Out => ease_out_cubic(t),
+        }
+    }
+}
+
 struct Tween<T> {
     from: T,
     to: T,
     started: Instant,
+    duration: Duration,
+    curve: Curve,
 }
+
+/// A looping indicator's clock. Unlike every other entry here it never
+/// settles, so it is kept alive by being *asked for*: `last_seen` is bumped on
+/// every poll, and `is_animating` only counts cycles polled within
+/// `CYCLE_IDLE`. Stop drawing the indicator and the redraw loop goes back to
+/// sleep on its own, with no teardown call to forget.
+struct Cycle {
+    started: Instant,
+    last_seen: Instant,
+}
+
+/// How long after its last poll a cycle stops holding the loop awake — two
+/// frames at 60Hz, rounded up.
+const CYCLE_IDLE: Duration = Duration::from_millis(50);
 
 struct Entrance {
     identity: u64,
@@ -162,6 +209,7 @@ pub struct Animator {
     floats: RefCell<HashMap<String, Tween<f32>>>,
     colors: RefCell<HashMap<String, Tween<Rgba>>>,
     entrances: RefCell<HashMap<String, Entrance>>,
+    cycles: RefCell<HashMap<String, Cycle>>,
 }
 
 impl Animator {
@@ -169,6 +217,23 @@ impl Animator {
     /// first time this key is seen or once the transition has settled;
     /// otherwise a possibly-overshooting in-between value.
     pub fn tween_f32(&self, key: impl Into<String>, target: f32) -> f32 {
+        self.tween_f32_over(key, target, DURATION, Curve::Back)
+    }
+
+    /// Eases toward `target` fast and without overshoot, for a value that is
+    /// *following something outside the interface* rather than settling after
+    /// an interaction — a download's progress, a conversion's. See [`FOLLOW`].
+    pub fn follow_f32(&self, key: impl Into<String>, target: f32) -> f32 {
+        self.tween_f32_over(key, target, FOLLOW, Curve::Out)
+    }
+
+    fn tween_f32_over(
+        &self,
+        key: impl Into<String>,
+        target: f32,
+        duration: Duration,
+        curve: Curve,
+    ) -> f32 {
         let key = key.into();
         let mut table = self.floats.borrow_mut();
         let now = Instant::now();
@@ -179,20 +244,31 @@ impl Animator {
                     // not from the old target, so reversing direction
                     // mid-flight (collapsing the sidebar back open before the
                     // first tween finished) doesn't jump.
-                    let t = elapsed_fraction(tw.started, now);
-                    tw.from = lerp(tw.from, tw.to, ease_out_back(t));
+                    let t = elapsed_fraction_over(tw.started, now, tw.duration);
+                    tw.from = lerp(tw.from, tw.to, tw.curve.apply(t));
                     tw.to = target;
                     tw.started = now;
+                    tw.duration = duration;
+                    tw.curve = curve;
                 }
-                let t = elapsed_fraction(tw.started, now);
-                lerp(tw.from, tw.to, ease_out_back(t))
+                let t = elapsed_fraction_over(tw.started, now, tw.duration);
+                lerp(tw.from, tw.to, tw.curve.apply(t))
             }
             None => {
                 // Backdated rather than `now`: the very first time a key is
                 // seen there is no prior value to move from, so this starts
                 // already settled instead of reading as "still animating"
                 // for one spurious `DURATION`.
-                table.insert(key, Tween { from: target, to: target, started: settled_start(now) });
+                table.insert(
+                    key,
+                    Tween {
+                        from: target,
+                        to: target,
+                        started: settled_start(now),
+                        duration,
+                        curve,
+                    },
+                );
                 target
             }
         }
@@ -206,16 +282,25 @@ impl Animator {
         match table.get_mut(&key) {
             Some(tw) => {
                 if tw.to != target {
-                    let t = elapsed_fraction(tw.started, now);
-                    tw.from = lerp_rgba(tw.from, tw.to, ease_out_back(t));
+                    let t = elapsed_fraction_over(tw.started, now, tw.duration);
+                    tw.from = lerp_rgba(tw.from, tw.to, tw.curve.apply(t));
                     tw.to = target;
                     tw.started = now;
                 }
-                let t = elapsed_fraction(tw.started, now);
-                lerp_rgba(tw.from, tw.to, ease_out_back(t))
+                let t = elapsed_fraction_over(tw.started, now, tw.duration);
+                lerp_rgba(tw.from, tw.to, tw.curve.apply(t))
             }
             None => {
-                table.insert(key, Tween { from: target, to: target, started: settled_start(now) });
+                table.insert(
+                    key,
+                    Tween {
+                        from: target,
+                        to: target,
+                        started: settled_start(now),
+                        duration: DURATION,
+                        curve: Curve::Back,
+                    },
+                );
                 target
             }
         }
@@ -274,6 +359,24 @@ impl Animator {
         }
     }
 
+    /// A phase that runs `0.0 -> 1.0` over `period` and starts again, for an
+    /// indeterminate indicator: something is happening, but nothing knows how
+    /// far along it is. Every other animation here has a destination; this one
+    /// is the admission that this one doesn't.
+    ///
+    /// Polling is what keeps it running (see [`Cycle`]) — call it while the
+    /// indicator is on screen and stop when it isn't.
+    pub fn cycle(&self, key: impl Into<String>, period: Duration) -> f32 {
+        let key = key.into();
+        let now = Instant::now();
+        let mut table = self.cycles.borrow_mut();
+        let cycle = table.entry(key).or_insert(Cycle { started: now, last_seen: now });
+        cycle.last_seen = now;
+        let elapsed = now.duration_since(cycle.started).as_secs_f32();
+        let period = period.as_secs_f32().max(f32::EPSILON);
+        (elapsed % period) / period
+    }
+
     /// The back-out curve `tween_f32`/`tween_color` ease with, exposed so
     /// `entrance_progress`'s raw fraction can drive a position with the same
     /// motion language.
@@ -292,9 +395,17 @@ impl Animator {
     /// redrawing on a timer, the same way it does while a video plays.
     pub fn is_animating(&self) -> bool {
         let now = Instant::now();
-        self.floats.borrow().values().any(|tw| elapsed_fraction(tw.started, now) < 1.0)
-            || self.colors.borrow().values().any(|tw| elapsed_fraction(tw.started, now) < 1.0)
+        let running = |tw: &Tween<f32>| elapsed_fraction_over(tw.started, now, tw.duration) < 1.0;
+        self.floats.borrow().values().any(running)
+            || self
+                .colors
+                .borrow()
+                .values()
+                .any(|tw| elapsed_fraction_over(tw.started, now, tw.duration) < 1.0)
             || self.entrances.borrow().values().any(|e| elapsed_fraction(e.started, now) < 1.0)
+            // An indeterminate indicator never settles, so it keeps the loop
+            // awake for exactly as long as something is still drawing it.
+            || self.cycles.borrow().values().any(|c| now.duration_since(c.last_seen) < CYCLE_IDLE)
     }
 }
 
@@ -345,6 +456,59 @@ mod tests {
         std::thread::sleep(DURATION + Duration::from_millis(10));
         anim.tween_f32("w", 56.0);
         assert!(!anim.is_animating());
+    }
+
+    /// A progress bar follows a number that keeps changing. On the widget
+    /// bounce it never reached one value before the next arrived, so it sat
+    /// permanently behind the truth and jittered where the overshoot met the
+    /// next retarget. Following has to be quick and monotonic instead.
+    #[test]
+    fn a_follow_tween_catches_up_quickly_and_never_overshoots() {
+        let anim = Animator::default();
+        anim.follow_f32("pct", 0.0);
+        std::thread::sleep(FOLLOW + Duration::from_millis(10));
+
+        // Retargeted repeatedly, the way live progress arrives.
+        let mut last = 0.0;
+        for step in 1..=4 {
+            let target = step as f32 * 0.2;
+            let v = anim.follow_f32("pct", target);
+            assert!(v <= target + f32::EPSILON, "overshot {target}: {v}");
+            assert!(v >= last, "went backwards: {last} then {v}");
+            last = v;
+            std::thread::sleep(Duration::from_millis(40));
+        }
+
+        // And it actually arrives, well inside the 300ms a widget takes.
+        std::thread::sleep(FOLLOW + Duration::from_millis(10));
+        assert_eq!(anim.follow_f32("pct", 0.8), 0.8);
+        assert!(!anim.is_animating(), "settled, so the redraw loop can sleep");
+    }
+
+    /// The indeterminate bar's clock: it loops forever, but only holds the
+    /// redraw loop awake while something is still asking it for a phase.
+    #[test]
+    fn a_cycle_wraps_and_only_runs_while_it_is_polled() {
+        let anim = Animator::default();
+        let period = Duration::from_millis(120);
+
+        let first = anim.cycle("bar", period);
+        assert!(first < 0.2, "starts near the beginning of its period: {first}");
+        assert!(anim.is_animating(), "a polled cycle keeps the loop redrawing");
+
+        std::thread::sleep(Duration::from_millis(60));
+        let mid = anim.cycle("bar", period);
+        assert!(mid > first, "advances: {first} then {mid}");
+
+        // Past the end of a period it wraps rather than clamping.
+        std::thread::sleep(period);
+        let wrapped = anim.cycle("bar", period);
+        assert!((0.0..=1.0).contains(&wrapped), "stays in 0..=1: {wrapped}");
+
+        // Stop drawing the indicator -- stop polling -- and the loop is free
+        // to go back to sleep without anything having to be torn down.
+        std::thread::sleep(CYCLE_IDLE + Duration::from_millis(10));
+        assert!(!anim.is_animating(), "an unpolled cycle holds nothing awake");
     }
 
     #[test]
