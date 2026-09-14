@@ -259,6 +259,9 @@ pub trait Styled: Sized {
     fn gap_1(self) -> Self {
         self.gap(step(1.0))
     }
+    fn gap_1p5(self) -> Self {
+        self.gap(step(1.5))
+    }
     fn gap_2(self) -> Self {
         self.gap(step(2.0))
     }
@@ -311,6 +314,9 @@ pub trait Styled: Sized {
     }
     fn py_2(self) -> Self {
         self.py(step(2.0))
+    }
+    fn py_3(self) -> Self {
+        self.py(step(3.0))
     }
     fn pl(mut self, v: f32) -> Self {
         self.style().padding.left = Some(v);

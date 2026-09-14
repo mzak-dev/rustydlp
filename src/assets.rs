@@ -13,6 +13,7 @@
 
 /// Every embedded asset, keyed by the path the interface asks for.
 static ASSETS: &[(&str, &[u8])] = &[
+    ("icons/chevron-down.svg", include_bytes!("../assets/icons/chevron-down.svg")),
     ("icons/chevron-left.svg", include_bytes!("../assets/icons/chevron-left.svg")),
     ("icons/chevron-right.svg", include_bytes!("../assets/icons/chevron-right.svg")),
     ("icons/close.svg", include_bytes!("../assets/icons/close.svg")),

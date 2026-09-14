@@ -7,6 +7,7 @@ use crate::ui::units::{Pixels, px};
 /// The Lucide icons the interface uses, vendored under `assets/icons`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconName {
+    ChevronDown,
     ChevronLeft,
     ChevronRight,
     Close,
@@ -24,6 +25,7 @@ pub enum IconName {
 impl IconName {
     pub fn path(self) -> &'static str {
         match self {
+            IconName::ChevronDown => "icons/chevron-down.svg",
             IconName::ChevronLeft => "icons/chevron-left.svg",
             IconName::ChevronRight => "icons/chevron-right.svg",
             IconName::Close => "icons/close.svg",
@@ -42,6 +44,7 @@ impl IconName {
 
 /// Every path `IconName` can resolve to. Used by the asset table's test.
 pub const ALL_ICON_PATHS: &[&str] = &[
+    "icons/chevron-down.svg",
     "icons/chevron-left.svg",
     "icons/chevron-right.svg",
     "icons/close.svg",

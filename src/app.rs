@@ -23,7 +23,7 @@ use crate::ui::element::{
 use crate::ui::style::{FluentBuilder as _, ObjectFit, Styled as _};
 use crate::ui::theme::theme;
 use crate::ui::units::{Bounds, Length, Pixels, px, relative};
-use crate::ui::black;
+use crate::ui::{Rgba, black};
 use crate::ui::anim::{SWAP_DISTANCE, morph_rect, page_swap};
 use crate::widget::{
     Button, Icon, IconName, Input, InputState, Slider, SliderState, Switch, Tab, TabBar,
@@ -245,6 +245,15 @@ pub struct RustyDlp {
     /// Reset whenever the popover closes, so reopening a different item always
     /// starts at the compact size.
     detail_fullscreen: bool,
+    /// Which card the pointer is over, as an element id. `.hover()` cannot be
+    /// animated — the pointer's position is resolved at paint time, after the
+    /// tree already exists, so there is no app-state moment to key a tween off
+    /// — so the dialogs push it in here through `on_hover` and tween from it.
+    hover_card: Option<String>,
+    /// Whether the New Download dialog's extra-arguments section is open.
+    /// Collapsed by default: it is for the one download in fifty that needs a
+    /// flag the preset does not carry.
+    advanced_open: bool,
     /// The window's size in logical pixels, pushed in by `shell.rs` every
     /// frame the way `window_maximized` is. `library_popover` computes the
     /// rectangle it morphs into itself (a fraction of the window, centred), so
@@ -578,6 +587,8 @@ impl RustyDlp {
             detail_fullscreen: false,
             // Until `shell.rs` says otherwise, the size it opens the window at
             // -- which is also the size the render tests judge layout at.
+            hover_card: None,
+            advanced_open: false,
             viewport: crate::shell::WINDOW_SIZE,
             click_origin: None,
             morph: None,
@@ -3512,54 +3523,41 @@ impl RustyDlp {
             .into_any_element()
     }
 
-    fn modal(&self, progress: f32) -> AnyElement {
-        let preview: AnyElement = match &self.probe {
-            ProbeState::Idle => div().into_any_element(),
-            ProbeState::Running => div()
-                .text_xs()
-                .text_color(theme().muted_foreground)
-                .child("Fetching info…")
-                .into_any_element(),
-            ProbeState::Err(e) => div()
-                .text_xs()
-                .text_color(theme().danger)
-                .child(e.clone())
-                .into_any_element(),
-            ProbeState::Ok(p) => {
-                let count = p.item_count();
-                let sub = if p.is_playlist() {
-                    format!("Playlist · {count} videos")
-                } else {
-                    match p.duration {
-                        Some(d) => format!("Video · {}", human_duration(d)),
-                        None => "Video".to_string(),
-                    }
-                };
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .text_sm()
-                            .truncate()
-                            .child(p.title.clone().unwrap_or_default()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme().muted_foreground)
-                            .child(sub),
-                    )
-                    .into_any_element()
-            }
+    /// Records which card the pointer is over, so a hover can be *animated*.
+    /// `.hover()` resolves at paint time, after the element tree exists, so
+    /// there is no app-state moment to key a tween off; this is that moment.
+    /// Same route the library grid's hover preview already takes.
+    fn set_hovered(&mut self, key: &str, entered: bool) {
+        if entered {
+            self.hover_card = Some(key.to_string());
+        } else if self.hover_card.as_deref() == Some(key) {
+            self.hover_card = None;
+        }
+    }
+
+    /// A card's background, eased between resting, hovered and selected.
+    /// `follow_color`, not `tween_color`: at the widget's 300ms a highlight
+    /// trails far enough behind the pointer to feel broken.
+    fn card_bg(&self, key: &str, selected: bool) -> Rgba {
+        let hovered = self.hover_card.as_deref() == Some(key);
+        let target = match (selected, hovered) {
+            (true, _) => theme().accent,
+            (false, true) => theme().list_hover,
+            (false, false) => theme().surface,
         };
+        self.anim.follow_color(format!("card-{key}"), target)
+    }
 
-        let (opacity, offset) = overlay_entrance(progress);
+    /// The chrome both dialogs share: a dimmed backdrop, a titled card with an
+    /// icon and a close button, a body, and a footer rule under it. Passed as
+    /// a struct because the alternative is seven positional arguments, four of
+    /// which are strings.
+    fn dialog(&self, chrome: DialogChrome, body: AnyElement, footer: AnyElement) -> AnyElement {
+        let (opacity, offset) = overlay_entrance(chrome.progress);
+        let dismiss = chrome.dismiss;
 
-        // ponytail: hand-rolled overlay rather than gpui_component::dialog —
-        // one absolutely-positioned div, no modal-manager lifecycle to learn.
+        // ponytail: hand-rolled overlay rather than a dialog manager — one
+        // absolutely-positioned div, no lifecycle to learn.
         div()
             .absolute()
             .inset_0()
@@ -3568,79 +3566,396 @@ impl RustyDlp {
             .justify_center()
             .opacity(opacity)
             .bg(black().opacity(0.5))
+            // Clicking away closes it, as the library popover already did.
+            .on_click(move |this: &mut Self| dismiss(this))
             .child(
                 v_flex()
                     .relative()
                     .top(px(offset))
-                    .w(px(520.))
-                    .p_5()
-                    .gap_4()
+                    .w(chrome.width)
                     .rounded(theme().radius)
                     .border_1()
                     .border_color(theme().border)
                     .bg(theme().background)
-                    .child(div().font_bold().child("New download"))
-                    .child(Input::new("url", &self.url_input))
-                    .child(preview)
+                    // So the footer's own background respects the rounded
+                    // corners it sits in.
+                    .overflow_hidden()
+                    // Swallows the click instead of letting it reach the
+                    // backdrop's dismiss — see `dispatch_click`'s ancestor walk.
+                    .on_click(|_: &mut Self| {})
                     .child(
-                        v_flex()
-                            .gap_1()
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap_3()
+                            .px_4()
+                            .py_3()
+                            .border_b_1()
+                            .border_color(theme().border)
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(theme().muted_foreground)
-                                    .child("Preset"),
+                                    .w(px(34.))
+                                    .h(px(34.))
+                                    .flex_shrink_0()
+                                    .rounded(theme().radius)
+                                    .bg(theme().muted)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        svg()
+                                            .path(chrome.icon.path())
+                                            .w(px(16.))
+                                            .h(px(16.))
+                                            .text_color(theme().foreground),
+                                    ),
                             )
                             .child(
-                                h_flex()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .children(self.presets.iter().map(|p| {
-                                        let name = p.name.clone();
-                                        let active =
-                                            self.chosen_preset.as_deref() == Some(p.name.as_str());
-                                        Button::new(SharedString::from(format!("pick-{}", p.name)))
-                                            .small()
-                                            .selected(active)
-                                            .label(p.name.clone())
-                                            .on_click(move |this: &mut Self| {
-                                                this.chosen_preset = Some(name.clone());
-                                            })
-                                    })),
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_size(px(15.), px(20.))
+                                            .font_bold()
+                                            .child(chrome.title),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .truncate()
+                                            .text_color(theme().muted_foreground)
+                                            .child(chrome.subtitle),
+                                    ),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "{}-dialog-close",
+                                    chrome.key
+                                )))
+                                .ghost()
+                                .small()
+                                .icon(IconName::Close)
+                                .on_click(move |this: &mut Self| dismiss(this)),
                             ),
                     )
+                    .child(v_flex().w_full().p_4().child(body))
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme().muted_foreground)
-                                    .child("Override for this download (optional)"),
-                            )
-                            .child(Input::new("override", &self.override_input)),
+                        h_flex()
+                            .w_full()
+                            .px_4()
+                            .py_3()
+                            .border_t_1()
+                            .border_color(theme().border)
+                            .bg(theme().surface)
+                            .child(footer),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The New Download dialog.
+    ///
+    /// Shares its chrome with the convert picker (see `dialog`): both are a
+    /// titled card over a dimmed backdrop, and both used to be an unlabelled
+    /// stack of controls that simply appeared. What is specific to this one is
+    /// the middle: a fixed-height panel that reports what the pasted link turns
+    /// out to be, so the card does not resize under the pointer as the probe
+    /// comes back.
+    fn modal(&self, progress: f32) -> AnyElement {
+        let url = self.url_input.value();
+        let has_url = !url.trim().is_empty();
+        let missing_ytdlp = self.ytdlp.is_none();
+
+        self.dialog(
+            DialogChrome {
+                key: "download",
+                progress,
+                width: px(520.),
+                icon: IconName::Plus,
+                title: "New download".into(),
+                subtitle: "Paste a link, pick how it should be saved.".into(),
+                dismiss: |this: &mut Self| this.modal = false,
+            },
+            v_flex()
+                .w_full()
+                .gap_4()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(field_label("Link"))
+                        .child(Input::new("url", &self.url_input))
+                        .child(self.probe_panel()),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(field_label("Preset"))
+                        .child(h_flex().w_full().flex_wrap().gap_2().children(
+                            self.presets.iter().map(|p| self.preset_card(p)),
+                        )),
+                )
+                .child(self.advanced_section())
+                .into_any_element(),
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .truncate()
+                        .when(missing_ytdlp, |t| t.text_color(theme().danger))
+                        .when(!missing_ytdlp, |t| t.text_color(theme().muted_foreground))
+                        .child(if missing_ytdlp {
+                            "yt-dlp not found — nothing can be downloaded".to_string()
+                        } else if has_url {
+                            String::new()
+                        } else {
+                            "Waiting for a link".to_string()
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(|this: &mut Self| {
+                                    this.modal = false;
+                                }),
+                        )
+                        .child(
+                            // Disabled rather than silently doing nothing:
+                            // `start_download` already returned early on an
+                            // empty URL or a missing binary, with no way for
+                            // the button to say so.
+                            Button::new("go")
+                                .primary()
+                                .label("Download")
+                                .disabled(!has_url || missing_ytdlp)
+                                .on_click(|this: &mut Self| {
+                                    this.start_download();
+                                }),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What the pasted link turns out to be, or what is happening while that
+    /// is being found out.
+    ///
+    /// One panel at a fixed minimum height for all four states. The old
+    /// version rendered nothing at all when idle and a bare line otherwise, so
+    /// the dialog grew and shrank under the pointer every time a probe
+    /// started, finished or failed — the Download button moving out from under
+    /// a click that was already on its way.
+    fn probe_panel(&self) -> AnyElement {
+        let body: AnyElement = match &self.probe {
+            ProbeState::Idle => div()
+                .text_xs()
+                .text_color(theme().muted_foreground)
+                .child("Anything yt-dlp supports — a video, or a whole playlist.")
+                .into_any_element(),
+            ProbeState::Running => v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme().muted_foreground)
+                        .child("Fetching info…"),
+                )
+                .child(self.indeterminate_bar("probe-loading", px(160.)))
+                .into_any_element(),
+            ProbeState::Err(e) => v_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .child(div().text_xs().text_color(theme().danger).child("Could not read that link"))
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .text_xs()
+                        .truncate()
+                        .text_color(theme().muted_foreground)
+                        .child(e.clone()),
+                )
+                .into_any_element(),
+            ProbeState::Ok(p) => {
+                let count = p.item_count();
+                let kind = if p.is_playlist() {
+                    format!("Playlist · {count} videos")
+                } else {
+                    match p.duration {
+                        Some(d) => human_duration(d),
+                        None => "Video".to_string(),
+                    }
+                };
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_sm()
+                            .truncate()
+                            .child(p.title.clone().unwrap_or_else(|| "Untitled".to_string())),
                     )
                     .child(
                         h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("cancel")
-                                    .ghost()
-                                    .label("Cancel")
-                                    .on_click(|this: &mut Self| {
-                                        this.modal = false;
-                                    }),
-                            )
-                            .child(
-                                Button::new("go")
-                                    .primary()
-                                    .label("Download")
-                                    .on_click(|this: &mut Self| {
-                                        this.start_download();
-                                    }),
-                            ),
+                            .flex_wrap()
+                            .gap_1p5()
+                            .child(meta_chip(&kind))
+                            .when_some(p.uploader.clone(), |this, by| this.child(meta_chip(&by))),
+                    )
+                    .into_any_element()
+            }
+        };
+
+        div()
+            .w_full()
+            .min_w_0()
+            // Tall enough for the roomiest of the four states (a title and its
+            // chips), so all four are the same height and the dialog never
+            // resizes as the probe comes back.
+            .min_h(px(68.))
+            .p_3()
+            .rounded(theme().radius)
+            .border_1()
+            .border_color(theme().border)
+            .bg(theme().surface)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// One preset, as a card rather than a pill: the name alone said nothing
+    /// about what picking it would do, and the summary was only visible in
+    /// Settings.
+    fn preset_card(&self, preset: &Preset) -> AnyElement {
+        let name = preset.name.clone();
+        let key = format!("preset-card-{name}");
+        let active = match self.chosen_preset.as_deref() {
+            Some(chosen) => chosen == name,
+            // Nothing picked yet: `start_download` falls back to the default,
+            // so the card that would actually be used is the one shown active.
+            None => preset.is_default,
+        };
+        let bg = self.card_bg(&key, active);
+        let picked = name.clone();
+        let hovered = key.clone();
+
+        v_flex()
+            .id(SharedString::from(key))
+            // Two to a row rather than three: at a third of the card the name
+            // and the Default badge fought each other and the name lost. A few
+            // pixels under half the content box, not exactly half -- at exactly
+            // half, the pair wraps.
+            .w(px(236.))
+            .gap_0p5()
+            .p_3()
+            .rounded(theme().radius)
+            .border_1()
+            .border_color(if active { theme().ring } else { theme().border })
+            .bg(bg)
+            .cursor_pointer()
+            .on_hover(move |this: &mut Self, entered| this.set_hovered(&hovered, entered))
+            .on_click(move |this: &mut Self| {
+                this.chosen_preset = Some(picked.clone());
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1()
+                    .child(div().flex_1().min_w_0().text_sm().truncate().child(preset.name.clone()))
+                    .when(preset.is_default, |t| {
+                        t.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .px_1p5()
+                                .rounded_full()
+                                .bg(theme().muted)
+                                .text_color(theme().muted_foreground)
+                                .child("Default"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_xs()
+                    .truncate()
+                    .text_color(theme().muted_foreground)
+                    .child(preset_summary(&preset.options)),
+            )
+            .into_any_element()
+    }
+
+    /// The per-download argument override, behind a disclosure.
+    ///
+    /// It was a permanently open field with a parenthetical label, which put
+    /// the rarest control in the dialog on the same footing as the link. The
+    /// height is tweened rather than toggled so the card grows into the space
+    /// instead of jumping, and clipped while it moves.
+    fn advanced_section(&self) -> AnyElement {
+        let open = self.advanced_open;
+        // Input height plus the gap above it. Clamped because the bounce
+        // undershoots past zero on the way closed, and a negative height is
+        // not a thing the layout engine should be asked about.
+        let height = self.anim.tween_f32("advanced-height", if open { 40.0 } else { 0.0 }).max(0.0);
+
+        v_flex()
+            .w_full()
+            .child(
+                h_flex()
+                    .id("advanced-toggle")
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(|this: &mut Self| {
+                        this.advanced_open = !this.advanced_open;
+                    })
+                    .child(
+                        svg()
+                            .path(if open {
+                                IconName::ChevronDown.path()
+                            } else {
+                                IconName::ChevronRight.path()
+                            })
+                            .w(px(14.))
+                            .h(px(14.))
+                            .text_color(theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme().muted_foreground)
+                            .child("Extra yt-dlp arguments, this download only"),
                     ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .h(px(height))
+                    .overflow_hidden()
+                    .child(div().w_full().mt_2().child(Input::new("override", &self.override_input))),
             )
             .into_any_element()
     }
@@ -3662,73 +3977,115 @@ impl RustyDlp {
         });
     }
 
+    /// The convert dialog.
+    ///
+    /// Four one-line buttons became four cards that say what each choice
+    /// actually produces — the old list read "MP4 (H.264/AAC)" and left the
+    /// consequence of picking it to whatever the reader already knew about
+    /// containers. Still one click to start: choosing the format *is* the
+    /// decision, and a confirm step would only make you say it twice.
     fn convert_format_picker(&self, progress: f32) -> AnyElement {
         let Some(source) = self.convert_picker.clone() else {
             return div().into_any_element();
         };
 
-        let (opacity, offset) = overlay_entrance(progress);
+        let cards: Vec<AnyElement> = ConvertFormat::ALL
+            .into_iter()
+            .map(|format| self.convert_card(&source, format))
+            .collect();
 
-        // ponytail: hand-rolled overlay, same as the New download modal —
-        // one absolutely-positioned div, no modal-manager lifecycle to learn.
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .opacity(opacity)
-            .bg(black().opacity(0.5))
+        self.dialog(
+            DialogChrome {
+                key: "convert",
+                progress,
+                width: px(480.),
+                icon: IconName::Replace,
+                title: "Convert file".into(),
+                subtitle: file_name(&source),
+                dismiss: |this: &mut Self| this.convert_picker = None,
+            },
+            v_flex()
+                .w_full()
+                .gap_3()
+                .child(field_label("Convert to"))
+                .child(h_flex().w_full().flex_wrap().gap_2().children(cards))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme().muted_foreground)
+                        .child("Always a full re-encode, saved beside the original."),
+                )
+                .into_any_element(),
+            h_flex()
+                .w_full()
+                .justify_end()
+                .child(
+                    Button::new("cancel-convert")
+                        .ghost()
+                        .label("Cancel")
+                        .on_click(|this: &mut Self| {
+                            this.convert_picker = None;
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// One target format. Clicking it starts the conversion.
+    fn convert_card(&self, source: &str, format: ConvertFormat) -> AnyElement {
+        let key = format!("convert-card-{}", format.as_str());
+        let bg = self.card_bg(&key, false);
+        let hovered = key.clone();
+        let source = source.to_string();
+
+        v_flex()
+            .id(SharedString::from(key))
+            // Two to a row, wide enough that `detail` fits without ellipsis,
+            // and a few pixels under half the content box so the pair does not
+            // wrap (see `preset_card`).
+            .w(px(216.))
+            .gap_0p5()
+            .p_3()
+            .rounded(theme().radius)
+            .border_1()
+            .border_color(theme().border)
+            .bg(bg)
+            .cursor_pointer()
+            .on_hover(move |this: &mut Self, entered| this.set_hovered(&hovered, entered))
+            .on_click(move |this: &mut Self| {
+                this.start_convert(source.clone(), format);
+            })
             .child(
-                v_flex()
-                    .relative()
-                    .top(px(offset))
-                    .w(px(420.))
-                    .p_5()
-                    .gap_3()
-                    .rounded(theme().radius)
-                    .border_1()
-                    .border_color(theme().border)
-                    .bg(theme().background)
-                    .child(div().font_bold().child("Convert to…"))
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_sm().child(format.short_label()))
                     .child(
                         div()
-                            .w_full()
-                            .min_w_0()
+                            .flex_shrink_0()
                             .text_xs()
-                            .truncate()
+                            .px_1p5()
+                            .rounded_full()
+                            .bg(theme().muted)
                             .text_color(theme().muted_foreground)
-                            .child(file_name(&source)),
-                    )
-                    .child(v_flex().gap_2().children(ConvertFormat::ALL.into_iter().map(|format| {
-                        let source = source.clone();
-                        Button::new(SharedString::from(format!("convert-as-{}", format.as_str())))
-                            .w_full()
-                            .label(format.label())
-                            .on_click(move |this: &mut Self| {
-                                this.start_convert(source.clone(), format);
-                            })
-                    })))
-                    .child(
-                        h_flex().justify_end().child(
-                            Button::new("cancel-convert")
-                                .ghost()
-                                .label("Cancel")
-                                .on_click(|this: &mut Self| {
-                                    this.convert_picker = None;
-                                }),
-                        ),
+                            .child(format!(".{}", format.as_str())),
                     ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_xs()
+                    .truncate()
+                    .text_color(theme().muted_foreground)
+                    .child(format.detail()),
             )
             .into_any_element()
     }
 
-    /// Creates and immediately launches a Convert job. No staggering queue
-    /// like downloads get — conversions are expected to run one at a time in
-    /// practice, and ffmpeg re-encodes are CPU-bound rather than
-    /// network-rate-limited, so there is no equivalent reason to space them
-    /// out. ponytail: if concurrent converts become common, give this the
-    /// same PendingLaunch/backoff treatment as downloads.
     fn start_convert(&mut self, source: String, format: ConvertFormat) {
         self.convert_picker = None;
 
@@ -3984,6 +4341,44 @@ fn inset_by(rect: Bounds, scale: f32) -> Bounds {
 /// real overlay identity is a hash, and `library_popover` forces the low bit
 /// so none of them can collide with it.
 const CLOSED: u64 = 0;
+
+/// Everything the shared dialog chrome needs that is not its body or footer.
+struct DialogChrome {
+    /// Prefixes the chrome's own element ids, so two dialogs open at once
+    /// cannot collide over them.
+    key: &'static str,
+    progress: f32,
+    width: Pixels,
+    icon: IconName,
+    title: SharedString,
+    subtitle: String,
+    /// What closing it does — the close button and the backdrop both run it.
+    /// A plain fn pointer, since both dialogs' dismissals are a field
+    /// assignment and it has to be copied into two handlers.
+    dismiss: fn(&mut RustyDlp),
+}
+
+/// The small muted caption above a control in a dialog.
+fn field_label(text: &str) -> AnyElement {
+    div()
+        .text_xs()
+        .text_color(theme().muted_foreground)
+        .child(text.to_string())
+        .into_any_element()
+}
+
+/// A read-only pill: one fact about whatever the dialog is describing.
+fn meta_chip(text: &str) -> AnyElement {
+    div()
+        .flex_shrink_0()
+        .text_xs()
+        .px_1p5()
+        .rounded_full()
+        .bg(theme().muted)
+        .text_color(theme().muted_foreground)
+        .child(text.to_string())
+        .into_any_element()
+}
 
 /// The entrance every overlay plays: a fade of the whole thing, backdrop
 /// included, with the card itself rising the last few pixels into place.
@@ -4452,8 +4847,8 @@ mod tests {
     // actually under test.
     use super::{
         AnyElement, Job, JobKind, JobState, LOADING_SWEEP, Live, Phase, Route, RustyDlp,
-        SidebarTab, Stream, Updates, filter_jobs, is_active, is_retryable, job_phase, select_arg,
-        state_after_failure, stream_of,
+        ProbeState, SidebarTab, Stream, Updates, filter_jobs, is_active, is_retryable, job_phase,
+        select_arg, state_after_failure, stream_of,
     };
     use crate::core::model::{File as MFile, FileKind, Item};
     use crate::render::Backend;
@@ -4819,6 +5214,118 @@ mod tests {
         assert!(find_id(&boxes, "popover-collapse").is_none(), "and is gone once it lands");
     }
 
+    /// The dialog must not resize as the probe comes back: the Download
+    /// button moving out from under a click already on its way is the failure
+    /// this is guarding against.
+    #[test]
+    fn the_download_dialog_is_the_same_height_in_every_probe_state() {
+        use crate::core::runner::Probe;
+
+        let states = || {
+            let resolved = Probe {
+                title: Some("Big Buck Bunny".into()),
+                duration: Some(596.0),
+                uploader: Some("Blender Foundation".into()),
+                ..Probe::default()
+            };
+            [
+                ProbeState::Idle,
+                ProbeState::Running,
+                ProbeState::Ok(Box::new(resolved)),
+                ProbeState::Err("ERROR: Unsupported URL".into()),
+            ]
+        };
+
+        let mut heights = Vec::new();
+        for probe in states() {
+            let (mut app, mut painter) = fixture();
+            app.presets = crate::core::model::Preset::seeds("C:/Videos");
+            app.modal = true;
+            app.probe = probe;
+            let tree = app.render();
+            let boxes = boxes_of(&tree, &mut painter);
+            heights.push(find_id(&boxes, "download-dialog-close").expect("no dialog").bounds.y);
+            // The close button's y is the card's top edge plus a constant, so
+            // a card that changed height would show up as a different one.
+        }
+        assert!(
+            heights.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5),
+            "the card moves as the probe resolves: {heights:?}"
+        );
+    }
+
+    /// A button that looks live and does nothing reads as a bug in the app.
+    #[test]
+    fn download_is_disabled_until_there_is_something_to_download() {
+        let handler_present = |app: &mut RustyDlp, painter: &mut Painter| {
+            let tree = app.render();
+            let boxes = boxes_of(&tree, painter);
+            find_id(&boxes, "go")
+                .expect("no download button")
+                .node
+                .and_then(|n| n.click_handler())
+                .is_some()
+        };
+
+        let (mut app, mut painter) = fixture();
+        app.modal = true;
+        app.ytdlp = Some(std::path::PathBuf::from("C:/yt-dlp.exe"));
+        assert!(!handler_present(&mut app, &mut painter), "no link yet");
+
+        let fonts = app.fonts.clone();
+        app.url_input.set_value(&mut fonts.borrow_mut(), "https://example.com/watch?v=x");
+        assert!(handler_present(&mut app, &mut painter), "a link and a binary: live");
+
+        app.ytdlp = None;
+        assert!(!handler_present(&mut app, &mut painter), "no yt-dlp to run it with");
+    }
+
+    /// Clicking away closes a dialog; clicking inside one does not.
+    #[test]
+    fn a_dialog_dismisses_from_the_backdrop_but_not_from_its_own_card() {
+        let (mut app, mut painter) = fixture();
+        app.convert_picker = Some("C:/Videos/clip.mkv".into());
+
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let card = find_id(&boxes, "convert-dialog-close").expect("no dialog").bounds;
+        drop(boxes);
+        drop(tree);
+
+        // Inside the card, well away from any control.
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let _ = dispatch_click(&boxes, card.x - 60.0, card.y + 4.0, &mut app);
+        assert!(app.convert_picker.is_some(), "a click on the card must not dismiss it");
+        drop(boxes);
+        drop(tree);
+
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let _ = dispatch_click(&boxes, 40.0, 600.0, &mut app);
+        assert!(app.convert_picker.is_none(), "a click on the backdrop dismisses");
+    }
+
+    /// Hover has to reach app state to be animatable at all: `.hover()` is
+    /// resolved at paint time, with no moment left to start a tween from.
+    #[test]
+    fn hovering_a_card_is_recorded_in_state_so_it_can_be_tweened() {
+        use crate::ui::event::{dispatch_hover, hovered_id};
+
+        let (mut app, mut painter) = fixture();
+        app.convert_picker = Some("C:/Videos/clip.mkv".into());
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let card = find_id(&boxes, "convert-card-mp4").expect("no mp4 card").bounds;
+        let (x, y) = (card.x + card.width / 2.0, card.y + card.height / 2.0);
+
+        let previous = dispatch_hover(&boxes, &None, hovered_id(&boxes, x, y), &mut app);
+        assert_eq!(app.hover_card.as_deref(), Some("convert-card-mp4"));
+
+        dispatch_hover(&boxes, &previous, None, &mut app);
+        assert_eq!(app.hover_card, None, "and cleared on the way out");
+    }
+
     /// Opening a file means resolving ffmpeg, probing it and waiting for a
     /// first decoded frame — seconds, on a cold cache — and every one of them
     /// used to look like a poster that had simply decided not to play.
@@ -5011,6 +5518,72 @@ mod tests {
         let path = out.join("fixture-thumb.png");
         std::fs::write(&path, r.encode_png()).expect("write thumbnail");
         path.to_string_lossy().into_owned()
+    }
+
+    /// Writes one sheet of the two dialogs in the states worth looking at, so
+    /// the layout can be seen rather than read off the builder calls.
+    ///
+    /// Run with: cargo test --lib -- --ignored dialog_states
+    #[test]
+    #[ignore = "writes a PNG to target/transitions"]
+    fn dialog_states() {
+        use crate::core::runner::Probe;
+
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transitions");
+        std::fs::create_dir_all(&out).expect("output dir");
+
+        let probe_ok = || Probe {
+            title: Some("Big Buck Bunny — full film in 1080p".into()),
+            duration: Some(596.0),
+            uploader: Some("Blender Foundation".into()),
+            ..Probe::default()
+        };
+
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut shot = |caption: &str, prepare: &dyn Fn(&mut RustyDlp)| {
+            let (mut app, mut painter) = fixture();
+            // A fresh install has these; the render fixture does not, and a
+            // dialog photographed with an empty preset row is a photograph of
+            // a state no user is in.
+            app.presets = crate::core::model::Preset::seeds("C:/Users/me/Videos");
+            app.ytdlp = Some(std::path::PathBuf::from("C:/yt-dlp.exe"));
+            prepare(&mut app);
+            // Twice, a settle apart: the entrance is not what this is about.
+            render(&mut app, &mut painter);
+            std::thread::sleep(crate::ui::anim::DURATION);
+            frames.push((caption.to_string(), render(&mut app, &mut painter).read_rgba()));
+        };
+
+        shot("New download · nothing pasted", &|a: &mut RustyDlp| {
+            a.modal = true;
+        });
+        shot("New download · probing", &|a: &mut RustyDlp| {
+            a.modal = true;
+            a.probe = ProbeState::Running;
+        });
+        shot("New download · link resolved", &|a: &mut RustyDlp| {
+            a.modal = true;
+            a.probe = ProbeState::Ok(Box::new(probe_ok()));
+        });
+        shot("New download · link rejected", &|a: &mut RustyDlp| {
+            a.modal = true;
+            a.probe = ProbeState::Err("ERROR: Unsupported URL: https://example.com/x".into());
+        });
+        shot("New download · advanced open", &|a: &mut RustyDlp| {
+            a.modal = true;
+            a.advanced_open = true;
+            a.probe = ProbeState::Ok(Box::new(probe_ok()));
+        });
+        shot("Convert · a format hovered", &|a: &mut RustyDlp| {
+            a.convert_picker = Some("C:/Users/me/Videos/holiday clip.mkv".into());
+            a.hover_card = Some("convert-card-mp3".into());
+        });
+
+        let path = out.join("dialogs.png");
+        let (_, mut painter) = fixture();
+        std::fs::write(&path, contact_sheet(&frames, &mut painter).encode_png())
+            .expect("write sheet");
+        println!("wrote {}", path.display());
     }
 
     /// Writes one sheet showing the detail pane's status chip in each phase a

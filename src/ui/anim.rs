@@ -276,6 +276,23 @@ impl Animator {
 
     /// Same as [`Self::tween_f32`], for a background or text colour.
     pub fn tween_color(&self, key: impl Into<String>, target: Rgba) -> Rgba {
+        self.tween_color_over(key, target, DURATION, Curve::Back)
+    }
+
+    /// A colour that has to keep up with the pointer rather than settle after
+    /// a decision: hover highlights, which at the widget's 300ms trail far
+    /// enough behind the cursor to feel broken.
+    pub fn follow_color(&self, key: impl Into<String>, target: Rgba) -> Rgba {
+        self.tween_color_over(key, target, FOLLOW, Curve::Out)
+    }
+
+    fn tween_color_over(
+        &self,
+        key: impl Into<String>,
+        target: Rgba,
+        duration: Duration,
+        curve: Curve,
+    ) -> Rgba {
         let key = key.into();
         let mut table = self.colors.borrow_mut();
         let now = Instant::now();
@@ -286,6 +303,8 @@ impl Animator {
                     tw.from = lerp_rgba(tw.from, tw.to, tw.curve.apply(t));
                     tw.to = target;
                     tw.started = now;
+                    tw.duration = duration;
+                    tw.curve = curve;
                 }
                 let t = elapsed_fraction_over(tw.started, now, tw.duration);
                 lerp_rgba(tw.from, tw.to, tw.curve.apply(t))
@@ -293,13 +312,7 @@ impl Animator {
             None => {
                 table.insert(
                     key,
-                    Tween {
-                        from: target,
-                        to: target,
-                        started: settled_start(now),
-                        duration: DURATION,
-                        curve: Curve::Back,
-                    },
+                    Tween { from: target, to: target, started: settled_start(now), duration, curve },
                 );
                 target
             }
