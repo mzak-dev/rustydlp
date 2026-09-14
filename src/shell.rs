@@ -32,7 +32,7 @@ use crate::ui::text::Shaper;
 use crate::ui::theme::theme;
 
 /// The size `main.rs` opened the gpui window at.
-const WINDOW_SIZE: (f32, f32) = (1180.0, 760.0);
+pub const WINDOW_SIZE: (f32, f32) = (1180.0, 760.0);
 
 /// The floor `drag_resize_window` (see `resize_direction_at`) can shrink the
 /// window to. Below roughly this, the navbar's three columns -- each with
@@ -153,6 +153,12 @@ impl Shell {
             return;
         };
         self.app.set_window_maximized(window.is_maximized());
+        // The popover morphs between two rectangles it has to compute itself
+        // (see `library_popover`), and only the shell knows how big the window
+        // currently is. Pushed in like `window_maximized` rather than threaded
+        // through `render`, so the signature every screen is built from stays
+        // as it was.
+        self.app.set_viewport(w as f32, h as f32);
         backend.begin_frame(w, h, theme().background);
         let tree = self.app.render();
         let boxes = layout(
@@ -196,7 +202,11 @@ impl Shell {
         self.dragging = self.app.slider_at(&boxes, x, y);
         if let Some(drag) = self.dragging {
             self.app.slider_drag(drag_is_seek(drag), &boxes, x, y, false);
-        } else if dispatch_click(&boxes, x, y, &mut self.app) {
+        } else if let Some(clicked) = dispatch_click(&boxes, x, y, &mut self.app) {
+            // What the click was *on*, kept for whatever the handler opened to
+            // animate out of -- a library tile hands the popover the rectangle
+            // it grows from.
+            self.app.set_click_origin(clicked);
             self.dirty = true;
         } else if self.app.is_titlebar_drag_area(&boxes, x, y)
             && let Some(window) = &self.window

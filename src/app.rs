@@ -22,9 +22,9 @@ use crate::ui::element::{
 };
 use crate::ui::style::{FluentBuilder as _, ObjectFit, Styled as _};
 use crate::ui::theme::theme;
-use crate::ui::units::{Length, Pixels, px, relative};
+use crate::ui::units::{Bounds, Length, Pixels, px, relative};
 use crate::ui::black;
-use crate::ui::anim::{SWAP_DISTANCE, page_swap};
+use crate::ui::anim::{SWAP_DISTANCE, morph_rect, page_swap};
 use crate::widget::{
     Button, Icon, IconName, Input, InputState, Slider, SliderState, Switch, Tab, TabBar,
 };
@@ -236,6 +236,17 @@ pub struct RustyDlp {
     /// Reset whenever the popover closes, so reopening a different item always
     /// starts at the compact size.
     detail_fullscreen: bool,
+    /// The window's size in logical pixels, pushed in by `shell.rs` every
+    /// frame the way `window_maximized` is. `library_popover` computes the
+    /// rectangle it morphs into itself (a fraction of the window, centred), so
+    /// unlike every other screen it cannot leave sizing to the layout engine.
+    viewport: (f32, f32),
+    /// Bounds of the box whose click handler last ran, pushed in by
+    /// `shell.rs`. What the popover grows out of.
+    click_origin: Option<Bounds>,
+    /// The pair of rectangles the popover is travelling between, kept across
+    /// frames so the closing collapse can run it backwards.
+    morph: Option<Morph>,
     /// Muted, autoplay-looped preview for whichever grid tile the pointer has
     /// rested on — a separate pipeline from `player`/`PlayerState` (the
     /// detail popover's own, full-controls player) rather than a shared one,
@@ -248,6 +259,27 @@ pub struct RustyDlp {
     /// Bumped on every hover change so a stale debounce timer or in-flight
     /// load from a tile the pointer has already left can't install itself.
     preview_gen: Arc<AtomicU64>,
+}
+
+/// The two rectangles the library popover animates between: the tile that
+/// opened it, and the card it settles into.
+///
+/// Kept on the app rather than in the `Animator` because only one of the two
+/// is a tween — `to` follows the fullscreen toggle every frame, while `from`
+/// is whatever was clicked and must not move under the animation.
+#[derive(Clone)]
+struct Morph {
+    /// Which open job/item this belongs to, or `CLOSED` once the popover has
+    /// been dismissed — which is what re-anchors the next open to its own
+    /// tile instead of reusing this one's.
+    identity: u64,
+    from: Bounds,
+    to: Bounds,
+    /// The item's thumbnail — the one thing the tile and the open card
+    /// actually have in common, and so what the growing rectangle carries
+    /// while `detail`'s content is still fading in (and what it carries back
+    /// on the way out, when there is no content to render at all).
+    thumb: Option<String>,
 }
 
 /// Live native-playback state for whichever item is currently open in
@@ -535,6 +567,11 @@ impl RustyDlp {
             pending_window_action: None,
             window_maximized: false,
             detail_fullscreen: false,
+            // Until `shell.rs` says otherwise, the size it opens the window at
+            // -- which is also the size the render tests judge layout at.
+            viewport: crate::shell::WINDOW_SIZE,
+            click_origin: None,
+            morph: None,
             hover_preview: None,
             preview_pending: None,
             preview_gen: Arc::new(AtomicU64::new(0)),
@@ -667,6 +704,18 @@ impl RustyDlp {
     /// shortcut changes it without going through `WindowAction` at all).
     pub fn set_window_maximized(&mut self, maximized: bool) {
         self.window_maximized = maximized;
+    }
+
+    /// The window's current size in logical pixels. Pushed in by `shell.rs`
+    /// each frame; see the field.
+    pub fn set_viewport(&mut self, width: f32, height: f32) {
+        self.viewport = (width, height);
+    }
+
+    /// The bounds of the box whose click handler just ran, pushed in by
+    /// `shell.rs` after it routes a click; see the field.
+    pub fn set_click_origin(&mut self, rect: Bounds) {
+        self.click_origin = Some(rect);
     }
 
     /// Steers a slider from a pointer position.
@@ -3177,6 +3226,12 @@ impl RustyDlp {
         self.selected = None;
         self.open_item = None;
         self.detail_fullscreen = false;
+        // The rectangles stay: `render` runs them backwards to collapse the
+        // card into the tile again. Only the identity is dropped, so the next
+        // open anchors to whatever *it* was clicked from.
+        if let Some(m) = &mut self.morph {
+            m.identity = CLOSED;
+        }
         self.ensure_player(None, None);
     }
 
@@ -3184,13 +3239,16 @@ impl RustyDlp {
     /// content, framed as a card over a dimmed backdrop instead of replacing
     /// the whole main pane, with its own close and fullscreen controls.
     ///
-    /// The "morph" is a fade + grow-from-slightly-smaller on open (driven by
-    /// `entrance_progress`, replayed only when the open job/item actually
-    /// changes) plus a smooth resize on the fullscreen toggle (a retargetable
-    /// `tween_f32`, so toggling mid-animation reverses from wherever it
-    /// currently is rather than jumping) — not a literal position-to-position
-    /// FLIP transform, which this renderer's `StyleRefinement` has no scale
-    /// or transform field for.
+    /// It morphs out of the tile you clicked: the card starts at that tile's
+    /// rectangle (`shell.rs` hands it over, since only the laid-out box list
+    /// knows where a tile ended up) and grows to its resting size, which is a
+    /// fraction of the window, centred. There is no transform in this
+    /// renderer, so this is not a scaled-up snapshot the way a compositor
+    /// would do it: the card is genuinely laid out at each intermediate size,
+    /// its overflow clipped, with `detail`'s content fading in over the second
+    /// half once there is room to read it. The fullscreen toggle then resizes
+    /// the same card through a retargetable `tween_f32`, so toggling
+    /// mid-animation reverses from where it is rather than jumping.
     fn library_popover(&mut self) -> Option<AnyElement> {
         let job_id = self.selected.clone()?;
         let job = self.jobs.iter().find(|j| j.id == job_id)?.clone();
@@ -3212,11 +3270,43 @@ impl RustyDlp {
             h.finish() | 1
         };
         let progress = self.anim.entrance_progress("popover", identity);
-        let (opacity, offset) = overlay_entrance(progress);
 
         let fullscreen = self.detail_fullscreen;
         let w = self.anim.tween_f32("popover-w", if fullscreen { 0.97 } else { 0.72 });
         let h = self.anim.tween_f32("popover-h", if fullscreen { 0.95 } else { 0.8 });
+        let to = centered_in(self.viewport, w, h);
+
+        // Anchored once per open: `from` is the tile that was clicked and must
+        // not move under the animation, while `to` is re-read every frame
+        // because the fullscreen tween is still steering it. `close_popover`
+        // parks the identity at `CLOSED`, which is what makes the next open
+        // take its own tile rather than reuse this one's.
+        let anchored = self.morph.as_ref().map(|m| (m.identity, m.from));
+        let from = match anchored {
+            Some((anchor, from)) if anchor == identity => from,
+            // Opened by something that was not a click on a tile (or before
+            // the shell ever routed one): grow from the middle of where the
+            // card will be, which is the old fade-and-rise in geometry form.
+            _ => self.click_origin.take().unwrap_or_else(|| inset_by(to, 0.85)),
+        };
+        let thumb = item.as_ref().and_then(|i| i.thumb_path.clone());
+        self.morph = Some(Morph { identity, from, to, thumb: thumb.clone() });
+        let rect = morph_rect(from, to, progress);
+
+        // The dimmed backdrop and the card's own frame come up quickly -- they
+        // are what make the growing rectangle legible -- while the content
+        // inside waits until the card is nearly full size. Laid out at a
+        // tile's 220px, `detail` is a column of clipped fragments; faded in
+        // late, the card reads as opening rather than as a screen being
+        // rebuilt.
+        //
+        // The thumbnail carries the card until then, and hands over *fast*:
+        // it is full-bleed while `detail` frames the same picture in its
+        // stage, so a long cross-fade between them shows the one image twice,
+        // at two crops. A short one reads as a dissolve.
+        let frame_in = (progress / 0.2).clamp(0.0, 1.0);
+        let content_in = ((progress - 0.4) / 0.3).clamp(0.0, 1.0);
+        let art_in = 1.0 - ((progress - 0.4) / 0.15).clamp(0.0, 1.0);
 
         let content = self.detail(&job, item.as_ref());
 
@@ -3224,22 +3314,19 @@ impl RustyDlp {
             div()
                 .absolute()
                 .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                // The fade goes on the whole overlay, dimmed backdrop
-                // included: the card arriving over an already-dark window was
-                // half of what made this read as a separate screen appearing
-                // rather than as the tile you clicked opening up.
-                .opacity(opacity)
-                .bg(black().opacity(0.55))
+                // Dimmed in step with the card's growth, rather than arriving
+                // as a separate dark sheet over the window.
+                .bg(black().opacity(0.55 * frame_in))
                 .on_click(|this: &mut Self| this.close_popover())
                 .child(
                     div()
-                        .relative()
-                        .w(relative(w))
-                        .h(relative(h))
-                        .top(px(offset))
+                        .id("popover-card")
+                        .absolute()
+                        .left(px(rect.x))
+                        .top(px(rect.y))
+                        .w(px(rect.width))
+                        .h(px(rect.height))
+                        .opacity(frame_in)
                         .rounded(theme().radius)
                         .border_1()
                         .border_color(theme().border)
@@ -3249,13 +3336,19 @@ impl RustyDlp {
                         // through to the backdrop's close handler — see
                         // `dispatch_click`'s ancestor walk.
                         .on_click(|_: &mut Self| {})
-                        .child(div().absolute().inset_0().child(content))
+                        .children(morph_art(thumb.as_deref(), art_in))
+                        .child(div().absolute().inset_0().opacity(content_in).child(content))
                         .child(
                             h_flex()
                                 .absolute()
                                 .top(px(8.))
                                 .right(px(8.))
                                 .gap_1()
+                                // With the content, not with the frame: a
+                                // close button floating in a 220px-wide card
+                                // that is still growing is not offering
+                                // anything worth clicking yet.
+                                .opacity(content_in)
                                 .child(
                                     Button::new("popover-fullscreen")
                                         .ghost()
@@ -3280,6 +3373,44 @@ impl RustyDlp {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The popover's exit: the same two rectangles as the entrance, run the
+    /// other way, so the card collapses back into the tile it came from.
+    ///
+    /// The frame and the item's thumbnail — no `detail` content. Rebuilding
+    /// that content for a view that is on its way out would restart the
+    /// playback `close_popover` just stopped (`detail` is what drives the
+    /// player), and at the sizes the last third of this plays at there would
+    /// be nothing legible in it anyway. The thumbnail is what makes it a morph
+    /// rather than a shrinking box: it is the same picture the tile shows, so
+    /// the card visibly goes back to where it came from. Inert, too: the click that closed it has already been answered,
+    /// and the window underneath is live again from that same frame.
+    fn popover_collapse(&self, morph: &Morph, progress: f32) -> AnyElement {
+        let rect = morph_rect(morph.to, morph.from, progress);
+        let out = 1.0 - progress.clamp(0.0, 1.0);
+        div()
+            .absolute()
+            .inset_0()
+            .pointer_events_none()
+            .bg(black().opacity(0.55 * out))
+            .child(
+                div()
+                    .id("popover-collapse")
+                    .absolute()
+                    .left(px(rect.x))
+                    .top(px(rect.y))
+                    .w(px(rect.width))
+                    .h(px(rect.height))
+                    .opacity(out)
+                    .rounded(theme().radius)
+                    .border_1()
+                    .border_color(theme().border)
+                    .bg(theme().background)
+                    .overflow_hidden()
+                    .children(morph_art(morph.thumb.as_deref(), 1.0)),
+            )
+            .into_any_element()
     }
 
     fn modal(&self, progress: f32) -> AnyElement {
@@ -3700,6 +3831,52 @@ fn toggle(
 /// A raised card grouping related preset fields, so the editor reads as
 /// distinct sections (what to fetch, where it goes, what happens after)
 /// instead of one long flat list of inputs.
+/// The item's thumbnail, full-bleed, for the card to carry while it is
+/// morphing between the tile and its open size — the one thing both ends of
+/// the morph actually show, and what turns a growing rectangle into the
+/// picture you clicked opening up.
+///
+/// `None` when there is no thumbnail on disk, rather than `cover`'s
+/// placeholder box: that box is `muted`, and a card-sized sheet of it flashing
+/// over the window is a worse start than the card's own background, which is
+/// what the detail view behind it is anyway.
+fn morph_art(thumb: Option<&str>, opacity: f32) -> Option<AnyElement> {
+    let path = thumb.filter(|p| std::path::Path::new(p).is_file())?;
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .opacity(opacity)
+            .child(img(PathBuf::from(path)).size_full().object_fit(ObjectFit::Cover))
+            .into_any_element(),
+    )
+}
+
+/// A box of `w` x `h` of the viewport, centred in it — where the library
+/// popover comes to rest, and what it morphs back into the tile from.
+fn centered_in(viewport: (f32, f32), w: f32, h: f32) -> Bounds {
+    let (width, height) = (viewport.0 * w, viewport.1 * h);
+    Bounds {
+        x: (viewport.0 - width) / 2.0,
+        y: (viewport.1 - height) / 2.0,
+        width,
+        height,
+    }
+}
+
+/// `rect` scaled about its own centre. The fallback origin for a popover that
+/// was opened by something other than a click on a tile: with no rectangle to
+/// come from, it grows a little out of where it is going to be.
+fn inset_by(rect: Bounds, scale: f32) -> Bounds {
+    let (width, height) = (rect.width * scale, rect.height * scale);
+    Bounds {
+        x: rect.x + (rect.width - width) / 2.0,
+        y: rect.y + (rect.height - height) / 2.0,
+        width,
+        height,
+    }
+}
+
 /// The identity an overlay's entrance is parked at while it is closed. Any
 /// real overlay identity is a hash, and `library_popover` forces the low bit
 /// so none of them can collide with it.
@@ -3921,15 +4098,22 @@ impl RustyDlp {
         // explicitly, covering every path that closes it (the close button,
         // switching tabs, opening Settings) in one spot.
         let popover = self.library_popover();
-        if popover.is_none() {
+        // Resets the popover's entrance while nothing is open. Without a
+        // closed-state poll its identity would still be the last item's, so
+        // reopening that same tile would find nothing changed and skip the
+        // animation entirely — the case where a transition is most obviously
+        // missing is the one you repeat. It also gives the collapse below the
+        // progress to run on.
+        let closing = if popover.is_none() {
             self.ensure_player(None, None);
-            // Resets the popover's entrance while nothing is open. Without a
-            // closed-state poll its identity would still be the last item's,
-            // so reopening that same tile would find nothing changed and skip
-            // the animation entirely — the case where a transition is most
-            // obviously missing is the one you repeat.
-            self.anim.entrance_progress("popover", CLOSED);
-        }
+            let (was_open, progress) = self.anim.transition("popover", CLOSED);
+            match (was_open, self.morph.as_ref()) {
+                (Some(_), Some(morph)) => Some(self.popover_collapse(morph, progress)),
+                _ => None,
+            }
+        } else {
+            None
+        };
         // Same reason these are polled every frame rather than only while
         // their overlay is up.
         let modal_in = self.anim.entrance_progress("modal", self.modal as u64);
@@ -3950,6 +4134,7 @@ impl RustyDlp {
             .text_color(theme().foreground)
             .child(v_flex().size_full().child(navbar).child(main))
             .children(popover)
+            .children(closing)
             .children(modal)
             .children(convert_modal)
             .children(toast)
@@ -4241,7 +4426,7 @@ mod tests {
         let tree = app.render();
         let boxes = boxes_of(&tree, &mut painter);
         let mut app2 = app;
-        dispatch_click(&boxes, x, y, &mut app2);
+        let _ = dispatch_click(&boxes, x, y, &mut app2);
         assert!(app2.selected.is_none(), "the tile underneath must not open");
     }
 
@@ -4260,8 +4445,93 @@ mod tests {
         assert!(back.y < 160.0, "and at the top of the screen: {}", back.y);
 
         let (cx, cy) = (back.x + back.width / 2.0, back.y + back.height / 2.0);
-        assert!(dispatch_click(&boxes, cx, cy, &mut app), "the back button is clickable");
+        assert!(dispatch_click(&boxes, cx, cy, &mut app).is_some(), "the back button is clickable");
         assert_eq!(app.route, Route::Library, "and it goes back to the library");
+    }
+
+    /// The popover is not a panel that appears over the library: it is the
+    /// tile you clicked, growing. The first frame of it has to be at the
+    /// tile's rectangle, and the last at its resting one.
+    #[test]
+    fn the_popover_grows_out_of_the_tile_that_opened_it() {
+        let (mut app, mut painter) = fixture();
+        app.jobs = vec![download_job("Some Video", JobState::Done)];
+        render(&mut app, &mut painter);
+
+        let tile = {
+            let tree = app.render();
+            let boxes = boxes_of(&tree, &mut painter);
+            find_id(&boxes, "tile-i1").expect("no tile").bounds
+        };
+        click_id(&mut app, &mut painter, "tile-i1");
+
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let opening = find_id(&boxes, "popover-card").expect("no popover card").bounds;
+        assert!(
+            (opening.x - tile.x).abs() < 60.0 && (opening.y - tile.y).abs() < 60.0,
+            "starts on the tile, not centred: {opening:?} vs {tile:?}"
+        );
+        assert!(
+            opening.width < tile.width * 2.0,
+            "and at roughly the tile's size: {}",
+            opening.width
+        );
+        drop(boxes);
+        drop(tree);
+
+        std::thread::sleep(crate::ui::anim::DURATION + std::time::Duration::from_millis(20));
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let settled = find_id(&boxes, "popover-card").expect("no popover card").bounds;
+        let (vw, vh) = (WINDOW.0 as f32, WINDOW.1 as f32);
+        assert!((settled.width - vw * 0.72).abs() < 1.0, "settles at 72% wide: {settled:?}");
+        assert!((settled.height - vh * 0.8).abs() < 1.0, "and 80% tall: {settled:?}");
+        assert!(
+            (settled.x - (vw - settled.width) / 2.0).abs() < 1.0,
+            "centred once it gets there: {settled:?}"
+        );
+    }
+
+    /// And it goes back the same way. The collapsing card carries no content
+    /// (see `popover_collapse`) and must not take clicks: the one that closed
+    /// it has already been answered.
+    #[test]
+    fn closing_collapses_the_card_back_toward_the_tile() {
+        let (mut app, mut painter) = fixture();
+        app.jobs = vec![download_job("Some Video", JobState::Done)];
+        render(&mut app, &mut painter);
+        let tile = {
+            let tree = app.render();
+            let boxes = boxes_of(&tree, &mut painter);
+            find_id(&boxes, "tile-i1").expect("no tile").bounds
+        };
+        click_id(&mut app, &mut painter, "tile-i1");
+        render(&mut app, &mut painter);
+        std::thread::sleep(crate::ui::anim::DURATION + std::time::Duration::from_millis(20));
+        render(&mut app, &mut painter);
+
+        app.close_popover();
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        let ghost = find_id(&boxes, "popover-collapse").expect("nothing collapsing");
+        assert!(
+            ghost.bounds.width > tile.width * 2.0,
+            "starts at the open card's size: {:?}",
+            ghost.bounds
+        );
+        assert!(!ghost.inherited.interactive, "and answers no clicks on the way out");
+        assert!(
+            find_id(&boxes, "popover-card").is_none(),
+            "the real popover is gone -- this is only its shape"
+        );
+
+        drop(boxes);
+        drop(tree);
+        std::thread::sleep(crate::ui::anim::DURATION + std::time::Duration::from_millis(20));
+        let tree = app.render();
+        let boxes = boxes_of(&tree, &mut painter);
+        assert!(find_id(&boxes, "popover-collapse").is_none(), "and is gone once it lands");
     }
 
     /// A selected job opens the detail pane, which is the densest screen: title,
@@ -4376,9 +4646,53 @@ mod tests {
         sheet
     }
 
-    /// The mutation a transition case stands in for: exactly what the click
-    /// that starts it would have done.
-    type Navigate = Box<dyn Fn(&mut RustyDlp)>;
+    /// What a transition case does to get the app into its before/after
+    /// state. Given the painter too, so a case can route a real click through
+    /// a real laid-out frame rather than reaching past it into the fields the
+    /// handler would have set.
+    type Navigate = Box<dyn Fn(&mut RustyDlp, &mut Painter)>;
+
+    /// Clicks the centre of the box with this id, the way `shell.rs` would:
+    /// handler first, then the clicked rectangle handed back to the app, which
+    /// is what the popover morphs out of.
+    fn click_id(app: &mut RustyDlp, painter: &mut Painter, id: &str) {
+        let tree = app.render();
+        let boxes = boxes_of(&tree, painter);
+        let rect = find_id(&boxes, id).unwrap_or_else(|| panic!("no box with id {id}")).bounds;
+        let (x, y) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+        let clicked = dispatch_click(&boxes, x, y, app).expect("nothing handled the click");
+        app.set_click_origin(clicked);
+    }
+
+    /// A recognisable stand-in for a real thumbnail, written next to the
+    /// sheets. The morph's whole claim is that the same picture is on screen
+    /// at both ends of it, and a fixture whose items have no art on disk
+    /// cannot show that either way.
+    fn fixture_thumb(out: &std::path::Path) -> String {
+        use crate::render::Backend;
+        use crate::ui::rgb;
+
+        let (w, h) = (480u32, 270u32);
+        let mut r = RasterBackend::new(w, h);
+        r.begin_frame(w, h, rgb(0x1d3557));
+        let canvas = r.canvas();
+        let mut paint = skia_safe::Paint::default();
+        paint.set_anti_alias(true);
+        paint.set_color(skia_safe::Color::from_rgb(0xf1, 0xa2, 0x08));
+        canvas.draw_circle((360.0, 80.0), 42.0, &paint);
+        paint.set_color(skia_safe::Color::from_rgb(0x2a, 0x9d, 0x8f));
+        canvas.draw_rect(skia_safe::Rect::from_xywh(0.0, 170.0, 480.0, 100.0), &paint);
+        paint.set_color(skia_safe::Color::from_rgb(0x26, 0x46, 0x53));
+        let mut hill = skia_safe::Path::new();
+        hill.move_to((0.0, 200.0));
+        hill.line_to((150.0, 110.0));
+        hill.line_to((300.0, 200.0));
+        hill.close();
+        canvas.draw_path(&hill, &paint);
+        let path = out.join("fixture-thumb.png");
+        std::fs::write(&path, r.encode_png()).expect("write thumbnail");
+        path.to_string_lossy().into_owned()
+    }
 
     /// Writes one PNG contact sheet per transition, so the motion can be
     /// looked at rather than only asserted about. Ignored by default: it
@@ -4391,7 +4705,9 @@ mod tests {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/transitions");
         std::fs::create_dir_all(&out).expect("output dir");
 
-        let job = download_job("Big Buck Bunny (1080p)", JobState::Done);
+        let thumb = fixture_thumb(&out);
+        let mut job = download_job("Big Buck Bunny (1080p)", JobState::Done);
+        job.items[0].thumb_path = Some(thumb);
         let running = {
             let mut j = download_job("Sintel trailer", JobState::Running);
             j.id = "running-1".into();
@@ -4402,27 +4718,55 @@ mod tests {
         // Each case renders once to settle the screen it starts on -- the very
         // first render of a screen has nothing to come from -- then mutates
         // exactly what the click would have, and samples the result.
-        let cases: Vec<(&str, Navigate)> = vec![
-            ("library-to-settings", Box::new(|a: &mut RustyDlp| a.route = Route::Settings)),
-            ("settings-to-library", Box::new(|a: &mut RustyDlp| a.route = Route::Library)),
+        let noop: fn() -> Navigate = || Box::new(|_: &mut RustyDlp, _: &mut Painter| {});
+        let open_popover: fn() -> Navigate =
+            || Box::new(|a: &mut RustyDlp, p: &mut Painter| click_id(a, p, "tile-i1"));
+
+        // (name, how the screen it starts on is reached, what starts the
+        // transition). The first runs before the settling render below, the
+        // second right after it.
+        let cases: Vec<(&str, Navigate, Navigate)> = vec![
+            (
+                "library-to-settings",
+                noop(),
+                Box::new(|a: &mut RustyDlp, _: &mut Painter| a.route = Route::Settings),
+            ),
+            (
+                "settings-to-library",
+                Box::new(|a: &mut RustyDlp, _: &mut Painter| a.route = Route::Settings),
+                Box::new(|a: &mut RustyDlp, _: &mut Painter| a.route = Route::Library),
+            ),
             (
                 "home-to-in-progress",
-                Box::new(|a: &mut RustyDlp| a.tab = SidebarTab::InProgress),
+                noop(),
+                Box::new(|a: &mut RustyDlp, _: &mut Painter| a.tab = SidebarTab::InProgress),
             ),
-            ("tile-to-popover", Box::new(|a: &mut RustyDlp| a.selected = Some("j-1".into()))),
-            ("new-download-modal", Box::new(|a: &mut RustyDlp| a.modal = true)),
+            ("tile-to-popover", noop(), open_popover()),
+            (
+                "popover-to-tile",
+                open_popover(),
+                Box::new(|a: &mut RustyDlp, _: &mut Painter| a.close_popover()),
+            ),
+            (
+                "new-download-modal",
+                noop(),
+                Box::new(|a: &mut RustyDlp, _: &mut Painter| a.modal = true),
+            ),
         ];
 
-        for (name, act) in cases {
+        for (name, before, act) in cases {
             let (mut app, mut painter) = fixture();
             let mut first = job.clone();
             first.id = "j-1".into();
             app.jobs = vec![first, running.clone()];
-            if name == "settings-to-library" {
-                app.route = Route::Settings;
-            }
+            before(&mut app, &mut painter);
+            // Twice, a full duration apart: whatever `before` started has to
+            // be settled before the transition under test begins, or it plays
+            // over the top of it.
             render(&mut app, &mut painter);
-            act(&mut app);
+            std::thread::sleep(crate::ui::anim::DURATION);
+            render(&mut app, &mut painter);
+            act(&mut app, &mut painter);
 
             let frames = transition_frames(&mut app, &mut painter);
             let png = contact_sheet(&frames, &mut painter).encode_png();

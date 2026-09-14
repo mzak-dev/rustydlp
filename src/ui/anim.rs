@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::color::Rgba;
+use super::units::Bounds;
 
 /// How long every tween takes to settle. One knob, so every animated surface
 /// in the app moves at the same pace.
@@ -116,6 +117,25 @@ pub fn page_swap(progress: f32, direction: f32, distance: f32) -> PageSwap {
         incoming_offset: direction * distance * (1.0 - eased),
         incoming_opacity: ((t - SWAP_FADE_IN_START) / (SWAP_FADE_IN_END - SWAP_FADE_IN_START))
             .clamp(0.0, 1.0),
+    }
+}
+
+/// Eases a rectangle from `from` to `to`, for a view that grows out of the
+/// thing that opened it rather than appearing over it.
+///
+/// This renderer has no transform, let alone a scale — so this is not a
+/// scaled-up snapshot of the origin, the way a compositor would do it. It is
+/// the real box, laid out at every intermediate size: the card is genuinely
+/// `rect` wide on each frame, and whatever is inside it is laid out (and
+/// clipped) to that. Which is why the content inside it fades in late, once
+/// the frame is most of the way to full size.
+pub fn morph_rect(from: Bounds, to: Bounds, progress: f32) -> Bounds {
+    let t = ease_out_cubic(progress.clamp(0.0, 1.0));
+    Bounds {
+        x: lerp(from.x, to.x, t),
+        y: lerp(from.y, to.y, t),
+        width: lerp(from.width, to.width, t),
+        height: lerp(from.height, to.height, t),
     }
 }
 
@@ -387,6 +407,27 @@ mod tests {
         let forward = page_swap(0.25, 1.0, SWAP_DISTANCE);
         assert_eq!(back.incoming_offset, -forward.incoming_offset);
         assert_eq!(back.outgoing_offset, -forward.outgoing_offset);
+    }
+
+    /// A morph has to start exactly on the rectangle it was handed and land
+    /// exactly on its target: a view that grows out of a tile but starts a few
+    /// pixels off it, or settles a few pixels short, is a view that jumps
+    /// twice instead of moving once.
+    #[test]
+    fn a_morph_starts_on_the_origin_rect_and_lands_on_the_target() {
+        let tile = Bounds { x: 20.0, y: 100.0, width: 220.0, height: 180.0 };
+        let card = Bounds { x: 165.0, y: 76.0, width: 850.0, height: 608.0 };
+
+        assert_eq!(morph_rect(tile, card, 0.0), tile);
+        assert_eq!(morph_rect(tile, card, 1.0), card);
+
+        let mid = morph_rect(tile, card, 0.5);
+        assert!(mid.width > tile.width && mid.width < card.width, "grows: {mid:?}");
+        assert!(mid.x > tile.x && mid.x < card.x, "and travels: {mid:?}");
+
+        // Clamped, so a progress that has run past the end cannot carry the
+        // card past where it is supposed to stop.
+        assert_eq!(morph_rect(tile, card, 1.4), card);
     }
 
     /// Whatever the curve, a screen may not overshoot its resting place: the
