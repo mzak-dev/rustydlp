@@ -1,0 +1,164 @@
+name: PR preview release
+
+# Builds every pull request into a real, downloadable Windows binary and
+# publishes it as a prerelease whose version carries a `-preview` tag, so a
+# change can be tried before it lands rather than only read.
+#
+# One rolling release per pull request: each push replaces it, and closing the
+# pull request deletes it. Nothing here touches `main`, any released tag, or
+# .release-please-manifest.json, so a preview can never be mistaken for a
+# release or shift the baseline the automated release bumps from.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+# The previous build for this pull request is stale the moment a new commit
+# lands, and the `closed` run should cancel any build still going.
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # release-please's own pull request carries nothing but a version bump and
+    # a changelog; a preview build of it is noise, and its Cargo.toml already
+    # holds the version being proposed, which would make the preview version
+    # read a minor ahead of anything real.
+    if: >-
+      github.event.action != 'closed'
+      && !startsWith(github.head_ref, 'release-please--')
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      # The pull request's head commit rather than the default merge ref: the
+      # preview is a build of *this branch*, and the merge ref is an ephemeral
+      # commit that could not be tagged later even if we wanted to.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # setup-python rather than the runner's own interpreter: `python3` is not
+      # reliably on PATH on the Windows images, and this is the one job that
+      # runs the version script somewhere other than ubuntu.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Resolve the preview version
+        id: resolve
+        shell: bash
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: python .github/scripts/version.py resolve --preview-of "$PR" >> "$GITHUB_OUTPUT"
+
+      # Stamped into Cargo.toml and Cargo.lock before building, so the version
+      # the binary reports — and the one Windows shows in the .exe's properties
+      # — is the preview version, not the last release's. Cargo.lock is edited
+      # in step with Cargo.toml, which is what keeps --locked below satisfied.
+      - name: Stamp the preview version
+        shell: bash
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          python .github/scripts/version.py write "$VERSION"
+          git --no-pager diff --stat
+
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p rustydlp
+
+      # Uploaded unconditionally, including for pull requests from forks: the
+      # publish job below cannot run for those (their GITHUB_TOKEN is read-only
+      # by design), so the artifact is the only way their build is reachable.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustydlp-${{ steps.resolve.outputs.tag }}
+          path: target/release/rustydlp.exe
+
+  publish:
+    needs: build
+    # A fork's token has no `contents: write` no matter what this workflow asks
+    # for, so publishing is skipped there rather than failing every fork PR.
+    # `needs.build.result` is explicit because a job with its own `if:` loses
+    # the implicit "only when the jobs I need succeeded" guard.
+    if: >-
+      needs.build.result == 'success'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      TAG: ${{ needs.build.outputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustydlp-${{ needs.build.outputs.tag }}
+
+      # Matched on the `-preview.<pr>` suffix rather than on the exact tag this
+      # run computed: a release landing on main while the pull request is open
+      # moves the base version, so the previous preview for this same pull
+      # request can be sitting under a different tag.
+      - name: Drop the previous preview release
+        run: |
+          stale=$(gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+-preview\.${PR}$" || true)
+          for tag in $stale; do
+            echo "removing $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done
+
+      - name: Publish the preview release
+        run: |
+          cat > notes.md <<EOF
+          Preview build of [#${PR}](${PR_URL}) — **not a release.**
+
+          | | |
+          |---|---|
+          | pull request | [#${PR}](${PR_URL}) |
+          | commit | \`${SHA}\` |
+          | version | \`${VERSION}\` |
+
+          Built from the pull request's head commit. This release and its tag
+          are replaced on every push to the pull request and deleted when it
+          closes, so neither is a stable thing to link to.
+          EOF
+          gh release create "$TAG" rustydlp.exe \
+            --target "$SHA" \
+            --title "$TAG (PR #${PR})" \
+            --notes-file notes.md \
+            --prerelease
+          echo "Preview release \`$TAG\`: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  # A preview outlives its pull request only as clutter, and a tag pointing at
+  # a commit on a deleted branch is worse than clutter — it keeps that commit
+  # reachable forever.
+  cleanup:
+    if: >-
+      github.event.action == 'closed'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Delete this pull request's preview releases
+        run: |
+          stale=$(gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+-preview\.${PR}$" || true)
+          for tag in $stale; do
+            echo "removing $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done
