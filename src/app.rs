@@ -1927,7 +1927,10 @@ impl RustyDlp {
             .p_2()
             .rounded(theme().radius)
             .border_1()
-            .border_color(if expanded { theme().ring } else { theme().border })
+            .border_color(theme().border)
+            // Open reads from the filled background, the chevron and the panel
+            // below — not from a brighter border. `ring` here was a near-white
+            // outline on an otherwise all-neutral screen.
             .when(expanded, |t| t.bg(theme().surface))
             .hover(|this| this.bg(theme().list_hover))
             .cursor_pointer()
