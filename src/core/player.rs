@@ -747,6 +747,106 @@ fn run_audio_output(
     Ok(())
 }
 
+/// A plain-text report of what `run_audio_output` sees: the host backend,
+/// every output device Windows reports, which one is picked, and the config
+/// it would actually stream at. Never opens a device, so it is cheap enough
+/// to run straight off a Settings button click.
+pub fn audio_diagnostics() -> String {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let mut lines = vec![format!("Host: {:?}", host.id())];
+
+    lines.push(match host.default_output_device().and_then(|d| d.name().ok()) {
+        Some(name) => format!("Windows default output device: {name}"),
+        None => "Windows default output device: none reported".into(),
+    });
+
+    match host.output_devices() {
+        Ok(devices) => {
+            let names: Vec<String> = devices.filter_map(|d| d.name().ok()).collect();
+            lines.push(if names.is_empty() {
+                "Output devices enumerated: none".into()
+            } else {
+                format!("Output devices enumerated: {}", names.join(", "))
+            });
+        }
+        Err(e) => lines.push(format!("Could not enumerate output devices: {e}")),
+    }
+
+    match pick_output_device(&host) {
+        None => lines.push("=> No usable output device: playback will be silent.".into()),
+        Some(device) => {
+            let name = device.name().unwrap_or_else(|_| "<unnamed>".into());
+            match device.default_output_config() {
+                Ok(cfg) => lines.push(format!(
+                    "Player will use \"{name}\": {} Hz, {} channel(s), {:?}",
+                    cfg.sample_rate().0,
+                    cfg.channels(),
+                    cfg.sample_format(),
+                )),
+                Err(e) => lines.push(format!(
+                    "=> \"{name}\" reported no usable config ({e}): playback will be silent."
+                )),
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Plays a half-second 440Hz tone through the same device/config path
+/// `run_audio_output` uses, entirely independent of ffmpeg — so a silent
+/// video can be told apart from a silent (or misconfigured) audio device.
+pub fn play_test_tone() -> Result<()> {
+    use cpal::SampleFormat;
+    use cpal::traits::{DeviceTrait, StreamTrait};
+
+    let host = cpal::default_host();
+    let device = pick_output_device(&host).ok_or_else(|| anyhow!("no audio output device available"))?;
+    let supported = device
+        .default_output_config()
+        .context("output device reported no default config")?;
+    let sample_format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+
+    fn tone_stream<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+    ) -> Result<cpal::Stream>
+    where
+        T: cpal::SizedSample + cpal::FromSample<f32>,
+    {
+        const FREQ_HZ: f32 = 440.0;
+        let channels = config.channels as usize;
+        let sample_rate = config.sample_rate.0 as f32;
+        let mut phase = 0.0f32;
+        let stream = device.build_output_stream(
+            config,
+            move |data: &mut [T], _| {
+                for frame in data.chunks_mut(channels.max(1)) {
+                    let s = T::from_sample((phase * std::f32::consts::TAU).sin() * 0.2);
+                    phase = (phase + FREQ_HZ / sample_rate).fract();
+                    frame.fill(s);
+                }
+            },
+            |err| eprintln!("player: test tone stream error: {err}"),
+            None,
+        )?;
+        Ok(stream)
+    }
+
+    let stream = match sample_format {
+        SampleFormat::I16 => tone_stream::<i16>(&device, &config),
+        SampleFormat::U16 => tone_stream::<u16>(&device, &config),
+        SampleFormat::F32 => tone_stream::<f32>(&device, &config),
+        other => Err(anyhow!("unsupported output sample format: {other:?}")),
+    }?;
+    stream.play()?;
+    std::thread::sleep(Duration::from_millis(600));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     // Explicit rather than a glob so it stays obvious what is under test.
