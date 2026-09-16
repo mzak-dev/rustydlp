@@ -627,9 +627,16 @@ fn run_audio_output(
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
+    // `default_output_device` returns `None` whenever no device has the
+    // "default" role set — happens on real machines (a disabled default
+    // device, some third-party audio managers), not just headless ones.
+    // Falling back to the first enumerable output device is the difference
+    // between silently never opening a stream (so the app doesn't even show
+    // up in the OS volume mixer) and playing through whatever is there.
     let device = host
         .default_output_device()
-        .ok_or_else(|| anyhow!("no default audio output device"))?;
+        .or_else(|| host.output_devices().ok().and_then(|mut d| d.next()))
+        .ok_or_else(|| anyhow!("no audio output device available"))?;
     let config = cpal::StreamConfig {
         channels,
         sample_rate: cpal::SampleRate(sample_rate),
