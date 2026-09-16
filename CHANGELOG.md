@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.0](https://github.com/mzak-dev/rustydlp/compare/v0.8.0...v0.9.0) (2026-09-16)
+
+
+### Features
+
+* **ui:** add an Audio diagnostics section to Settings ([1856664](https://github.com/mzak-dev/rustydlp/commit/185666419c65c90d9c35775fcf6057571204df06))
+
+
+### Bug Fixes
+
+* audio device fallback, responsive library grid, drag/resize after maximize ([9eeffb3](https://github.com/mzak-dev/rustydlp/commit/9eeffb3254acb5c9b7a129cc6370d5fa16ee9bf5))
+* **player:** fall back to any output device when no default is set ([995154e](https://github.com/mzak-dev/rustydlp/commit/995154e6c6a030b3e80b03ec1607877b85720b01))
+* **player:** match the audio stream to the device's own mix format ([4aefebe](https://github.com/mzak-dev/rustydlp/commit/4aefebee739fb1c3aba60cd7a929017e08e6d7c0))
+* **ui:** restore native drag/resize after a maximize-restore round trip ([d2d9360](https://github.com/mzak-dev/rustydlp/commit/d2d9360b3b6d9187fe00af6195fdc600912f3031))
+* **ui:** space out a full library grid row instead of leaving slack ([45a6d23](https://github.com/mzak-dev/rustydlp/commit/45a6d2395eec3940ef5c981a510423736ea38aa7))
+
 ## [0.8.0](https://github.com/mzak-dev/rustydlp/compare/v0.7.0...v0.8.0) (2026-09-14)
 
 
