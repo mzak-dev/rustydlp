@@ -4940,8 +4940,21 @@ fn sorted_items(job: &Job) -> Vec<&Item> {
 
 /// One wrapping row of library tiles. The library is a stack of these rather
 /// than a single wrap container, so an expanded playlist can interrupt it.
+/// `justify_between` is what makes this responsive: `gap` alone is a fixed
+/// minimum, so a row with room for tiles it didn't get (window wider than a
+/// whole number of `TILE_W + TILE_GAP`) would otherwise leave that leftover
+/// space dead on the right. Flexbox's `space-between` is computed per wrapped
+/// line, so a full row spreads its slack evenly between tiles while a
+/// half-empty trailing row still starts flush left with just the fixed gap —
+/// there's nothing to space *between* when there's only one or two tiles.
 fn tile_row(tiles: Vec<AnyElement>) -> AnyElement {
-    div().flex().flex_wrap().gap(TILE_GAP).children(tiles).into_any_element()
+    div()
+        .flex()
+        .flex_wrap()
+        .justify_between()
+        .gap(TILE_GAP)
+        .children(tiles)
+        .into_any_element()
 }
 
 /// The small badge a library tile shows over its thumbnail: what happened to
