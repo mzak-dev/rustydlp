@@ -485,14 +485,28 @@ fn spawn_audio(
     stopped: Arc<AtomicBool>,
     volume: Volume,
 ) -> Result<Arc<AtomicBool>> {
-    const SAMPLE_RATE: u32 = 48_000;
-    const CHANNELS: u16 = 2;
+    /// What ffmpeg is asked for when no device can be probed up front (no
+    /// output device at all) — playback still starts and simply finds no
+    /// sound, same as today, rather than failing to spawn.
+    const FALLBACK_SAMPLE_RATE: u32 = 48_000;
+    const FALLBACK_CHANNELS: u16 = 2;
     /// How much decoded audio may sit in the ring at once. Long enough to
     /// ride out scheduling jitter, short enough that pausing doesn't leave a
     /// stale tail queued in front of the resume.
     const BUFFER_SECS: f64 = 0.5;
 
-    let capacity = (SAMPLE_RATE as f64 * CHANNELS as f64 * BUFFER_SECS) as usize;
+    // Ask ffmpeg for exactly the rate/channel count the output device
+    // actually wants, rather than a hardcoded 48kHz stereo: forcing a config
+    // a device's shared-mode mix format doesn't support (e.g. a mono-only
+    // output) is a silent, unreported way for `build_output_stream` to fail
+    // later in `run_audio_output`, which is indistinguishable from "no
+    // audio" to whoever hits it. Probed again independently inside that
+    // thread when the stream actually opens — cheap, and avoids carrying a
+    // `cpal::Device` (not `Send` on every backend) across the thread split.
+    let (sample_rate, channels) =
+        probe_output_format().unwrap_or((FALLBACK_SAMPLE_RATE, FALLBACK_CHANNELS));
+
+    let capacity = (sample_rate as f64 * channels as f64 * BUFFER_SECS) as usize;
 
     let mut audio_child = base_command(ffmpeg)
         .args(["-ss", &start_at_secs.to_string(), "-i"])
@@ -504,9 +518,9 @@ fn spawn_audio(
             "-f",
             "s16le",
             "-ar",
-            &SAMPLE_RATE.to_string(),
+            &sample_rate.to_string(),
             "-ac",
-            &CHANNELS.to_string(),
+            &channels.to_string(),
             "pipe:1",
         ])
         .stdin(Stdio::null())
@@ -598,8 +612,6 @@ fn spawn_audio(
         std::thread::spawn(move || {
             if let Err(e) = run_audio_output(
                 ring,
-                SAMPLE_RATE,
-                CHANNELS,
                 paused,
                 stopped,
                 volume,
@@ -614,40 +626,53 @@ fn spawn_audio(
     Ok(started)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_audio_output(
+/// `default_output_device` returns `None` whenever no device has the
+/// "default" role set — happens on real machines (a disabled default
+/// device, some third-party audio managers), not just headless ones.
+/// Falling back to the first enumerable output device is the difference
+/// between silently never opening a stream (so the app doesn't even show
+/// up in the OS volume mixer) and playing through whatever is there.
+fn pick_output_device(host: &cpal::Host) -> Option<cpal::Device> {
+    use cpal::traits::HostTrait;
+    host.default_output_device()
+        .or_else(|| host.output_devices().ok().and_then(|mut d| d.next()))
+}
+
+/// The channel count and sample rate to ask ffmpeg for, taken from whatever
+/// output device is actually available. `None` when there is none to ask —
+/// `spawn_audio` still starts ffmpeg with a guessed format in that case, on
+/// the offhand chance a device shows up by the time playback would reach it.
+fn probe_output_format() -> Option<(u32, u16)> {
+    use cpal::traits::DeviceTrait;
+    let device = pick_output_device(&cpal::default_host())?;
+    let config = device.default_output_config().ok()?;
+    Some((config.sample_rate().0, config.channels()))
+}
+
+/// Drains the ring into one cpal sample type. Generic over it because a
+/// device's shared-mode mix format decides the type, not this app — WASAPI
+/// devices commonly default to `f32` these days, and building a stream with
+/// the wrong one is a hard error from `build_output_stream`, not a silent
+/// format conversion.
+fn build_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
     ring: Arc<Mutex<VecDeque<i16>>>,
-    sample_rate: u32,
-    channels: u16,
     paused: Arc<AtomicBool>,
-    stopped: Arc<AtomicBool>,
     volume: Volume,
     started: Arc<AtomicBool>,
-) -> Result<()> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-    let host = cpal::default_host();
-    // `default_output_device` returns `None` whenever no device has the
-    // "default" role set — happens on real machines (a disabled default
-    // device, some third-party audio managers), not just headless ones.
-    // Falling back to the first enumerable output device is the difference
-    // between silently never opening a stream (so the app doesn't even show
-    // up in the OS volume mixer) and playing through whatever is there.
-    let device = host
-        .default_output_device()
-        .or_else(|| host.output_devices().ok().and_then(|mut d| d.next()))
-        .ok_or_else(|| anyhow!("no audio output device available"))?;
-    let config = cpal::StreamConfig {
-        channels,
-        sample_rate: cpal::SampleRate(sample_rate),
-        buffer_size: cpal::BufferSize::Default,
-    };
-
+) -> Result<cpal::Stream>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    use cpal::traits::DeviceTrait;
+    let channels = config.channels as usize;
     let stream = device.build_output_stream(
-        &config,
-        move |data: &mut [i16], _| {
+        config,
+        move |data: &mut [T], _| {
+            let silence = T::from_sample(0.0f32);
             if paused.load(Ordering::Relaxed) {
-                data.fill(0);
+                data.fill(silence);
                 return;
             }
             let gain = volume.get();
@@ -656,20 +681,20 @@ fn run_audio_output(
                 // Never hand the device an unwritten buffer: whatever was in
                 // it last is not silence.
                 Err(_) => {
-                    data.fill(0);
+                    data.fill(silence);
                     return;
                 }
             };
             // Rounded down to a whole frame: `data` is interleaved, so
             // handing back an odd number of samples on an underrun would
             // swap the channels for every callback after it.
-            let frame = channels as usize;
-            let available = guard.len().min(data.len()) / frame * frame;
+            let available = guard.len().min(data.len()) / channels * channels;
             for (i, sample) in data.iter_mut().enumerate() {
                 *sample = if i < available {
-                    (guard.pop_front().unwrap_or(0) as f32 * gain) as i16
+                    let raw = guard.pop_front().unwrap_or(0) as f32 / i16::MAX as f32;
+                    T::from_sample(raw * gain)
                 } else {
-                    0
+                    silence
                 };
             }
             // Frame pacing hangs off this: the video thread holds its first
@@ -681,6 +706,37 @@ fn run_audio_output(
         |err| eprintln!("player: audio stream error: {err}"),
         None,
     )?;
+    Ok(stream)
+}
+
+fn run_audio_output(
+    ring: Arc<Mutex<VecDeque<i16>>>,
+    paused: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    volume: Volume,
+    started: Arc<AtomicBool>,
+) -> Result<()> {
+    use cpal::SampleFormat;
+    use cpal::traits::{DeviceTrait, StreamTrait};
+
+    let host = cpal::default_host();
+    let device = pick_output_device(&host).ok_or_else(|| anyhow!("no audio output device available"))?;
+    // The device's own default config, not a hardcoded 48kHz/stereo/i16:
+    // shared-mode WASAPI only accepts its own mix format, so asking for
+    // anything else is exactly the silent "no audio, no error the user ever
+    // sees" failure this is fixing.
+    let supported = device
+        .default_output_config()
+        .context("output device reported no default config")?;
+    let sample_format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+
+    let stream = match sample_format {
+        SampleFormat::I16 => build_stream::<i16>(&device, &config, ring, paused, volume, Arc::clone(&started)),
+        SampleFormat::U16 => build_stream::<u16>(&device, &config, ring, paused, volume, Arc::clone(&started)),
+        SampleFormat::F32 => build_stream::<f32>(&device, &config, ring, paused, volume, Arc::clone(&started)),
+        other => Err(anyhow!("unsupported output sample format: {other:?}")),
+    }?;
     stream.play()?;
 
     // Parked here for the run's whole lifetime: `stream` must not drop (and
