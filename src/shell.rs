@@ -98,6 +98,10 @@ pub struct Shell {
     /// The id of the box a hover handler last fired "entered" for, so a move
     /// that leaves it can fire "left" — see `crate::ui::event::dispatch_hover`.
     hovered: Option<SharedString>,
+    /// Last-seen `window.is_maximized()`, so `redraw` can catch the
+    /// maximized-to-windowed edge and re-assert the resizable style — see
+    /// the comment above that check.
+    was_maximized: bool,
 }
 
 impl Shell {
@@ -125,6 +129,7 @@ impl Shell {
             size: (w, h),
             last_redraw: std::time::Instant::now(),
             hovered: None,
+            was_maximized: false,
         }
     }
 
@@ -152,7 +157,19 @@ impl Shell {
         let (Some(window), Some(backend)) = (self.window.as_ref(), self.backend.as_mut()) else {
             return;
         };
-        self.app.set_window_maximized(window.is_maximized());
+        let is_maximized = window.is_maximized();
+        // On Windows, an undecorated window's WS_THICKFRAME (and with it,
+        // native drag-move/drag-resize) can come back cleared by the OS after
+        // a maximize->restore round trip -- a winit/Win32 quirk that only
+        // shows up for borderless windows, since a decorated one keeps its
+        // frame style throughout. Re-asserting it right after the restore is
+        // the documented workaround; doing it unconditionally every frame
+        // would fight an in-progress `drag_resize_window` call instead.
+        if self.was_maximized && !is_maximized {
+            window.set_resizable(true);
+        }
+        self.was_maximized = is_maximized;
+        self.app.set_window_maximized(is_maximized);
         // The popover morphs between two rectangles it has to compute itself
         // (see `library_popover`), and only the shell knows how big the window
         // currently is. Pushed in like `window_maximized` rather than threaded
