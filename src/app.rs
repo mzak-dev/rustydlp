@@ -192,6 +192,10 @@ pub struct RustyDlp {
     cancels: HashMap<String, runner::CancelHandle>,
     /// Result of the last `yt-dlp -U`, shown in Settings.
     update_status: Option<String>,
+    /// Output of the last audio device check / test tone, shown in Settings
+    /// — see `diagnose_audio`. What a friend with silent playback and no
+    /// error to describe now has something to screenshot instead.
+    audio_diag: Option<String>,
     presets: Vec<Preset>,
     /// Preset chosen in the New Download modal.
     chosen_preset: Option<String>,
@@ -578,6 +582,7 @@ impl RustyDlp {
             launcher_active: false,
             cancels: HashMap::new(),
             update_status: None,
+            audio_diag: None,
             presets: Vec::new(),
             chosen_preset: None,
             editing: None,
@@ -849,6 +854,38 @@ impl RustyDlp {
                 self.startup_error = Some(e.to_string());
             }
         }
+    }
+
+    /// Enumerates output devices and the config `player::spawn_audio` would
+    /// actually use, without opening a stream — fast enough to run straight
+    /// off the click. What tells a "no audio" report apart from a "no
+    /// device" or "unsupported format" one before anyone has to read logs.
+    fn diagnose_audio(&mut self) {
+        self.audio_diag = Some(player::audio_diagnostics());
+    }
+
+    /// Plays a half-second tone through the same device/config path
+    /// `diagnose_audio` just reported on, so "the device looks right" can
+    /// actually be heard rather than taken on faith. Runs off-thread since
+    /// it blocks for the tone's duration.
+    fn test_audio_tone(&mut self) {
+        self.audio_diag = Some(match &self.audio_diag {
+            Some(prev) => format!("{prev}\nPlaying test tone…"),
+            None => "Playing test tone…".into(),
+        });
+        self.updates.spawn(|updates| {
+            let result = player::play_test_tone();
+            updates.send(move |this| {
+                let line = match result {
+                    Ok(()) => "Test tone: played without error — if you heard nothing, the wrong device is default in Windows.".to_string(),
+                    Err(e) => format!("Test tone failed: {e}"),
+                };
+                this.audio_diag = Some(match this.audio_diag.take() {
+                    Some(prev) => format!("{prev}\n{line}"),
+                    None => line,
+                });
+            });
+        });
     }
 
     fn open_store(&mut self) {
@@ -2737,6 +2774,68 @@ impl RustyDlp {
             ],
         );
 
+        // For reports of silent playback with nothing else to go on: shows
+        // which device/format the player would actually use, and lets that
+        // be confirmed by ear rather than taken on faith.
+        let audio = settings_section(
+            "Audio",
+            vec![
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .flex_wrap()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme().muted_foreground)
+                            .child("If playback has no sound, check here first."),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_2()
+                            .child(
+                                Button::new("check-audio")
+                                    .ghost()
+                                    .small()
+                                    .border_1()
+                                    .border_color(theme().border)
+                                    .label("Check audio device")
+                                    .on_click(|this: &mut Self| {
+                                        this.diagnose_audio();
+                                    }),
+                            )
+                            .child(
+                                Button::new("test-audio-tone")
+                                    .ghost()
+                                    .small()
+                                    .border_1()
+                                    .border_color(theme().border)
+                                    .label("Play test tone")
+                                    .on_click(|this: &mut Self| {
+                                        this.test_audio_tone();
+                                    }),
+                            ),
+                    )
+                    .into_any_element(),
+                v_flex()
+                    .gap_1()
+                    .children(self.audio_diag.iter().flat_map(|report| {
+                        report.lines().map(|line| {
+                            div()
+                                .text_xs()
+                                .text_color(theme().muted_foreground)
+                                .child(line.to_string())
+                                .into_any_element()
+                        })
+                    }))
+                    .into_any_element(),
+            ],
+        );
+
         // Presets: a narrow picker beside the editor for whichever one is
         // selected, so switching preset and tweaking it happen side by side
         // instead of losing your place navigating between two pages.
@@ -2815,6 +2914,7 @@ impl RustyDlp {
                     ),
             )
             .child(general)
+            .child(audio)
             .child(presets)
             .into_any_element()
     }
@@ -4940,8 +5040,21 @@ fn sorted_items(job: &Job) -> Vec<&Item> {
 
 /// One wrapping row of library tiles. The library is a stack of these rather
 /// than a single wrap container, so an expanded playlist can interrupt it.
+/// `justify_between` is what makes this responsive: `gap` alone is a fixed
+/// minimum, so a row with room for tiles it didn't get (window wider than a
+/// whole number of `TILE_W + TILE_GAP`) would otherwise leave that leftover
+/// space dead on the right. Flexbox's `space-between` is computed per wrapped
+/// line, so a full row spreads its slack evenly between tiles while a
+/// half-empty trailing row still starts flush left with just the fixed gap —
+/// there's nothing to space *between* when there's only one or two tiles.
 fn tile_row(tiles: Vec<AnyElement>) -> AnyElement {
-    div().flex().flex_wrap().gap(TILE_GAP).children(tiles).into_any_element()
+    div()
+        .flex()
+        .flex_wrap()
+        .justify_between()
+        .gap(TILE_GAP)
+        .children(tiles)
+        .into_any_element()
 }
 
 /// The small badge a library tile shows over its thumbnail: what happened to
